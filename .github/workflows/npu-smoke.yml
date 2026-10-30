@@ -1,0 +1,102 @@
+name: NPU Smoke Test
+
+# 第一步只做链路验证：证明 runner 路由通、NPU 设备可见、torch_npu 可用。
+# 手动触发，避免在标签未就绪时污染 PR 检查结果。
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_label:
+        description: 'Runner 标签（必须与 Settings → Actions → Runners 里的一致）'
+        required: true
+        default: 'linux-aarch64-a3-2'
+        type: choice
+        options:
+          - linux-aarch64-a3-2
+          - linux-aarch64-a3-8
+          - linux-aarch64-a3-800i-8
+          - linux-aarch64-cpu-4
+      image:
+        description: 'container.image（必须是 arm64 镜像；不指定 container 不会分配 NPU）'
+        required: true
+        default: 'quay.io/ascend/cann:9.0.0-a3-openeuler24.03-py3.11'
+      check_torchturbo:
+        description: '额外检查 torchturbo 能否 import'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  smoke:
+    name: smoke (${{ inputs.runner_label }})
+    runs-on: ${{ inputs.runner_label }}
+
+    # 注意：使用昇腾芯片必须指定 container.image，
+    # 不写 container 时 job 会跑在 runner 宿主上但拿不到 NPU。
+    container:
+      image: ${{ inputs.image }}
+      options: --user root
+
+    steps:
+      - name: Runner 基本信息
+        run: |
+          echo "runner label : ${{ inputs.runner_label }}"
+          echo "image        : ${{ inputs.image }}"
+          uname -a
+          cat /etc/os-release | head -5
+          nproc
+          free -h
+
+      - name: NPU 设备可见性
+        run: |
+          which npu-smi
+          npu-smi info
+
+      - name: Python / torch / torch_npu 版本
+        run: |
+          python -V
+          python - <<'PY'
+          import platform
+          print("machine:", platform.machine())
+
+          try:
+              import torch
+              print("torch:", torch.__version__)
+          except Exception as e:
+              print("torch import FAILED:", e)
+              torch = None
+
+          try:
+              import torch_npu
+              print("torch_npu:", getattr(torch_npu, "__version__", "unknown"))
+              print("npu.is_available:", torch.npu.is_available() if torch else "n/a")
+              print("npu.device_count:", torch.npu.device_count() if torch else "n/a")
+          except Exception as e:
+              print("torch_npu import FAILED:", e)
+          PY
+
+      - name: 单卡矩阵乘（最小 NPU 计算验证）
+        run: |
+          python - <<'PY'
+          import torch
+          import torch_npu  # noqa: F401
+
+          if not torch.npu.is_available():
+              raise SystemExit("torch.npu.is_available() == False，NPU 未分配到本 job")
+
+          d = "npu:0"
+          a = torch.randn(1024, 1024, device=d, dtype=torch.float16)
+          b = torch.randn(1024, 1024, device=d, dtype=torch.float16)
+          c = (a @ b).float()
+          torch.npu.synchronize()
+
+          print("matmul ok, out device =", c.device, "mean =", c.mean().item())
+          PY
+
+      - name: 检查 torchturbo 可安装可导入
+        if: ${{ inputs.check_torchturbo }}
+        run: |
+          # 用 -e . 让 src/ 布局生效；--no-deps 避免 pip 去解析 torch>=2.10
+          # 而把镜像里预编译好的 torch 覆盖成 PyPI 版本。
+          pip install -e . --no-deps -q
+          python -c "import torchturbo; print('torchturbo ok:', torchturbo.__file__)"
