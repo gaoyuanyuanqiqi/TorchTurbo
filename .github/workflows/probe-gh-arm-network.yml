@@ -340,9 +340,16 @@ jobs:
           echo "DOCKER_HOST    = ${DOCKER_HOST:-<unset>}"
           echo "DOCKER_CONFIG  = ${DOCKER_CONFIG:-<unset>}"
           echo "--- 二进制 ---"
-          for b in docker buildctl buildx podman buildah kaniko; do
+          for b in docker buildctl podman buildah kaniko; do
             printf '%-10s %s\n' "$b" "$(command -v "$b" || echo '<not found>')"
           done
+          # buildx 是 docker CLI 插件，`command -v buildx` 找不到；必须查插件目录
+          for p in "${DOCKER_CONFIG:-$HOME/.docker}/cli-plugins/docker-buildx" \
+                   /usr/libexec/docker/cli-plugins/docker-buildx \
+                   /usr/lib/docker/cli-plugins/docker-buildx; do
+            [ -x "$p" ] && { printf '%-10s %s\n' buildx "$p"; break; }
+          done
+          docker buildx version >/dev/null 2>&1 && printf '%-10s %s\n' buildx '(docker plugin: 可用)'
           echo "--- docker 版本 / buildx 插件 ---"
           docker version 2>&1 | head -15 || true
           docker buildx version 2>&1 | head -3 || true
