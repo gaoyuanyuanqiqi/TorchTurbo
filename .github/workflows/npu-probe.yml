@@ -1,0 +1,213 @@
+name: NPU Runner Probe
+
+# 目的：不构建任何镜像，直接用 docker/npu/Dockerfile_aarch64 的 FROM 基础镜像
+# （quay.io/ascend/cann:9.0.0-a3-openeuler24.03-py3.11）在 a3-800i-2 上跑一遍探针，
+# 一次跑完回答五个问题：
+#   ① 这个 container.image 能否在 a3-800i-2 上启动（能否 pull、是否 arm64）
+#   ② 能不能拿到 2 张 NPU，两卡能不能真的算出结果
+#   ③ 基础镜像里预装了什么（torch / torch_npu / triton / CANN 版本）
+#   ④ 网络出口够不够跑 Dockerfile_aarch64 里的那些 RUN（huaweicloud / github / quay）
+#   ⑤ 能不能在这个 pod 里构建镜像（buildctl / docker / BUILDKITD_ADDR / /dev/fuse）
+#
+# 所有探针步骤都是 continue-on-error，任何一步失败都不会中断，最终看 Job Summary。
+# 只在 workflow_dispatch 手动触发，不污染 PR 检查。
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_label:
+        description: 'Runner 标签（必须与 Settings → Actions → Runners 里的原文一致）'
+        required: true
+        default: 'linux-aarch64-a3-800i-2'
+        type: choice
+        options:
+          - linux-aarch64-a3-800i-2
+          - linux-aarch64-a3-800i-4
+          - linux-aarch64-a3-800i-8
+          - linux-aarch64-a3-800i-16
+      image:
+        description: 'container.image（默认 = Dockerfile_aarch64 的 FROM 基础镜像）'
+        required: true
+        default: 'quay.io/ascend/cann:9.0.0-a3-openeuler24.03-py3.11'
+
+concurrency:
+  group: npu-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    name: probe (${{ inputs.runner_label }})
+    runs-on: ${{ inputs.runner_label }}
+
+    # 使用昇腾芯片必须指定 container.image；不写 container 拿不到 NPU。
+    container:
+      image: ${{ inputs.image }}
+      options: --user root
+
+    # runner 若排队超过这个时间会自动取消，避免无声地挂一夜。
+    timeout-minutes: 40
+
+    steps:
+      - name: ① Runner / Pod 基本信息
+        continue-on-error: true
+        run: |
+          echo "label : ${{ inputs.runner_label }}"
+          echo "image : ${{ inputs.image }}"
+          echo "RUNNER_NAME=${RUNNER_NAME:-<unset>}"
+          uname -a
+          head -6 /etc/os-release || true
+          echo "--- cpu / mem ---"
+          nproc
+          free -h
+          echo "--- disk ---"
+          df -h / /tmp || true
+
+      - name: ② NPU 设备可见性（a3-800i-2 期望 2 张）
+        continue-on-error: true
+        run: |
+          echo "--- /dev/davinci* ---"
+          if ls /dev/davinci* >/dev/null 2>&1; then
+            ls -l /dev/davinci*
+            echo "davinci 设备数: $(ls /dev/davinci* | wc -l)"
+          else
+            echo "no /dev/davinci* —— NPU 未映射进 pod"
+          fi
+          echo "--- npu-smi ---"
+          command -v npu-smi || echo "npu-smi NOT in PATH"
+          npu-smi info || true
+          echo "--- npu-smi info -l ---"
+          npu-smi info -l || true
+
+      - name: ③ 基础镜像预装软件栈（对照 Dockerfile_aarch64 的假设）
+        continue-on-error: true
+        run: |
+          python -V
+          echo "--- CANN 安装位置 ---"
+          ls /usr/local/Ascend/ 2>/dev/null || echo "no /usr/local/Ascend"
+          cat /usr/local/Ascend/ascend-toolkit/latest/version.cfg 2>/dev/null || true
+          echo "--- python 包（Dockerfile 里单独 pip install 的那些）---"
+          python - <<'PY'
+          import importlib
+          for name in ["torch", "torch_npu", "triton", "triton_ascend", "fla", "py_spy"]:
+              try:
+                  mod = importlib.import_module(name)
+                  print(f"{name:14s} {getattr(mod, '__version__', '?')}")
+              except Exception as exc:
+                  print(f"{name:14s} MISSING ({type(exc).__name__})")
+          PY
+
+      - name: ④ 网络出口（Dockerfile 里的 RUN 全靠它）
+        continue-on-error: true
+        run: |
+          probe() {
+            code=$(curl -sS -m 12 -o /dev/null -w '%{http_code}' "$1" 2>/dev/null) || code="FAIL"
+            printf '%-6s %s\n' "$code" "$1"
+          }
+          probe https://repo.huaweicloud.com/repository/pypi/simple
+          probe https://repo.huaweicloud.com/ascend/repos/pypi
+          probe https://github.com
+          probe https://quay.io/v2/
+          probe https://gosspublic.alicdn.com/ossutil/install.sh
+          echo "--- 集群内缓存服务 ---"
+          probe http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple/
+          echo "--- proxy 环境变量 ---"
+          env | grep -iE '^(http|https|no)_proxy=' || echo "no proxy env"
+
+      - name: ⑤ 能否在本 pod 构建镜像（决定 build job 放哪）
+        continue-on-error: true
+        run: |
+          echo "BUILDKITD_ADDR = ${BUILDKITD_ADDR:-<unset>}"
+          echo "DOCKER_HOST    = ${DOCKER_HOST:-<unset>}"
+          echo "DOCKER_CONFIG  = ${DOCKER_CONFIG:-<unset>}"
+          echo "--- 二进制 ---"
+          for b in docker buildctl podman buildah kaniko; do
+            printf '%-10s %s\n' "$b" "$(command -v "$b" || echo '<not found>')"
+          done
+          echo "--- 内核接口 ---"
+          ls -l /var/run/docker.sock 2>/dev/null || echo "/var/run/docker.sock : absent"
+          ls -l /dev/fuse 2>/dev/null || echo "/dev/fuse            : absent"
+          id
+
+      - name: ⑥ NPU 算子验证（两卡都跑一次 matmul）
+        continue-on-error: true
+        run: |
+          python - <<'PY'
+          import os
+          try:
+              import torch, torch_npu  # noqa: F401
+          except Exception as exc:
+              raise SystemExit(f"torch/torch_npu 不可用，跳过算子验证: {exc!r}")
+
+          print("torch    :", torch.__version__)
+          print("torch_npu:", getattr(torch_npu, "__version__", "?"))
+
+          n = torch.npu.device_count()
+          print("npu count:", n)
+          if n == 0:
+              raise SystemExit("device_count == 0，NPU 未分配到本 job")
+
+          for i in range(n):
+              d = f"npu:{i}"
+              a = torch.randn(1024, 1024, device=d, dtype=torch.float16)
+              b = torch.randn(1024, 1024, device=d, dtype=torch.float16)
+              out = (a @ b).float()
+              torch.npu.synchronize()
+              err = (out.cpu() - a.float().cpu() @ b.float().cpu()).abs().max().item()
+              print(f"{d} matmul ok, out={out.device}, max_abs_err={err:.4f}")
+              assert err < 1.0, f"{d} 结果异常 err={err}"
+
+          print("fusion attention 接口存在:", hasattr(torch_npu, "npu_fusion_attention"))
+          print("OK: 全部卡完成矩阵乘")
+          PY
+
+      - name: ⑦ 重编译 PyTorch 的可行性信号（Dockerfile_aarch64 最贵的一层）
+        continue-on-error: true
+        run: |
+          echo "--- 编译工具 ---"
+          for b in gcc g++ cmake make git patch; do
+            if command -v "$b" >/dev/null 2>&1; then
+              printf '%-6s %s\n' "$b" "$($b --version 2>&1 | head -1)"
+            else
+              printf '%-6s <not found>\n' "$b"
+            fi
+          done
+          echo "--- 并行度 ---"
+          nproc
+          free -h
+          echo "--- github 出口速度（clone 一个小仓）---"
+          rm -rf /tmp/probe-clone
+          start=$(date +%s)
+          if timeout 180 git clone --depth 1 https://github.com/pytorch/test-infra.git /tmp/probe-clone >/dev/null 2>&1; then
+            echo "clone ok, $(( $(date +%s) - start ))s"
+          else
+            echo "clone FAILED/timeout, $(( $(date +%s) - start ))s"
+          fi
+          rm -rf /tmp/probe-clone
+          echo "--- 包管理器 ---"
+          (dnf --version | head -1) || echo "dnf not found"
+          (apt-get --version | head -1) || echo "apt-get not found"
+
+      - name: ⑧ 汇总到 Job Summary
+        if: always()
+        run: |
+          cpus=$(nproc 2>/dev/null || echo '?')
+          mem=$(free -g 2>/dev/null | awk '/^Mem:/{print $2}') || mem='?'
+          davinci=$(ls /dev/davinci* 2>/dev/null | wc -l) || davinci=0
+          buildctl=$(command -v buildctl || echo '<not found>')
+          if [ -e /dev/fuse ]; then fuse=present; else fuse=absent; fi
+          {
+            echo "## NPU Runner Probe"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| runner label | \`${{ inputs.runner_label }}\` |"
+            echo "| container.image | \`${{ inputs.image }}\` |"
+            echo "| CPU | ${cpus} 核 |"
+            echo "| 内存 | ${mem} Gi |"
+            echo "| davinci 设备数 | ${davinci} |"
+            echo "| BUILDKITD_ADDR | \`${BUILDKITD_ADDR:-<unset>}\` |"
+            echo "| buildctl | \`${buildctl}\` |"
+            echo "| /dev/fuse | ${fuse} |"
+            echo ""
+            echo "各探针步骤详细输出见上方日志（全部 continue-on-error，单步失败不影响其余步骤）。"
+          } >> "$GITHUB_STEP_SUMMARY"
