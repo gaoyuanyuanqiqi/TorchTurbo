@@ -1,0 +1,417 @@
+name: Image CI (base)
+
+# 只做一件事：构建基础镜像 L1（docker/npu/Dockerfile_aarch64）并推到 SWR。
+# 不含 L2（ci-lf / ci-swift），不含 PR 消费侧。手动触发。
+#
+# 依据的实测（2026-10-31，run 41183337303 / 41188921488 / 41190118452）：
+#   · ubuntu-22.04-arm：4 vCPU / 15 GiB + 3 GiB swap / 110 GB 可用磁盘
+#   · Docker 28.0.4 + buildx v0.38.1（docker-daemon 驱动，非远程 buildkitd）
+#   · quay.io 拉 cann:9.0.0-a3 全量 172 s（25.2 MiB/s）→ FROM 保持 quay.io
+#   · 推 SWR 4.00 MiB/s → L1 产物 6~8 GiB 约需 26~34 min
+#   · 4 核跑 PyTorch 源码编译 3~5 h，MAX_JOBS=8 需 24 GB 内存会 OOM → 默认 4
+#
+# 硬约束（SWR 只收 Docker v2s2，不收 OCI image index）：
+#   --output type=image,push=true,oci-mediatypes=false
+#   --provenance=false --sbom=false
+# 否则推送会以 404 MANIFEST_UNKNOWN 失败（GH runner 的 containerd/OCI 默认行为）。
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: '构建机（GH 托管有真 docker + buildx；自托管池可能没有 docker）'
+        required: true
+        default: 'ubuntu-22.04-arm'
+        type: choice
+        options:
+          - ubuntu-22.04-arm
+          - linux-aarch64-cpu-24
+          - linux-aarch64-cpu-4
+      should_push:
+        description: 'true=构建并推送；false=只验证 Dockerfile 能跑通（不产出镜像、不推送）'
+        required: true
+        default: true
+        type: boolean
+      push_tag:
+        description: '不可变 tag（留空 = 自动 base-<YYYYMMDD>-<sha7>）'
+        required: false
+        default: ''
+      max_jobs:
+        description: 'Dockerfile 里的 MAX_JOBS（4 核 15 GiB 建议 4；8 会 OOM）'
+        required: true
+        default: '4'
+      use_cache:
+        description: '是否用 GHA 构建缓存（type=gha）。首次构建建议 false，避免缓存导出失败拖垮整次构建'
+        required: true
+        default: false
+        type: boolean
+      free_disk:
+        description: '构建前腾磁盘（GH 托管有效；自托管可能无 sudo）。110 GB 本来就够，失败可忽略'
+        required: false
+        default: true
+        type: boolean
+
+# 同一个镜像不要并发构建，否则两次 4~5 h 的构建互相抢带宽且可能互相覆盖 tag
+concurrency:
+  group: image-ci-base
+  cancel-in-progress: false
+
+# 只读仓库即可；不写 package/issue
+permissions:
+  contents: read
+
+env:
+  REGISTRY: swr.cn-north-12.myhuaweicloud.com
+  REPOSITORY: ascend/torchturbo_npu
+  DOCKERFILE: docker/npu/Dockerfile_aarch64
+  PLATFORM: linux/arm64
+  MOVING_TAG: base-latest
+
+jobs:
+  build-base:
+    name: build base (${{ inputs.runner }})
+    runs-on: ${{ inputs.runner }}
+    # GH 托管 runner 硬上限 6 h（360 min）。PyTorch 4 核编译实测/估算 3~5 h，
+    # 留 10 min 给收尾步骤，否则超时后连 Summary 都写不出来。
+    timeout-minutes: 350
+
+    steps:
+      - name: ① 检出
+        uses: actions/checkout@v4
+
+      - name: ② 环境自检（docker / buildx / 磁盘 / 内存）
+        run: |
+          echo "runner : ${{ inputs.runner }}"
+          echo "host   : $(hostname)"
+          uname -m
+          echo "--- cpu / mem ---"
+          nproc
+          free -h
+          echo "--- disk ---"
+          df -h / | tail -1
+          echo "--- docker ---"
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "::error::本机没有 docker —— 这个池不能用来构建镜像（自托管池需先确认有 docker 或 buildkitd）"
+            exit 1
+          fi
+          docker version --format 'client={{.Client.Version}} server={{.Server.Version}}' || docker version | head -5
+          if docker buildx version >/dev/null 2>&1; then
+            docker buildx version
+            echo "::notice::buildx 可用"
+          else
+            echo "::error::docker buildx 不可用 —— 没有 buildx 就只能 docker build + docker push，会产出 OCI manifest 被 SWR 拒收"
+            exit 1
+          fi
+          echo "--- 校验架构与 PLATFORM 是否一致 ---"
+          # PLATFORM 写死在 env 里；若实际机器架构不同，buildx 会走 QEMU，而 runner 上没装 → 构建必失败
+          case "${PLATFORM}" in
+            linux/arm64) WANT=aarch64 ;;
+            linux/amd64) WANT=x86_64  ;;
+            *)           WANT=""      ;;
+          esac
+          HAVE=$(uname -m)
+          echo "uname -m = ${HAVE}，PLATFORM = ${PLATFORM}（期望 ${WANT:-<未知>}）"
+          if [ -n "$WANT" ] && [ "$HAVE" != "$WANT" ]; then
+            echo "::error::机器架构 ${HAVE} 与 PLATFORM ${PLATFORM} 不一致 —— 需要 QEMU，而本 runner 没装，构建会失败"
+            exit 1
+          fi
+          echo "--- 校验 Dockerfile 存在 ---"
+          test -f "$DOCKERFILE" || { echo "::error::找不到 $DOCKERFILE"; exit 1; }
+          head -3 "$DOCKERFILE"
+
+      - name: ③ 腾磁盘（可选，失败不阻断）
+        if: ${{ inputs.free_disk }}
+        continue-on-error: true
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          # 必须保留 swap：15 GiB 内存 + MAX_JOBS=4 本来就很贴（峰值约 12 GB），
+          # 这个 action 的 swap-storage 默认是 true，会把 3 GiB swap 一起删掉。
+          swap-storage: false
+
+      - name: ④ 建立 buildx builder（缓存导出需要 docker-container 驱动）
+        id: builder
+        run: |
+          set -uo pipefail
+          NAME="imageci-$$"
+          # docker 默认的 docker 驱动不支持 --cache-to type=gha 导出，
+          # 所以需要显式建一个 docker-container 驱动的 builder。
+          if docker buildx create --name "$NAME" --driver docker-container --use >/dev/null 2>&1; then
+            docker buildx inspect --bootstrap >/tmp/bx.log 2>&1 || true
+            echo "builder 配置完成：$NAME（docker-container）"
+            echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::建 docker-container builder 失败，退回默认 builder；GHA 缓存导出将不可用"
+            tail -20 /tmp/bx.log 2>/dev/null || true
+            echo "name=" >> "$GITHUB_OUTPUT"
+          fi
+          docker buildx ls | head -20 || true
+
+      - name: ⑤ 计算 tag
+        id: tag
+        run: |
+          set -uo pipefail
+          STAMP=$(date -u +%Y%m%d)
+          SHORT_SHA=$(printf '%s' "${GITHUB_SHA:-local}" | cut -c1-7)
+          INPUT_TAG="${{ inputs.push_tag }}"
+          if [ -n "$INPUT_TAG" ]; then
+            IMMUTABLE="$INPUT_TAG"
+          else
+            IMMUTABLE="base-${STAMP}-${SHORT_SHA}"
+          fi
+          FULL="${REGISTRY}/${REPOSITORY}"
+          echo "immutable=${IMMUTABLE}" >> "$GITHUB_OUTPUT"
+          echo "full=${FULL}" >> "$GITHUB_OUTPUT"
+          echo "::notice::不可变 tag = ${FULL}:${IMMUTABLE}；滚动 tag = ${FULL}:${MOVING_TAG}"
+
+      - name: ⑥ 登录 SWR（仅 should_push=true）
+        if: ${{ inputs.should_push }}
+        env:
+          SWR_USER: ${{ secrets.SWR_USERNAME }}
+          SWR_PASS: ${{ secrets.SWR_PASSWORD }}
+        run: |
+          set -uo pipefail
+          if [ -z "${SWR_USER:-}" ] || [ -z "${SWR_PASS:-}" ]; then
+            echo "::error::SWR_USERNAME / SWR_PASSWORD 为空 —— 请在 Settings → Secrets 里配置"
+            exit 1
+          fi
+          if ! printf '%s' "$SWR_PASS" | docker login "$REGISTRY" -u "$SWR_USER" --password-stdin >/tmp/login.log 2>&1; then
+            echo "::error::docker login 失败"
+            tail -10 /tmp/login.log || true
+            exit 1
+          fi
+          echo "::notice::docker login 成功（${REGISTRY}）"
+
+      - name: ⑦ 前置检查（不可变 tag 已存在则拒绝，不覆盖）
+        if: ${{ inputs.should_push }}
+        env:
+          TAG_IMM: ${{ steps.tag.outputs.immutable }}
+        run: |
+          set -uo pipefail
+          HOST="${REGISTRY%%/*}"
+          ANON=$(curl -sS -m 20 "https://${HOST}/swr/auth/v2/registry/auth/?service=dockyard&scope=repository:${REPOSITORY}:pull" \
+            | python3 -c "import sys,json;print(json.load(sys.stdin).get('token',''))" 2>/dev/null)
+          if [ -z "$ANON" ]; then
+            echo "::warning::仓库匿名不可读，跳过前置检查"
+            exit 0
+          fi
+          ACC='application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json'
+          CODE=$(curl -sS -m 20 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${ANON}" -H "Accept: ${ACC}" \
+            "https://${HOST}/v2/${REPOSITORY}/manifests/${TAG_IMM}")
+          echo "GET manifests/${TAG_IMM} → HTTP ${CODE}"
+          if [ "$CODE" = "200" ]; then
+            echo "::error::${REPOSITORY}:${TAG_IMM} 已存在，拒绝覆盖。请换 push_tag。"
+            exit 1
+          fi
+          echo "::notice::前置检查通过：${TAG_IMM} 空闲"
+
+      - name: ⑧ 构建并推送基础镜像
+        id: build
+        env:
+          TAG_IMM: ${{ steps.tag.outputs.immutable }}
+          FULL: ${{ steps.tag.outputs.full }}
+          MAX_JOBS: ${{ inputs.max_jobs }}
+          SHOULD_PUSH: ${{ inputs.should_push }}
+          USE_CACHE: ${{ inputs.use_cache }}
+          BUILDER: ${{ steps.builder.outputs.name }}
+        run: |
+          set -uo pipefail
+          START=$(date +%s)
+          echo "begin=$(date -u +%H:%M:%S)"
+
+          # tag 参数 / 输出目标
+          # 注意：type=cacheonly 不产出镜像，只导出缓存，所以这一支不能带 -t
+          if [ "$SHOULD_PUSH" = "true" ]; then
+            TAG_ARGS=(-t "${FULL}:${TAG_IMM}" -t "${FULL}:${MOVING_TAG}")
+            # SWR 只收 Docker v2s2：必须 oci-mediatypes=false，且关掉 provenance/sbom
+            OUTPUT="type=image,push=true,oci-mediatypes=false"
+          else
+            # 只验证 Dockerfile：跑完构建但不落盘、不推送
+            TAG_ARGS=()
+            OUTPUT="type=cacheonly"
+            echo "::notice::should_push=false —— 只验证构建，不产出镜像、不推送"
+          fi
+
+          CACHE_ARGS=()
+          if [ "$USE_CACHE" = "true" ] && [ -n "${BUILDER:-}" ]; then
+            CACHE_ARGS+=(--cache-from "type=gha,scope=torchturbo-base")
+            CACHE_ARGS+=(--cache-to "type=gha,mode=max,scope=torchturbo-base")
+            echo "缓存：type=gha,mode=max（scope=torchturbo-base）"
+          else
+            echo "缓存：未启用（首次构建建议关闭；GHA 缓存导出失败会让整次构建失败）"
+          fi
+
+          echo "--- 构建参数 ---"
+          echo "dockerfile : ${DOCKERFILE}"
+          echo "platform   : ${PLATFORM}"
+          echo "MAX_JOBS   : ${MAX_JOBS}"
+          echo "tags       : ${TAG_ARGS[*]}"
+          echo "output     : ${OUTPUT}"
+
+          # digest 是构建的“输出产物”，不是可配参数：由内容寻址算出，只能读不能造。
+          # --metadata-file 让 buildx 把产出的 manifest digest 落盘，
+          # 比事后再拿 imagetools inspect 回查更可靠（不依赖 registry 已可见）。
+          META_ARGS=()
+          if [ "$SHOULD_PUSH" = "true" ]; then
+            META_ARGS=(--metadata-file /tmp/build-meta.json)
+          fi
+
+          set +e
+          BUILDER_ARGS=()
+          if [ -n "${BUILDER:-}" ]; then
+            BUILDER_ARGS=(--builder "${BUILDER}")
+          fi
+          docker buildx build \
+            "${BUILDER_ARGS[@]}" \
+            --platform "$PLATFORM" \
+            --file "$DOCKERFILE" \
+            --build-arg "MAX_JOBS=${MAX_JOBS}" \
+            --provenance=false --sbom=false \
+            "${CACHE_ARGS[@]}" \
+            "${META_ARGS[@]}" \
+            "${TAG_ARGS[@]}" \
+            --output "$OUTPUT" \
+            . 2>&1 | tee /tmp/build.log
+          RC=${PIPESTATUS[0]}
+
+          ELAPSED=$(( $(date +%s) - START ))
+          echo "elapsed=${ELAPSED}" >> "$GITHUB_OUTPUT"
+          echo "rc=${RC}" >> "$GITHUB_OUTPUT"
+          echo "end=$(date -u +%H:%M:%S)"
+          echo "::notice::构建耗时 $(( ELAPSED / 60 )) min（rc=${RC}）"
+
+          if [ "$RC" != "0" ]; then
+            echo "::error::构建失败（rc=${RC}），最后 40 行见下"
+            tail -40 /tmp/build.log || true
+            exit "$RC"
+          fi
+
+          # ---- 取出本次构建产出的 digest ----
+          DIGEST=""
+          if [ -f /tmp/build-meta.json ]; then
+            DIGEST=$(python3 -c "import json;print(json.load(open('/tmp/build-meta.json')).get('containerimage.digest',''))" 2>/dev/null)
+            echo "--- build-meta.json ---"
+            cat /tmp/build-meta.json || true
+          fi
+          if [ -z "$DIGEST" ] && [ "$SHOULD_PUSH" = "true" ]; then
+            DIGEST=$(docker buildx imagetools inspect "${FULL}:${TAG_IMM}" \
+                       --format '{{.Manifest.Digest}}' 2>/dev/null || true)
+          fi
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          if [ -n "$DIGEST" ]; then
+            echo "ref=${FULL}@${DIGEST}" >> "$GITHUB_OUTPUT"
+            echo "::notice::本次 digest = ${DIGEST}"
+            echo "::notice::严格引用写法 = ${FULL}@${DIGEST}"
+          else
+            echo "::notice::未推送到 registry，无 digest（should_push=${SHOULD_PUSH}）"
+          fi
+
+      - name: ⑨ 校验产物（只有推送时才回读 manifest）
+        id: verify
+        if: ${{ inputs.should_push && success() }}
+        env:
+          TAG_IMM: ${{ steps.tag.outputs.immutable }}
+          FULL: ${{ steps.tag.outputs.full }}
+          BUILD_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -uo pipefail
+          echo "media_type=" >> "$GITHUB_OUTPUT"
+
+          # digest 已在 ⑧ 由 --metadata-file 取出，这里不再重复解析
+          DIGEST="${BUILD_DIGEST:-}"
+          echo "digest = ${DIGEST:-<unknown>}"
+
+          echo "--- 本地 tag ---"
+          docker buildx imagetools inspect "${FULL}:${TAG_IMM}" 2>/dev/null | head -20 || true
+
+          HOST="${REGISTRY%%/*}"
+          ANON=$(curl -sS -m 20 "https://${HOST}/swr/auth/v2/registry/auth/?service=dockyard&scope=repository:${REPOSITORY}:pull" \
+            | python3 -c "import sys,json;print(json.load(sys.stdin).get('token',''))" 2>/dev/null)
+          if [ -z "$ANON" ]; then
+            echo "::warning::拿不到匿名 token，跳过格式校验"
+            exit 0
+          fi
+
+          # Accept 同时给 Docker v2s2 与 OCI，否则 OCI 会被 404 掩盖
+          ACC='application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json'
+          MAN=$(curl -sS -m 30 -H "Authorization: Bearer ${ANON}" -H "Accept: ${ACC}" \
+            "https://${HOST}/v2/${REPOSITORY}/manifests/${TAG_IMM}" 2>/dev/null)
+          FMT=$(printf '%s' "$MAN" | python3 -c "import sys,json;d=json.loads(sys.stdin.read() or '{}');print(d.get('mediaType',''))" 2>/dev/null)
+          LAYERS=$(printf '%s' "$MAN" | python3 -c "import sys,json;d=json.loads(sys.stdin.read() or '{}');print(sum(l.get('size',0) for l in d.get('layers',[])))" 2>/dev/null)
+          echo "media_type=${FMT}" >> "$GITHUB_OUTPUT"
+
+          echo "--- 服务端回读 ---"
+          echo "mediaType = ${FMT:-<空>}"
+          case "${LAYERS:-}" in
+            ''|*[!0-9]*) LAYERS=0 ;;
+          esac
+          if [ "$LAYERS" -gt 0 ]; then
+            GIB=$(awk -v b="$LAYERS" 'BEGIN{printf "%.2f", b/1073741824}')
+            echo "::notice::镜像压缩后 ${GIB} GiB（${LAYERS} bytes）—— 按 4.00 MiB/s 推过约 $(( LAYERS / 4194304 / 60 )) min"
+          fi
+
+          case "$FMT" in
+            application/vnd.docker.distribution.manifest.v2+json)
+              echo "::notice::存的是 Docker v2s2 manifest ✓" ;;
+            *oci.image.*)
+              echo "::error::存的是 OCI manifest —— SWR 下游可能拒收。检查是否漏了 oci-mediatypes=false"
+              exit 1 ;;
+            *)
+              echo "::warning::未识别的 manifest 格式：${FMT:-<空>}" ;;
+          esac
+
+      - name: ⑩ 汇总到 Job Summary
+        if: always()
+        run: |
+          {
+            echo "## Image CI (base)"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| runner | \`${{ inputs.runner }}\` |"
+            echo "| Dockerfile | \`${{ env.DOCKERFILE }}\` |"
+            echo "| platform | \`${{ env.PLATFORM }}\` |"
+            echo "| MAX_JOBS | \`${{ inputs.max_jobs }}\` |"
+            echo "| 使用缓存 | \`${{ inputs.use_cache }}\` |"
+            echo "| 推送 | \`${{ inputs.should_push }}\` |"
+            echo "| 不可变 tag | \`${{ steps.tag.outputs.full }}:${{ steps.tag.outputs.immutable }}\` |"
+            echo "| 滚动 tag | \`${{ steps.tag.outputs.full }}:${{ env.MOVING_TAG }}\` |"
+            echo "| digest | \`${{ steps.build.outputs.digest || 'n/a' }}\` |"
+            echo "| manifest 格式 | \`${{ steps.verify.outputs.media_type || 'n/a' }}\` |"
+            echo "| 构建耗时 | \`${{ steps.build.outputs.elapsed || 'n/a' }}\` s |"
+            echo ""
+            echo "### 消费方式"
+            echo ""
+            echo "**方式 A · 不可变 tag（推荐日常使用）**"
+            echo ""
+            echo '```yaml'
+            echo "container:"
+            echo "  image: ${{ steps.tag.outputs.full }}:${{ steps.tag.outputs.immutable }}"
+            echo '```'
+            echo ""
+            echo "**方式 B · 钉 digest（严格复现，tag 被覆盖也不受影响）**"
+            echo ""
+            echo '```yaml'
+            echo "container:"
+            echo "  image: ${{ steps.build.outputs.ref || 'n/a（本次未推送，无 digest）' }}"
+            echo '```'
+            echo ""
+            echo "> tag 是名字、digest 是内容。tag 可以被重新指向别的镜像，digest 永远指同一批字节。"
+            echo "> 需要“永远不变”的引用就写 \`repo@sha256:...\`；否则用不可变 tag 即可（每次重建都是新名字，kubelet 必然重拉）。"
+            echo "> 本 workflow 只构建 **L1 base**；L2（ci-lf / ci-swift）由后续 workflow 基于它构建。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: ⑪ 清理 buildx builder
+        if: always()
+        run: |
+          B="${{ steps.builder.outputs.name }}"
+          if [ -n "${B:-}" ]; then
+            docker buildx rm "$B" >/dev/null 2>&1 || true
+            echo "已删除 builder $B"
+          fi
+          # 大镜像很占磁盘，自托管 runner 上尤其要注意
+          docker image prune -f >/dev/null 2>&1 || true
+          df -h / | tail -1
