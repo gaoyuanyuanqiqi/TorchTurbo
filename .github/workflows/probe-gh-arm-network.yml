@@ -1,18 +1,20 @@
 name: Probe GH ARM Network
 
 # 目的：用一次可对比的实测，回答"构建镜像放 GitHub 托管 ubuntu-22.04-arm 还是自托管
-# linux-aarch64-cpu-4"这个问题的网络那一半。
+# linux-aarch64-cpu-4"这个问题的网络那一半；同时可对比不同 registry 的下载速度。
 #
-# 背景数字（已从 registry 侧确认，不是猜的）：
-#   swr.cn-south-1/ascendhub/cann:9.0.0-a3-openeuler24.03-py3.11  arm64
-#     6 层，压缩后 4.24 GiB，最大单层 3899 MiB
-#   即：每次在 GitHub 托管 runner 上新建镜像，都要重新把这 4.24 GiB 拉一遍
-#   （GH 托管的 type=gha 构建缓存不含 base image，机器也是全新的）。
+# 默认配置 = 从 ubuntu-22.04-arm 测 quay.io/ascend/cann 的拉取速度，
+# 并以 swr.cn-south-1/ascendhub/cann 作为同一次 run 内的对照组（同一镜像、同一 layer）。
 #
 # 要回答的三个问题：
-#   ① 从这台机器到 SWR 的单连接吞吐是多少（分片取样，不受镜像总大小影响）
-#   ② 完整 docker pull 实际要多久，拉完后磁盘还剩多少（GH arm 只有 ~14 GB，可能先炸磁盘）
+#   ① 主 registry 与对照 registry 的匿名 token / TTFB 差异
+#   ② 各自的分片吞吐（128 MiB 取样，不受镜像总大小影响），以及冷拉耗时外推
 #   ③ 这台机器到底有没有构建能力（docker / buildx / buildctl / BUILDKITD_ADDR）
+#
+# 用法：手动触发，runner 选 ubuntu-22.04-arm 跑一次，再选 linux-aarch64-cpu-4 跑一次，
+# 对比两次的 Job Summary。
+#   · 若 linux-aarch64-cpu-4 一直 Queued / 报 no runner → 该池没授予本仓库
+#   · 所有关键结论都用 ::notice:: 输出，未登录也能在 Actions 页面看到 annotation
 #
 # 用法：手动触发，runner 选 ubuntu-22.04-arm 跑一次，再选 linux-aarch64-cpu-4 跑一次，
 # 对比两次的 Job Summary。
@@ -34,29 +36,33 @@ on:
           - linux-aarch64-cpu-4
           - linux-aarch64-cpu-24
       image:
-        description: '待测的基础镜像（= docker/npu/Dockerfile_aarch64 的 FROM 目标）'
+        description: '待测镜像（主目标）'
         required: true
-        default: 'swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.0.0-a3-openeuler24.03-py3.11'
+        default: 'quay.io/ascend/cann:9.0.0-a3-openeuler24.03-py3.11'
       registry:
-        description: '镜像所在 registry（用于取匿名 token）'
+        description: '主 registry 主机名（用于取匿名 token）'
         required: true
-        default: 'swr.cn-south-1.myhuaweicloud.com'
+        default: 'quay.io'
       repository:
-        description: '镜像仓库路径（用于取匿名 token）'
+        description: '主镜像仓库路径（用于取匿名 token）'
         required: true
+        default: 'ascend/cann'
+      compare_registry:
+        description: '对照组 registry（留空则不测；默认 swr.cn-south-1 做同 run A/B）'
+        required: false
+        default: 'swr.cn-south-1.myhuaweicloud.com'
+      compare_repository:
+        description: '对照组仓库路径'
+        required: false
         default: 'ascendhub/cann'
-      blob_digest:
-        description: '取样测速用的层 digest（默认 = 上面镜像的最大层，3899 MiB）'
-        required: true
-        default: 'sha256:125d2ec216d83c74f0afc907bfc5af7061e82008387fcb2b2656a89a1b63e215'
       sample_mib:
         description: '分片取样大小（MiB）'
         required: true
         default: '128'
       full_pull:
-        description: '是否做完整 docker pull（会占 12~15 GB 磁盘）'
+        description: '是否做完整 docker pull（会占 12~15 GB 磁盘；quay 若很慢可能 30~45 min）'
         required: false
-        default: true
+        default: false
         type: boolean
       verify_push:
         description: '是否验证 SWR 写凭证 + 推送链路（推一个 128 MiB 随机层测上传速度，推完立即删除）'
@@ -85,7 +91,7 @@ jobs:
   probe:
     name: probe (${{ inputs.runner }})
     runs-on: ${{ inputs.runner }}
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
       - name: ① 机器 / 磁盘 / 内核
@@ -117,86 +123,168 @@ jobs:
         continue-on-error: true
         run: |
           REG="${{ inputs.registry }}"
+          REPO="${{ inputs.repository }}"
+          # 各家 registry 的匿名 token 端点不一样，按 host 选
+          case "$REG" in
+            quay.io)  AUTH_URL="https://quay.io/v2/auth?service=quay.io&scope=repository:${REPO}:pull" ;;
+            ghcr.io)  AUTH_URL="https://ghcr.io/token?service=ghcr.io&scope=repository:${REPO}:pull" ;;
+            docker.io|registry-1.docker.io)
+                      AUTH_URL="https://auth.docker.io/token?service=registry.docker.io&scope=repository:${REPO}:pull" ;;
+            *)        AUTH_URL="https://${REG}/swr/auth/v2/registry/auth/?service=dockyard&scope=repository:${REPO}:pull" ;;
+          esac
+          echo "auth url: ${AUTH_URL}"
           echo "--- DNS ---"
           getent hosts "$REG" || echo "DNS FAILED"
           echo "--- TLS 握手 + 匿名 token 往返（跑 3 次看抖动）---"
           for i in 1 2 3; do
             curl -sS -m 20 -o /dev/null \
               -w "  try$i  dns=%{time_namelookup}s connect=%{time_connect}s ttfb=%{time_starttransfer}s\n" \
-              "https://${REG}/swr/auth/v2/registry/auth/?service=dockyard&scope=repository:${{ inputs.repository }}:pull" \
-              2>&1 || echo "  try$i FAILED"
+              "$AUTH_URL" 2>&1 || echo "  try$i FAILED"
           done
           echo "--- 对照：公网 github ---"
           curl -sS -m 15 -o /dev/null -w "  github ttfb=%{time_starttransfer}s\n" https://github.com 2>&1 || true
 
-      - name: ④ 镜像体积核算 + 分片吞吐（最能代表持续带宽）
+      - name: ④ 镜像体积核算 + 分片吞吐（主 registry 与对照组各测一次）
         id: throughput
         continue-on-error: true
         env:
           REG: ${{ inputs.registry }}
           REPO: ${{ inputs.repository }}
           IMAGE: ${{ inputs.image }}
-          BLOB: ${{ inputs.blob_digest }}
+          CMP_REG: ${{ inputs.compare_registry }}
+          CMP_REPO: ${{ inputs.compare_repository }}
           SAMPLE_MIB: ${{ inputs.sample_mib }}
         run: |
           set -uo pipefail
-          TK=$(curl -sS -m 30 \
-            "https://${REG}/swr/auth/v2/registry/auth/?service=dockyard&scope=repository:${REPO}:pull" \
-            | python3 -c "import sys,json;print(json.load(sys.stdin).get('token',''))" 2>/dev/null)
-          if [ -z "$TK" ]; then
-            echo "::warning::拿不到匿名 token，跳过体积核算与吞吐测量"
-            exit 0
-          fi
 
-          # ---- 体积核算：拉 manifest list → 选本架构子 manifest → 累加 layer 压缩后字节数 ----
-          TAG="${IMAGE##*:}"
           case "$(uname -m)" in
             aarch64|arm64) ARCH=arm64 ;;
             x86_64|amd64)  ARCH=amd64 ;;
             *)             ARCH="$(uname -m)" ;;
           esac
-          LIST=$(curl -sS -m 30 -H "Authorization: Bearer ${TK}" \
-            -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.index.v1+json' \
-            "https://${REG}/v2/${REPO}/manifests/${TAG}" 2>/dev/null || echo '')
-          # 单行 python：JSON 不合法时 traceback 到 stderr，stdout 为空 → 走下面的 else 分支
-          CHILD=$(printf '%s' "$LIST" \
-            | python3 -c "import sys,json;d=json.loads(sys.stdin.read() or '{}');a='${ARCH}';h=[m['digest'] for m in d.get('manifests',[]) if m.get('platform',{}).get('architecture')==a];print(h[0] if h else '')" \
-              2>/dev/null)
-          BYTES=0
-          if [ -n "$CHILD" ]; then
-            BYTES=$(curl -sS -m 30 -H "Authorization: Bearer ${TK}" \
-              -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
-              "https://${REG}/v2/${REPO}/manifests/${CHILD}" 2>/dev/null \
-              | python3 -c "import sys,json;d=json.loads(sys.stdin.read() or '{}');print(sum(l.get('size',0) for l in d.get('layers',[])))" \
-                2>/dev/null)
-            case "$BYTES" in
-              ''|*[!0-9]*) BYTES=0 ;;
+          SAMPLE="${SAMPLE_MIB:-128}"
+          case "$SAMPLE" in ''|*[!0-9]*) SAMPLE=128 ;; esac
+          TAG="${IMAGE##*:}"
+          echo "arch=${ARCH}  tag=${TAG}  sample=${SAMPLE} MiB"
+
+          # 各家 registry 的匿名 token 端点不一样，按 host 自动选
+          token_for() {   # $1=host $2=repo
+            case "$1" in
+              quay.io)
+                URL="https://quay.io/v2/auth?service=quay.io&scope=repository:$2:pull" ;;
+              ghcr.io)
+                URL="https://ghcr.io/token?service=ghcr.io&scope=repository:$2:pull" ;;
+              docker.io|registry-1.docker.io)
+                URL="https://auth.docker.io/token?service=registry.docker.io&scope=repository:$2:pull" ;;
+              *)
+                URL="https://$1/swr/auth/v2/registry/auth/?service=dockyard&scope=repository:$2:pull" ;;
             esac
-            if [ "$BYTES" -gt 0 ]; then
-              CGIB=$(awk -v b="$BYTES" 'BEGIN{printf "%.2f", b/1073741824}')
-              echo "compressed_gib=${CGIB}" >> "$GITHUB_OUTPUT"
-              echo "::notice::${ARCH} 镜像压缩后 ${CGIB} GiB（${BYTES} bytes，这就是每次冷拉要下载的字节数）"
-            else
-              echo "::warning::拿到了子 manifest 但没解析出 layer 大小"
+            curl -sS -m 30 "$URL" 2>/dev/null \
+              | python3 -c "import sys,json;d=json.loads(sys.stdin.read() or '{}');print(d.get('token') or d.get('access_token') or '')" 2>/dev/null
+          }
+
+          # 结果写回这两个全局变量，调用方读完后自行保存
+          RESULT_GIB=""
+          RESULT_MIBPS=""
+          measure() {   # $1=label $2=host $3=repo $4=tag
+            local LABEL="$1" H="$2" R="$3" TG="$4"
+            local TK LIST CHILD MAN TOTAL BIG BIGBLOB TGIB BEND OUT MIBPS
+
+            RESULT_GIB=""; RESULT_MIBPS=""
+            TGIB=""
+
+            TK=$(token_for "$H" "$R")
+            if [ -z "$TK" ]; then
+              echo "::warning::${LABEL}: 拿不到匿名 token，跳过（${H}/${R}）"
+              return 0
             fi
+
+            LIST=$(curl -sS -m 30 -H "Authorization: Bearer ${TK}" \
+              -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json' \
+              "https://${H}/v2/${R}/manifests/${TG}" 2>/dev/null || echo '')
+            # 单行 python：JSON 不合法时 stdout 为空 → 后面走单平台分支
+            CHILD=$(printf '%s' "$LIST" \
+              | python3 -c "import sys,json;d=json.loads(sys.stdin.read() or '{}');a='${ARCH}';h=[m['digest'] for m in d.get('manifests',[]) if m.get('platform',{}).get('architecture')==a];print(h[0] if h else '')" 2>/dev/null)
+
+            if [ -n "$CHILD" ]; then
+              echo "${LABEL}: ${ARCH} 子 manifest = ${CHILD}"
+              MAN=$(curl -sS -m 30 -H "Authorization: Bearer ${TK}" \
+                -H 'Accept: application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json' \
+                "https://${H}/v2/${R}/manifests/${CHILD}" 2>/dev/null)
+            else
+              echo "${LABEL}: 不是 manifest list，按单平台处理"
+              MAN="$LIST"
+            fi
+
+            # 单行 python：输出 "总字节数 最大层字节数 最大层digest"
+            read -r TOTAL BIG BIGBLOB < <(printf '%s' "$MAN" \
+              | python3 -c "import sys,json;d=json.loads(sys.stdin.read() or '{}');ls=[(l.get('size',0),l.get('digest','')) for l in d.get('layers',[])];t=sum(s for s,_ in ls);b=max(ls) if ls else (0,'');print(t,b[0],b[1])" 2>/dev/null)
+
+            case "${TOTAL:-}" in ''|*[!0-9]*) TOTAL=0 ;; esac
+            case "${BIG:-}" in ''|*[!0-9]*) BIG=0 ;; esac
+            if [ "$TOTAL" -gt 0 ]; then
+              TGIB=$(awk -v b="$TOTAL" 'BEGIN{printf "%.2f", b/1073741824}')
+              RESULT_GIB="$TGIB"
+              echo "::notice::${LABEL}: ${ARCH} 压缩后 ${TGIB} GiB（${TOTAL} bytes，冷拉要下载这么多）"
+            else
+              echo "::warning::${LABEL}: 没解析出 layer 大小"
+            fi
+
+            if [ "$BIG" -le 0 ] || [ -z "${BIGBLOB:-}" ]; then
+              echo "::warning::${LABEL}: 没有可用的大层 digest，跳过分片测速"
+              return 0
+            fi
+            echo "${LABEL}: 取样层 ${BIGBLOB}（$(( BIG / 1048576 )) MiB）"
+
+            BEND=$(( SAMPLE * 1024 * 1024 - 1 ))
+            OUT=$(curl -sS -m 900 -L -o /dev/null \
+              -w '%{http_code} %{size_download} %{speed_download} %{time_total}' \
+              -r "0-${BEND}" -H "Authorization: Bearer ${TK}" \
+              "https://${H}/v2/${R}/blobs/${BIGBLOB}" 2>&1) || OUT="FAILED"
+            echo "${LABEL} 分片(${SAMPLE} MiB) code size_B speed_Bps total_s = ${OUT}"
+            set -- $OUT
+            if [ "$1" = "206" ] || [ "$1" = "200" ]; then
+              MIBPS=$(awk -v s="$3" 'BEGIN{printf "%.2f", s/1048576}')
+              RESULT_MIBPS="$MIBPS"
+              echo "::notice::${LABEL}: 分片吞吐 ${MIBPS} MiB/s（${SAMPLE} MiB 取样，取自 ${H}）"
+            else
+              echo "::warning::${LABEL}: 分片下载异常 → ${OUT}"
+            fi
+          }
+
+          # ---- 主 registry ----
+          measure "主(${REG})" "$REG" "$REPO" "$TAG"
+          P_GIB="$RESULT_GIB"; P_MIBPS="$RESULT_MIBPS"
+
+          # ---- 对照组 ----
+          C_GIB=""; C_MIBPS=""
+          if [ -n "${CMP_REG:-}" ] && [ -n "${CMP_REPO:-}" ] \
+             && [ "${CMP_REG}/${CMP_REPO}" != "${REG}/${REPO}" ]; then
+            measure "对照(${CMP_REG})" "$CMP_REG" "$CMP_REPO" "$TAG"
+            C_GIB="$RESULT_GIB"; C_MIBPS="$RESULT_MIBPS"
           else
-            echo "::warning::没能解析 ${TAG} 的 ${ARCH} 子 manifest（可能不是 manifest list，或 tag 不存在）"
+            echo "::notice::未配置对照组（或与主 registry 相同），跳过 A/B"
           fi
 
-          # ---- 分片吞吐：只读 128 MiB，不受镜像总大小影响 ----
-          END=$(( SAMPLE_MIB * 1024 * 1024 - 1 ))
-          OUT=$(curl -sS -m 900 -L -o /dev/null \
-            -w '%{http_code} %{size_download} %{speed_download} %{time_total}' \
-            -r "0-${END}" -H "Authorization: Bearer ${TK}" \
-            "https://${REG}/v2/${REPO}/blobs/${BLOB}" 2>&1) || OUT="FAILED"
-          echo "code size_B speed_Bps total_s = $OUT"
-          set -- $OUT
-          if [ "$1" = "206" ] || [ "$1" = "200" ]; then
-            MBPS=$(awk -v s="$3" 'BEGIN{printf "%.2f", s/1048576}')
-            echo "speed_mibps=${MBPS}" >> "$GITHUB_OUTPUT"
-            echo "::notice::分片吞吐 ${MBPS} MiB/s（${SAMPLE_MIB} MiB 取样，取自 ${REG}）"
-          else
-            echo "::warning::分片下载异常: $OUT"
+          # ---- 写 outputs ----
+          [ -n "${P_GIB:-}" ]   && echo "compressed_gib=${P_GIB}" >> "$GITHUB_OUTPUT"
+          [ -n "${P_MIBPS:-}" ] && echo "speed_mibps=${P_MIBPS}" >> "$GITHUB_OUTPUT"
+          [ -n "${C_GIB:-}" ]   && echo "cmp_compressed_gib=${C_GIB}" >> "$GITHUB_OUTPUT"
+          [ -n "${C_MIBPS:-}" ] && echo "cmp_speed_mibps=${C_MIBPS}" >> "$GITHUB_OUTPUT"
+
+          # ---- 对比与冷拉耗时外推 ----
+          if [ -n "${P_MIBPS:-}" ] && [ -n "${C_MIBPS:-}" ]; then
+            RATIO=$(awk -v a="$P_MIBPS" -v b="$C_MIBPS" 'BEGIN{ if(b<=0) b=0.0001; printf "%.2f", a/b }')
+            if awk -v r="$RATIO" 'BEGIN{exit !(r>=1)}'; then
+              echo "::notice::A/B: 主 registry 比对照快 ${RATIO}×"
+            else
+              INV=$(awk -v r="$RATIO" 'BEGIN{printf "%.2f", 1/r}')
+              echo "::notice::A/B: 主 registry 比对照慢 ${INV}×"
+            fi
+          fi
+          if [ -n "${P_GIB:-}" ] && [ -n "${P_MIBPS:-}" ]; then
+            MIN=$(awk -v g="$P_GIB" -v s="$P_MIBPS" 'BEGIN{ if(s<=0) s=0.0001; printf "%.1f", g*1024/s/60 }')
+            echo "::notice::按主 registry ${P_MIBPS} MiB/s 外推，冷拉 ${P_GIB} GiB 约需 ${MIN} 分钟（不含解压与重试）"
           fi
 
       - name: ⑤ 完整 docker pull 计时 + 磁盘余量
@@ -239,9 +327,9 @@ jobs:
             tail -30 /tmp/pull.log || true
             df -h / | tail -1
             if grep -qi 'no space left' /tmp/pull.log; then
-              echo "::error::磁盘写满（GH arm 只有 ~14 GB），pull 失败 —— 这是比网速更早的硬约束"
+              echo "::error::磁盘写满（GH arm 实测 146 GB 总量 / 110 GB 可用，解压后约 11 GB，正常不会炸）—— 检查是否是 /tmp 分区"
             else
-              echo "::error::完整 pull 失败，见上方日志"
+              echo "::error::完整 pull 失败，见上方日志（quay.io 常见原因：限流 / 丢包 / 单层 3.9 GiB 无断点续传）"
             fi
           fi
 
@@ -551,9 +639,12 @@ jobs:
             echo "| 项 | 值 |"
             echo "|---|---|"
             echo "| runner | \`${{ inputs.runner }}\` |"
-            echo "| image | \`${{ inputs.image }}\` |"
-            echo "| 分片吞吐 | \`${{ steps.throughput.outputs.speed_mibps || 'n/a' }}\` MiB/s |"
-            echo "| 镜像压缩后体积 | \`${{ steps.throughput.outputs.compressed_gib || 'n/a' }}\` GiB |"
+            echo "| 主镜像 | \`${{ inputs.image }}\` |"
+            echo "| 主 分片吞吐 | \`${{ steps.throughput.outputs.speed_mibps || 'n/a' }}\` MiB/s |"
+            echo "| 主 镜像压缩后体积 | \`${{ steps.throughput.outputs.compressed_gib || 'n/a' }}\` GiB |"
+            echo "| 对照 registry | \`${{ inputs.compare_registry || 'n/a' }}\` |"
+            echo "| 对照 分片吞吐 | \`${{ steps.throughput.outputs.cmp_speed_mibps || 'n/a' }}\` MiB/s |"
+            echo "| 对照 镜像压缩后体积 | \`${{ steps.throughput.outputs.cmp_compressed_gib || 'n/a' }}\` GiB |"
             echo "| 完整 pull 成功 | \`${{ steps.fullpull.outputs.pull_ok || 'n/a' }}\` |"
             echo "| 完整 pull 耗时 | \`${{ steps.fullpull.outputs.elapsed || 'n/a' }}\` s |"
             echo "| 写凭证验证 | $([[ '${{ inputs.verify_push }}' == 'true' ]] && echo '已开启' || echo '未开启') |"
