@@ -16,10 +16,13 @@ on:
           - linux-aarch64-a3-800i-4
           - linux-aarch64-a3-800i-8
           - linux-aarch64-a3-800i-16
+      # 默认走华为云 SWR 镜像（ascendhub 官方仓库的国内副本），与 quay.io/ascend/cann
+      # 同 tag 的 manifest/arm64 子 manifest digest 完全一致（同一镜像），但国内链路快得多。
+      # quay.io 直连单层 3.9 GiB 拉取极慢，容易卡在 Set up job / Initialize containers。
       image:
         description: 'container.image（必须是 arm64 镜像；不指定 container 不会分配 NPU）'
         required: true
-        default: 'quay.io/ascend/cann:9.0.0-a3-openeuler24.03-py3.11'
+        default: 'swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.0.0-a3-openeuler24.03-py3.11'
       check_torchturbo:
         description: '额外检查 torchturbo 能否 import'
         required: false

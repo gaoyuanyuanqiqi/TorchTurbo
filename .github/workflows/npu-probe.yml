@@ -1,7 +1,8 @@
 name: NPU Runner Probe
 
 # 目的：不构建任何镜像，直接用 docker/npu/Dockerfile_aarch64 的 FROM 基础镜像
-# （quay.io/ascend/cann:9.0.0-a3-openeuler24.03-py3.11）在 a3-800i-2 上跑一遍探针，
+# （cann:9.0.0-a3-openeuler24.03-py3.11）在 a3-800i-2 上跑一遍探针，
+# 基础镜像用华为云 SWR 的国内副本（与 quay.io/ascend/cann 同 digest，见 inputs.image 注释），
 # 一次跑完回答五个问题：
 #   ① 这个 container.image 能否在 a3-800i-2 上启动（能否 pull、是否 arm64）
 #   ② 能不能拿到 2 张 NPU，两卡能不能真的算出结果
@@ -25,10 +26,13 @@ on:
           - linux-aarch64-a3-800i-4
           - linux-aarch64-a3-800i-8
           - linux-aarch64-a3-800i-16
+      # 默认 = Dockerfile_aarch64 的 FROM 基础镜像，但改走华为云 SWR 的 ascendhub 官方副本：
+      # 同 tag 的 manifest list / arm64 子 manifest digest 与 quay.io 完全一致（同一镜像内容），
+      # 而 quay 那条 3.9 GiB 单体层在国内链路上常年只有 1~2 MB/s，是卡 Initialize containers 的主因。
       image:
-        description: 'container.image（默认 = Dockerfile_aarch64 的 FROM 基础镜像）'
+        description: 'container.image（默认 = Dockerfile_aarch64 的 FROM 基础镜像，走 SWR 国内镜像）'
         required: true
-        default: 'quay.io/ascend/cann:9.0.0-a3-openeuler24.03-py3.11'
+        default: 'swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.0.0-a3-openeuler24.03-py3.11'
 
 concurrency:
   group: npu-probe-${{ github.ref }}
@@ -106,6 +110,8 @@ jobs:
           probe https://repo.huaweicloud.com/repository/pypi/simple
           probe https://repo.huaweicloud.com/ascend/repos/pypi
           probe https://github.com
+          # 镜像源：SWR 是这次实际使用的；quay 留作对照（401 只表示要 token，即"可达"）
+          probe https://swr.cn-south-1.myhuaweicloud.com/v2/
           probe https://quay.io/v2/
           probe https://gosspublic.alicdn.com/ossutil/install.sh
           echo "--- 集群内缓存服务 ---"
