@@ -1,0 +1,583 @@
+name: Probe GH ARM Network
+
+# 目的：用一次可对比的实测，回答"构建镜像放 GitHub 托管 ubuntu-22.04-arm 还是自托管
+# linux-aarch64-cpu-4"这个问题的网络那一半。
+#
+# 背景数字（已从 registry 侧确认，不是猜的）：
+#   swr.cn-south-1/ascendhub/cann:9.0.0-a3-openeuler24.03-py3.11  arm64
+#     6 层，压缩后 4.24 GiB，最大单层 3899 MiB
+#   即：每次在 GitHub 托管 runner 上新建镜像，都要重新把这 4.24 GiB 拉一遍
+#   （GH 托管的 type=gha 构建缓存不含 base image，机器也是全新的）。
+#
+# 要回答的三个问题：
+#   ① 从这台机器到 SWR 的单连接吞吐是多少（分片取样，不受镜像总大小影响）
+#   ② 完整 docker pull 实际要多久，拉完后磁盘还剩多少（GH arm 只有 ~14 GB，可能先炸磁盘）
+#   ③ 这台机器到底有没有构建能力（docker / buildx / buildctl / BUILDKITD_ADDR）
+#
+# 用法：手动触发，runner 选 ubuntu-22.04-arm 跑一次，再选 linux-aarch64-cpu-4 跑一次，
+# 对比两次的 Job Summary。
+#   · 若 linux-aarch64-cpu-4 一直 Queued / 报 no runner → 该池没授予本仓库
+#   · 所有关键结论都用 ::notice:: 输出，未登录也能在 Actions 页面看到 annotation
+#
+# 不做的事情：不构建 torchturbo、不推任何镜像、不碰 SWR 写权限（全程匿名只读）。
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: '构建机（两次各选一个，用于 A/B 对比）'
+        required: true
+        default: 'ubuntu-22.04-arm'
+        type: choice
+        options:
+          - ubuntu-22.04-arm
+          - linux-aarch64-cpu-4
+          - linux-aarch64-cpu-24
+      image:
+        description: '待测的基础镜像（= docker/npu/Dockerfile_aarch64 的 FROM 目标）'
+        required: true
+        default: 'swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.0.0-a3-openeuler24.03-py3.11'
+      registry:
+        description: '镜像所在 registry（用于取匿名 token）'
+        required: true
+        default: 'swr.cn-south-1.myhuaweicloud.com'
+      repository:
+        description: '镜像仓库路径（用于取匿名 token）'
+        required: true
+        default: 'ascendhub/cann'
+      blob_digest:
+        description: '取样测速用的层 digest（默认 = 上面镜像的最大层，3899 MiB）'
+        required: true
+        default: 'sha256:125d2ec216d83c74f0afc907bfc5af7061e82008387fcb2b2656a89a1b63e215'
+      sample_mib:
+        description: '分片取样大小（MiB）'
+        required: true
+        default: '128'
+      full_pull:
+        description: '是否做完整 docker pull（会占 12~15 GB 磁盘）'
+        required: false
+        default: true
+        type: boolean
+      verify_push:
+        description: '是否验证 SWR 写凭证 + 推送链路（推一个 128 MiB 随机层测上传速度，推完立即删除）'
+        required: false
+        default: false
+        type: boolean
+      push_repo:
+        description: '推送目标仓库（需你确有写权限）'
+        required: false
+        default: 'swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu'
+      push_tag:
+        description: '推送用 tag（默认 test；该 tag 若已存在会直接拒绕，不覆盖）'
+        required: false
+        default: 'test'
+      push_mib:
+        description: '推送层大小（MiB，随机数据不可压缩，用来测上传带宽）'
+        required: false
+        default: '128'
+
+# 同一个 runner 上不要并发跑，避免互相抢带宽污染测量
+concurrency:
+  group: probe-gh-arm-network-${{ inputs.runner }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    name: probe (${{ inputs.runner }})
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 60
+
+    steps:
+      - name: ① 机器 / 磁盘 / 内核
+        run: |
+          echo "runner input : ${{ inputs.runner }}"
+          echo "RUNNER_NAME  : ${RUNNER_NAME:-<unset>}"
+          echo "hostname     : $(hostname)"
+          uname -a
+          head -3 /etc/os-release || true
+          echo "--- cpu / mem ---"
+          nproc
+          free -h
+          echo "--- disk（镜像要占 12~15 GB 解压后）---"
+          df -h / /tmp 2>/dev/null || df -h /
+          echo "--- 虚拟化/缓存线索 ---"
+          cat /proc/cpuinfo | grep -m1 'model name' || true
+
+      - name: ② 先腾磁盘（GH 托管 runner 才有效，自托管可能无 sudo）
+        if: ${{ inputs.full_pull }}
+        continue-on-error: true
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+
+      - name: ③ 网络基线（DNS / TCP / TLS 往返，与镜像大小无关）
+        continue-on-error: true
+        run: |
+          REG="${{ inputs.registry }}"
+          echo "--- DNS ---"
+          getent hosts "$REG" || echo "DNS FAILED"
+          echo "--- TLS 握手 + 匿名 token 往返（跑 3 次看抖动）---"
+          for i in 1 2 3; do
+            curl -sS -m 20 -o /dev/null \
+              -w "  try$i  dns=%{time_namelookup}s connect=%{time_connect}s ttfb=%{time_starttransfer}s\n" \
+              "https://${REG}/swr/auth/v2/registry/auth/?service=dockyard&scope=repository:${{ inputs.repository }}:pull" \
+              2>&1 || echo "  try$i FAILED"
+          done
+          echo "--- 对照：公网 github ---"
+          curl -sS -m 15 -o /dev/null -w "  github ttfb=%{time_starttransfer}s\n" https://github.com 2>&1 || true
+
+      - name: ④ 镜像体积核算 + 分片吞吐（最能代表持续带宽）
+        id: throughput
+        continue-on-error: true
+        env:
+          REG: ${{ inputs.registry }}
+          REPO: ${{ inputs.repository }}
+          IMAGE: ${{ inputs.image }}
+          BLOB: ${{ inputs.blob_digest }}
+          SAMPLE_MIB: ${{ inputs.sample_mib }}
+        run: |
+          set -uo pipefail
+          TK=$(curl -sS -m 30 \
+            "https://${REG}/swr/auth/v2/registry/auth/?service=dockyard&scope=repository:${REPO}:pull" \
+            | python3 -c "import sys,json;print(json.load(sys.stdin).get('token',''))" 2>/dev/null)
+          if [ -z "$TK" ]; then
+            echo "::warning::拿不到匿名 token，跳过体积核算与吞吐测量"
+            exit 0
+          fi
+
+          # ---- 体积核算：拉 manifest list → 选本架构子 manifest → 累加 layer 压缩后字节数 ----
+          TAG="${IMAGE##*:}"
+          case "$(uname -m)" in
+            aarch64|arm64) ARCH=arm64 ;;
+            x86_64|amd64)  ARCH=amd64 ;;
+            *)             ARCH="$(uname -m)" ;;
+          esac
+          LIST=$(curl -sS -m 30 -H "Authorization: Bearer ${TK}" \
+            -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.index.v1+json' \
+            "https://${REG}/v2/${REPO}/manifests/${TAG}" 2>/dev/null || echo '')
+          # 单行 python：JSON 不合法时 traceback 到 stderr，stdout 为空 → 走下面的 else 分支
+          CHILD=$(printf '%s' "$LIST" \
+            | python3 -c "import sys,json;d=json.loads(sys.stdin.read() or '{}');a='${ARCH}';h=[m['digest'] for m in d.get('manifests',[]) if m.get('platform',{}).get('architecture')==a];print(h[0] if h else '')" \
+              2>/dev/null)
+          BYTES=0
+          if [ -n "$CHILD" ]; then
+            BYTES=$(curl -sS -m 30 -H "Authorization: Bearer ${TK}" \
+              -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+              "https://${REG}/v2/${REPO}/manifests/${CHILD}" 2>/dev/null \
+              | python3 -c "import sys,json;d=json.loads(sys.stdin.read() or '{}');print(sum(l.get('size',0) for l in d.get('layers',[])))" \
+                2>/dev/null)
+            case "$BYTES" in
+              ''|*[!0-9]*) BYTES=0 ;;
+            esac
+            if [ "$BYTES" -gt 0 ]; then
+              CGIB=$(awk -v b="$BYTES" 'BEGIN{printf "%.2f", b/1073741824}')
+              echo "compressed_gib=${CGIB}" >> "$GITHUB_OUTPUT"
+              echo "::notice::${ARCH} 镜像压缩后 ${CGIB} GiB（${BYTES} bytes，这就是每次冷拉要下载的字节数）"
+            else
+              echo "::warning::拿到了子 manifest 但没解析出 layer 大小"
+            fi
+          else
+            echo "::warning::没能解析 ${TAG} 的 ${ARCH} 子 manifest（可能不是 manifest list，或 tag 不存在）"
+          fi
+
+          # ---- 分片吞吐：只读 128 MiB，不受镜像总大小影响 ----
+          END=$(( SAMPLE_MIB * 1024 * 1024 - 1 ))
+          OUT=$(curl -sS -m 900 -L -o /dev/null \
+            -w '%{http_code} %{size_download} %{speed_download} %{time_total}' \
+            -r "0-${END}" -H "Authorization: Bearer ${TK}" \
+            "https://${REG}/v2/${REPO}/blobs/${BLOB}" 2>&1) || OUT="FAILED"
+          echo "code size_B speed_Bps total_s = $OUT"
+          set -- $OUT
+          if [ "$1" = "206" ] || [ "$1" = "200" ]; then
+            MBPS=$(awk -v s="$3" 'BEGIN{printf "%.2f", s/1048576}')
+            echo "speed_mibps=${MBPS}" >> "$GITHUB_OUTPUT"
+            echo "::notice::分片吞吐 ${MBPS} MiB/s（${SAMPLE_MIB} MiB 取样，取自 ${REG}）"
+          else
+            echo "::warning::分片下载异常: $OUT"
+          fi
+
+      - name: ⑤ 完整 docker pull 计时 + 磁盘余量
+        id: fullpull
+        if: ${{ inputs.full_pull }}
+        continue-on-error: true
+        env:
+          IMAGE: ${{ inputs.image }}
+          SPEED_MIBPS: ${{ steps.throughput.outputs.speed_mibps }}
+          COMPRESSED_GIB: ${{ steps.throughput.outputs.compressed_gib }}
+        run: |
+          set -uo pipefail
+          echo "pull_ok=0" >> "$GITHUB_OUTPUT"
+          echo "elapsed=0" >> "$GITHUB_OUTPUT"
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "::warning::本机没有 docker 命令，跳过完整 pull（自托管池常见，需 buildctl）"
+            exit 0
+          fi
+          echo "--- pull 前 ---"
+          df -h / | tail -1
+          START=$(date +%s)
+          if docker pull "$IMAGE" >/tmp/pull.log 2>&1; then
+            ELAPSED=$(( $(date +%s) - START ))
+            SIZE=$(docker image inspect "$IMAGE" --format '{{.Size}}' 2>/dev/null || echo 0)
+            SIZE_GIB=$(awk -v s="$SIZE" 'BEGIN{printf "%.2f", s/1073741824}')
+            echo "pull_ok=1" >> "$GITHUB_OUTPUT"
+            echo "elapsed=${ELAPSED}" >> "$GITHUB_OUTPUT"
+            echo "--- pull 后 ---"
+            df -h / | tail -1
+            echo "::notice::完整 pull 成功 ${ELAPSED}s（解压后占盘 ${SIZE_GIB} GiB）"
+            # 用「压缩后体积 ÷ 分片吞吐」外推，而不是用解压后体积（否则会高估 3 倍左右）
+            if [ -n "${SPEED_MIBPS:-}" ] && [ -n "${COMPRESSED_GIB:-}" ]; then
+              MINUTES=$(awk -v g="$COMPRESSED_GIB" -v s="$SPEED_MIBPS" 'BEGIN{printf "%.1f", g*1024/s/60}')
+              echo "::notice::按 ${SPEED_MIBPS} MiB/s 外推，下载 ${COMPRESSED_GIB} GiB 约需 ${MINUTES} 分钟（不含解压与重试）"
+            fi
+          else
+            ELAPSED=$(( $(date +%s) - START ))
+            echo "elapsed=${ELAPSED}" >> "$GITHUB_OUTPUT"
+            echo "--- 失败现场 ---"
+            tail -30 /tmp/pull.log || true
+            df -h / | tail -1
+            if grep -qi 'no space left' /tmp/pull.log; then
+              echo "::error::磁盘写满（GH arm 只有 ~14 GB），pull 失败 —— 这是比网速更早的硬约束"
+            else
+              echo "::error::完整 pull 失败，见上方日志"
+            fi
+          fi
+
+      - name: ⑥ 构建能力探测（决定这个池能不能直接建镜像）
+        continue-on-error: true
+        run: |
+          echo "BUILDKITD_ADDR = ${BUILDKITD_ADDR:-<unset>}"
+          echo "DOCKER_HOST    = ${DOCKER_HOST:-<unset>}"
+          echo "DOCKER_CONFIG  = ${DOCKER_CONFIG:-<unset>}"
+          echo "--- 二进制 ---"
+          for b in docker buildctl buildx podman buildah kaniko; do
+            printf '%-10s %s\n' "$b" "$(command -v "$b" || echo '<not found>')"
+          done
+          echo "--- docker 版本 / buildx 插件 ---"
+          docker version 2>&1 | head -15 || true
+          docker buildx version 2>&1 | head -3 || true
+          echo "--- 内核接口 ---"
+          ls -l /var/run/docker.sock 2>/dev/null || echo "/var/run/docker.sock : absent"
+          ls -l /dev/fuse 2>/dev/null || echo "/dev/fuse            : absent"
+          id
+          # 把结论打成 notice，方便匿名查看
+          BUILDER="none"
+          if [ -n "${BUILDKITD_ADDR:-}" ]; then
+            BUILDER="buildkitd-remote(${BUILDKITD_ADDR})"
+          elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+            if docker buildx version >/dev/null 2>&1; then
+              BUILDER="docker-daemon+buildx"
+            else
+              BUILDER="docker-daemon(no-buildx)"
+            fi
+          elif command -v buildctl >/dev/null 2>&1; then
+            BUILDER="buildctl(no-addr)"
+          fi
+          echo "::notice::构建后端 = ${BUILDER}"
+
+      - name: ⑦ 最小 buildx 冒烟（不推、只用 busybox）
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "::notice::无 docker，跳过 buildx 冒烟"
+            exit 0
+          fi
+          mkdir -p /tmp/smoke && cd /tmp/smoke
+          printf 'FROM busybox:latest\nRUN echo ok > /ok\n' > Dockerfile
+          if timeout 300 docker buildx build --load -t probe-smoke:1 . >/tmp/buildx.log 2>&1; then
+            echo "::notice::buildx 冒烟通过"
+          else
+            echo "::warning::buildx 冒烟失败（不代表最终结论，见日志）"
+            tail -20 /tmp/buildx.log || true
+          fi
+
+      # ======================================================================
+      # ⑨ 可选：验证 SWR 写凭证 + 推送链路
+      #
+      # 目标仓库 swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu
+      # 已确认存在且匿名可读（当前只有 beta 一个 tag），所以推上去之后
+      # PR job 用 container.image 拉它不需要任何凭证。
+      #
+      # 推的是一个 128 MiB 随机层（不是压缩得掉的零），因此：
+      #   · 推送字节数 ≈ 128 MiB，可以拿来算真实上传带宽
+      #   · 不依赖任何 registry（FROM scratch，不从 Docker Hub 拉 busybox）
+      #   · 同时证明「凭证有效 + 写入路径通 + 目标仓库可写」
+      #
+      # 口径提醒：计时的范围是「buildx build 到 push 完成」。
+      #   · GH 托管 runner（本地 buildx docker-container driver）→ 基本就是纯 push 时间
+      #   · 自托管 runner（远端 buildkitd）→ 包含 build context 上传，会偏慢
+      # 两者都是真实构建会付的代价，只是归因不同，看总结里的速度数据时要区分。
+      #
+      # 安全措施：
+      #   · 推之前先查 tag 是否存在，已存在则直接拒绕（绕不覆盖真实镜像）
+      #   · ⑩ 用 always() 保证无论成败都尝试删除
+      # ======================================================================
+      - name: ⑨ 验证 SWR 写凭证 + 推送（推 128 MiB 并测上传速度）
+        id: pushprobe
+        if: ${{ inputs.verify_push }}
+        continue-on-error: true
+        env:
+          REG: ${{ inputs.push_repo }}
+          TAG: ${{ inputs.push_tag }}
+          PUSH_MIB: ${{ inputs.push_mib }}
+          SWR_USER: ${{ secrets.SWR_USERNAME }}
+          SWR_PASS: ${{ secrets.SWR_PASSWORD }}
+        run: |
+          set -uo pipefail
+          echo "pushed=0" >> "$GITHUB_OUTPUT"
+          echo "digest=" >> "$GITHUB_OUTPUT"
+          echo "push_elapsed=0" >> "$GITHUB_OUTPUT"
+          echo "push_mibps=" >> "$GITHUB_OUTPUT"
+          echo "pushed_bytes=0" >> "$GITHUB_OUTPUT"
+
+          HOST="${REG%%/*}"
+          REPO="${REG#*/}"
+          echo "registry host: ${HOST}"
+          echo "repository   : ${REPO}"
+          echo "tag          : ${TAG}"
+
+          if [ -z "${SWR_USER:-}" ] || [ -z "${SWR_PASS:-}" ]; then
+            echo "::error::SWR_USERNAME / SWR_PASSWORD 为空 —— 请在 Settings → Secrets 里配置"
+            exit 1
+          fi
+
+          # ---- 前置检查：tag 已存在则拒绝，避免覆盖真实镜像 ----
+          ANON=$(curl -sS -m 20 "https://${HOST}/swr/auth/v2/registry/auth/?service=dockyard&scope=repository:${REPO}:pull" \
+            | python3 -c "import sys,json;print(json.load(sys.stdin).get('token',''))" 2>/dev/null)
+          if [ -n "$ANON" ]; then
+            EXIST=$(curl -sS -m 20 -o /dev/null -w '%{http_code}' \
+              -H "Authorization: Bearer ${ANON}" \
+              -H 'Accept: application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.index.v1+json' \
+              "https://${HOST}/v2/${REPO}/manifests/${TAG}")
+            echo "现有 tag 探测: HTTP ${EXIST}"
+            if [ "$EXIST" = "200" ]; then
+              echo "::error:::${REPO}:${TAG} 已存在，拒绝覆盖。请换一个 push_tag。"
+              exit 1
+            fi
+            echo "::notice::前置检查通过：${REPO}:${TAG} 目前不存在，可安全推送"
+          else
+            echo "::warning::该仓库匿名不可读，跳过前置检查（但仍会推送）"
+          fi
+
+          # ---- 登录 ----
+          if ! printf '%s' "$SWR_PASS" | docker login "$HOST" -u "$SWR_USER" --password-stdin >/tmp/login.log 2>&1; then
+            echo "::error::docker login 失败（凭证错误，或本机无 docker）"
+            tail -10 /tmp/login.log || true
+            exit 1
+          fi
+          echo "::notice::docker login 成功（${HOST}）"
+
+          # ---- 构造 128 MiB 不可压缩层并推送（FROM scratch，零外部依赖）----
+          # 注意：Docker 29+ 默认 containerd image store，`docker build` + `docker push`
+          # 会产出 OCI manifest（application/vnd.oci.image.manifest.v1+json），
+          # 而 SWR 只接受 Docker v2s2 —— 所以必须走 buildx 且带 oci-mediatypes=false。
+          case "$(uname -m)" in
+            aarch64|arm64) PLATFORM=linux/arm64 ;;
+            x86_64|amd64)  PLATFORM=linux/amd64 ;;
+            *)             PLATFORM="linux/$(uname -m)" ;;
+          esac
+          MIB="${PUSH_MIB:-128}"
+          case "$MIB" in ''|*[!0-9]*) MIB=128 ;; esac
+          mkdir -p /tmp/pushprobe && cd /tmp/pushprobe
+
+          echo "--- 生成 ${MIB} MiB 随机数据（/dev/urandom，不可压缩）---"
+          START_GEN=$(date +%s)
+          dd if=/dev/urandom of=blob.bin bs=1M count="$MIB" status=none 2>&1 || \
+            head -c $((MIB * 1024 * 1024)) /dev/urandom > blob.bin
+          GEN_ELAPSED=$(( $(date +%s) - START_GEN ))
+          ACTUAL=$(stat -c %s blob.bin 2>/dev/null || echo 0)
+          echo "生成完成 ${GEN_ELAPSED}s，${ACTUAL} bytes"
+          sha256sum blob.bin | awk '{print "blob sha256:", $1}'
+          printf 'FROM scratch\nCOPY blob.bin /blob.bin\n' > Dockerfile
+
+          echo "--- 推送 ${REG}:${TAG} (${PLATFORM}) ---"
+          echo "${MIB} MiB 随机数据，gzip 压缩率约 1.000（不可压缩）→ 推送字节数 ≈ ${MIB} MiB"
+          PUSH_MODE=""
+          PUSH_RC=1
+          START=$(date +%s)
+
+          if docker buildx version >/dev/null 2>&1; then
+            # 唯一能保证 Docker v2s2 的写法（SWR 不接受 OCI manifest）
+            PUSH_MODE="buildx --output type=image,push=true,oci-mediatypes=false（含建层与 context 上传）"
+            START=$(date +%s)
+            if timeout 1800 docker buildx build \
+                  --platform "$PLATFORM" \
+                  --provenance=false --sbom=false \
+                  -t "${REG}:${TAG}" \
+                  --output "type=image,push=true,oci-mediatypes=false" . >/tmp/push.log 2>&1; then
+              PUSH_RC=0
+            else
+              PUSH_RC=$?
+            fi
+          else
+            # 没有 buildx：只能用经典 docker build/push，但很可能产出 OCI manifest，
+            # SWR 可能拒收。先试，能推上去就算链路通，但会明确警告格式风险。
+            echo "::warning::本机无 buildx，退回 docker build + docker push；产物可能是 OCI manifest，SWR 可能拒收"
+            PUSH_MODE="docker build + docker push（可能产出 OCI，SWR 兼容性存疑）"
+            if timeout 900 docker build --platform "$PLATFORM" -t "${REG}:${TAG}" . >/tmp/build.log 2>&1; then
+              START=$(date +%s)
+              if timeout 1800 docker push "${REG}:${TAG}" >/tmp/push.log 2>&1; then PUSH_RC=0; else PUSH_RC=$?; fi
+            else
+              PUSH_RC=1
+              cp /tmp/build.log /tmp/push.log 2>/dev/null || true
+            fi
+          fi
+
+          if [ "$PUSH_RC" = "0" ]; then
+            ELAPSED=$(( $(date +%s) - START ))
+            [ "$ELAPSED" -le 0 ] && ELAPSED=1
+            MBPS=$(awk -v m="$MIB" -v t="$ELAPSED" 'BEGIN{printf "%.2f", m/t}')
+            echo "pushed=1" >> "$GITHUB_OUTPUT"
+            echo "push_elapsed=${ELAPSED}" >> "$GITHUB_OUTPUT"
+            echo "push_mibps=${MBPS}" >> "$GITHUB_OUTPUT"
+            echo "pushed_bytes=${ACTUAL}" >> "$GITHUB_OUTPUT"
+            echo "::notice::推送成功 ${REG}:${TAG} —— ${MIB} MiB / ${ELAPSED}s = ${MBPS} MiB/s（${PUSH_MODE}）"
+          else
+            echo "::error::推送失败 —— 凭证无效、无写权限、或到 SWR 的出口不通（rc=${PUSH_RC}）"
+            tail -30 /tmp/push.log 2>/dev/null || true
+            exit 1
+          fi
+
+          # ---- 回读 manifest，确认服务端实际存了多少字节 + 校验格式 ----
+          TK=$(curl -sS -m 20 "https://${HOST}/swr/auth/v2/registry/auth/?service=dockyard&scope=repository:${REPO}:pull" \
+            | python3 -c "import sys,json;print(json.load(sys.stdin).get('token',''))" 2>/dev/null)
+          if [ -n "$TK" ]; then
+            # Accept 同时包含 Docker v2s2 与 OCI，两种格式都能读回（否则 OCI 会被 404）
+            ACC='application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.index.v1+json'
+            MAN=$(curl -sS -m 20 -H "Authorization: Bearer ${TK}" -H "Accept: ${ACC}" \
+              "https://${HOST}/v2/${REPO}/manifests/${TAG}" 2>/dev/null)
+            FMT=$(printf '%s' "$MAN" | python3 -c "import sys,json;d=json.loads(sys.stdin.read() or '{}');print(d.get('mediaType',''))" 2>/dev/null)
+            STORED=$(printf '%s' "$MAN" | python3 -c "import sys,json;d=json.loads(sys.stdin.read() or '{}');print(sum(l.get('size',0) for l in d.get('layers',[])))" 2>/dev/null)
+            case "${STORED:-}" in ''|*[!0-9]*) STORED=0 ;; esac
+            echo "manifest mediaType: ${FMT:-<unknown>}"
+            case "$FMT" in
+              *oci.image.*) echo "::warning::存的是 OCI manifest —— SWR 虽然收下了，但后续下游可能不兼容（vllm-ascend 的注释说 SWR 不收 OCI）" ;;
+              *docker.distribution.manifest*) echo "::notice::存的是 Docker v2s2 manifest ✓" ;;
+            esac
+            if [ "$STORED" -gt 0 ]; then
+              SMIB=$(awk -v b="$STORED" 'BEGIN{printf "%.2f", b/1048576}')
+              echo "::notice::服务端实际接收 ${SMIB} MiB（随机数据不可压缩，能对上 ${MIB} MiB 就说明没被截断）"
+            fi
+          fi
+
+          # ---- 取 digest，供 ⑩ 删除 ----
+          DIGEST=$(docker buildx imagetools inspect "${REG}:${TAG}" \
+                     --format '{{.Manifest.Digest}}' 2>/dev/null || true)
+          if [ -z "$DIGEST" ]; then
+            DIGEST=$(docker image inspect "${REG}:${TAG}" --format '{{index .RepoDigests 0}}' 2>/dev/null \
+                       | sed 's/.*@//' || true)
+          fi
+          echo "digest=${DIGEST:-<unknown>}"
+          echo "digest=${DIGEST:-}" >> "$GITHUB_OUTPUT"
+
+      - name: ⑩ 立即删除 ⑨ 推上去的 tag
+        if: ${{ always() && inputs.verify_push }}
+        continue-on-error: true
+        env:
+          REG: ${{ inputs.push_repo }}
+          TAG: ${{ inputs.push_tag }}
+          DIGEST: ${{ steps.pushprobe.outputs.digest }}
+          PUSHED: ${{ steps.pushprobe.outputs.pushed }}
+          SWR_USER: ${{ secrets.SWR_USERNAME }}
+          SWR_PASS: ${{ secrets.SWR_PASSWORD }}
+        run: |
+          set -uo pipefail
+          HOST="${REG%%/*}"
+          REPO="${REG#*/}"
+
+          # 没推成功就不需要删，只做一次存在性回显
+          if [ "${PUSHED:-0}" != "1" ]; then
+            echo "::notice::⑨ 未成功推送，跳过删除"
+            exit 0
+          fi
+
+          # 用带 push scope 的 token 做删除
+          TK=$(curl -sS -m 20 -u "${SWR_USER}:${SWR_PASS}" \
+            "https://${HOST}/swr/auth/v2/registry/auth/?service=dockyard&scope=repository:${REPO}:push,pull" \
+            | python3 -c "import sys,json;print(json.load(sys.stdin).get('token',''))" 2>/dev/null)
+          if [ -z "$TK" ]; then
+            echo "::warning::拿不到带 push scope 的 token，无法自动删除"
+            echo "::notice::请手工删除 ${REG}:${TAG}"
+            exit 0
+          fi
+
+          # 优先按 digest 删（tag 会随之消失），失败再试按 tag 删
+          is_ok() {
+            case "$1" in 200|202|204) return 0 ;; *) return 1 ;; esac
+          }
+
+          DELETED=0
+          if [ -n "${DIGEST:-}" ]; then
+            CODE=$(curl -sS -m 30 -o /tmp/del.log -w '%{http_code}' -X DELETE \
+              -H "Authorization: Bearer ${TK}" \
+              "https://${HOST}/v2/${REPO}/manifests/${DIGEST}")
+            echo "DELETE by digest ${DIGEST} -> HTTP ${CODE}"
+            if is_ok "$CODE"; then DELETED=1; fi
+          fi
+          if [ "$DELETED" != "1" ]; then
+            CODE=$(curl -sS -m 30 -o /tmp/del2.log -w '%{http_code}' -X DELETE \
+              -H "Authorization: Bearer ${TK}" \
+              "https://${HOST}/v2/${REPO}/manifests/${TAG}")
+            echo "DELETE by tag ${TAG} -> HTTP ${CODE}"
+            if is_ok "$CODE"; then DELETED=1; fi
+          fi
+
+          # 用匿名读回验证 tag 是否真的没了
+          ANON=$(curl -sS -m 20 "https://${HOST}/swr/auth/v2/registry/auth/?service=dockyard&scope=repository:${REPO}:pull" \
+            | python3 -c "import sys,json;print(json.load(sys.stdin).get('token',''))" 2>/dev/null)
+          LEFT=$(curl -sS -m 20 -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${ANON}" \
+            -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+            "https://${HOST}/v2/${REPO}/manifests/${TAG}")
+
+          if [ "$LEFT" = "404" ]; then
+            echo "::notice::清理完成：${REG}:${TAG} 已删除（回读 404）"
+            echo "::notice::注意：删 manifest 后 layered blob 需等 SWR 的 GC 回收（通常数小时~1 天），属正常现象"
+          else
+            echo "::error::删除后仍可读到 tag（HTTP ${LEFT}）—— 请手工清理 ${REG}:${TAG}"
+            echo "  · SWR 控制台可能配置了「禁止删除」策略"
+            echo "  · 或者该 tag 是 manifest list，需先删子 manifest"
+          fi
+
+      - name: ⑧ 汇总到 Job Summary
+        if: always()
+        run: |
+          {
+            echo "## Probe GH ARM Network"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| runner | \`${{ inputs.runner }}\` |"
+            echo "| image | \`${{ inputs.image }}\` |"
+            echo "| 分片吞吐 | \`${{ steps.throughput.outputs.speed_mibps || 'n/a' }}\` MiB/s |"
+            echo "| 镜像压缩后体积 | \`${{ steps.throughput.outputs.compressed_gib || 'n/a' }}\` GiB |"
+            echo "| 完整 pull 成功 | \`${{ steps.fullpull.outputs.pull_ok || 'n/a' }}\` |"
+            echo "| 完整 pull 耗时 | \`${{ steps.fullpull.outputs.elapsed || 'n/a' }}\` s |"
+            echo "| 写凭证验证 | $([[ '${{ inputs.verify_push }}' == 'true' ]] && echo '已开启' || echo '未开启') |"
+            echo "| 推送成功 | \`${{ steps.pushprobe.outputs.pushed || 'n/a' }}\` |"
+            echo "| 推送耗时 | \`${{ steps.pushprobe.outputs.push_elapsed || 'n/a' }}\` s |"
+            echo "| 上传带宽 | \`${{ steps.pushprobe.outputs.push_mibps || 'n/a' }}\` MiB/s |"
+            echo "| 推送层大小 | \`${{ inputs.push_mib }}\` MiB |"
+            echo "| 推送 digest | \`${{ steps.pushprobe.outputs.digest || 'n/a' }}\` |"
+            echo "| 推送目标 | \`${{ inputs.push_repo }}:${{ inputs.push_tag }}\` |"
+            echo ""
+            echo "### 判据"
+            echo ""
+            echo "| 完整 pull 耗时 | 剩余磁盘 | 结论 |"
+            echo "|---|---|---|"
+            echo "| < 300 s | > 5 GB | ✅ GH arm 可用 |"
+            echo "| 300–900 s | > 5 GB | ⚠️ 能用但每天浪费 5–15 min，建议换自托管 |"
+            echo "| > 900 s / 失败 | — | ❌ 改 \`linux-aarch64-cpu-4\` 或改用 GHCR 存 L1 |"
+            echo "| 任意 | < 2 GB | ❌ 磁盘先炸，网速再快也没用 |"
+            echo ""
+            echo "### A/B 用法"
+            echo ""
+            echo "同一份本次 run，把 \`runner\` 分别选 \`ubuntu-22.04-arm\` 与 \`linux-aarch64-cpu-4\` 各跑一次，"
+            echo "对比上表的「分片吞吐」与「完整 pull 耗时」。"
+            echo ""
+            echo "> 注意：GH 托管的 \`type=gha\` 构建缓存**不含 base image**，且每次都是全新机器，"
+            echo "> 所以「完整 pull 耗时」就是每次构建必定要付的固定成本。"
+          } >> "$GITHUB_STEP_SUMMARY"

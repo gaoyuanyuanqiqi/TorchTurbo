@@ -33,6 +33,15 @@ on:
         description: 'container.image（默认 = Dockerfile_aarch64 的 FROM 基础镜像，走 SWR 国内镜像）'
         required: true
         default: 'swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.0.0-a3-openeuler24.03-py3.11'
+      # 基础镜像（ascend/cann）里**没有任何 torch**：镜像 config 的 history 里只有
+      # openEuler rootfs + python3.11.15 + CANN 9.0.0 + NNAL/ATB，没有 pip install torch。
+      # torch 是 Dockerfile_aarch64 里 `pip install torch_npu==2.10.0.post2` 才带进来的。
+      # 因此默认跳过 ⑥ 的 matmul 验证；要真验证 NPU 能算，把这个开关打开。
+      install_torch:
+        description: '在容器内 pip install torch_npu（基础镜像不含 torch），以真正跑一次 NPU matmul'
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: npu-probe-${{ github.ref }}
@@ -134,6 +143,13 @@ jobs:
           ls -l /dev/fuse 2>/dev/null || echo "/dev/fuse            : absent"
           id
 
+      - name: ⑥-0 按需安装 torch / torch_npu（基础镜像本身不含）
+        if: ${{ inputs.install_torch }}
+        continue-on-error: true
+        run: |
+          python -m pip install --no-cache-dir 'torch_npu==2.10.0.post2'
+          python -c "import torch, torch_npu; print('torch', torch.__version__, '| torch_npu', torch_npu.__version__)"
+
       - name: ⑥ NPU 算子验证（两卡都跑一次 matmul）
         continue-on-error: true
         run: |
@@ -142,7 +158,10 @@ jobs:
           try:
               import torch, torch_npu  # noqa: F401
           except Exception as exc:
-              raise SystemExit(f"torch/torch_npu 不可用，跳过算子验证: {exc!r}")
+              # 预期缺失：ascend/cann 基础镜像只有 CANN + python3.11，torch 由
+              # Dockerfile_aarch64 的 pip install 带入。这里不算失败，只发一条 notice。
+              print(f"::notice::基础镜像不含 torch/torch_npu（预期，Dockerfile 才装），跳过算子验证: {exc!r}")
+              raise SystemExit(0)
 
           print("torch    :", torch.__version__)
           print("torch_npu:", getattr(torch_npu, "__version__", "?"))
@@ -150,7 +169,8 @@ jobs:
           n = torch.npu.device_count()
           print("npu count:", n)
           if n == 0:
-              raise SystemExit("device_count == 0，NPU 未分配到本 job")
+              print("::error::device_count == 0，NPU 未分配到本 job")
+              raise SystemExit(1)
 
           for i in range(n):
               d = f"npu:{i}"
@@ -163,6 +183,7 @@ jobs:
               assert err < 1.0, f"{d} 结果异常 err={err}"
 
           print("fusion attention 接口存在:", hasattr(torch_npu, "npu_fusion_attention"))
+          print(f"::notice::NPU 计算验证通过：{n} 张卡完成 matmul（torch {torch.__version__}）")
           print("OK: 全部卡完成矩阵乘")
           PY
 
