@@ -1,7 +1,16 @@
 name: NPU Smoke Test
 
-# 第一步只做链路验证：证明 runner 路由通、NPU 设备可见、torch_npu 可用。
-# 手动触发，避免在标签未就绪时污染 PR 检查结果。
+# 消费 image-ci.yml 推送到 SWR 的 L1 base 镜像，在真实 NPU runner 上验证三件事：
+#   ① 镜像能拉起来、NPU 设备映射进 pod、torch_npu 能真正算
+#   ② 镜像里预装的软件栈与 Dockerfile_aarch64 的假设一致（torch 是 nomimalloc 版，
+#      fla_npu / fla / triton-ascend / py-spy 都在）
+#   ③ torchturbo 的 ops 测试用例在 NPU 上全绿
+#
+# 为什么必须写 container.image：昇腾芯片靠 container runtime 把 /dev/davinci* 映射进 pod，
+# 不写 container 时 job 跑在 runner 宿主上但拿不到 NPU（见 npu-probe.yml 的实测结论）。
+#
+# 镜像在 SWR 私有仓库，所以 container.credentials 需要 SWR_USERNAME / SWR_PASSWORD
+# （与 image-ci.yml 同一对 secrets）。缺这两个 secret 时 job 会在拉镜像阶段失败。
 
 on:
   workflow_dispatch:
@@ -16,90 +25,280 @@ on:
           - linux-aarch64-a3-800i-4
           - linux-aarch64-a3-800i-8
           - linux-aarch64-a3-800i-16
-      # 默认走华为云 SWR 镜像（ascendhub 官方仓库的国内副本），与 quay.io/ascend/cann
-      # 同 tag 的 manifest/arm64 子 manifest digest 完全一致（同一镜像），但国内链路快得多。
-      # quay.io 直连单层 3.9 GiB 拉取极慢，容易卡在 Set up job / Initialize containers。
       image:
-        description: 'container.image（必须是 arm64 镜像；不指定 container 不会分配 NPU）'
+        description: 'container.image（image-ci 推的 L1 base；要严格复现请改成 repo@sha256:...）'
         required: true
-        default: 'swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.0.0-a3-openeuler24.03-py3.11'
-      check_torchturbo:
-        description: '额外检查 torchturbo 能否 import'
+        default: 'swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:base-latest'
+      test_path:
+        description: 'pytest 目标（默认整个 ops 目录；也可只跑 tests/ops/npu）'
+        required: true
+        default: 'tests/ops/npu'
+      pytest_args:
+        description: 'pytest 额外参数（空格分隔）'
         required: false
-        default: false
+        default: '-v --durations=20'
+      transformers_spec:
+        description: 'transformers 约束（tests/ops/npu/test_fused_rms_norm.py 需要 Qwen3MoeRMSNorm，即 >=4.51）'
+        required: false
+        default: 'transformers>=4.51'
+      install_test_deps:
+        description: '安装 pytest / transformers / omegaconf / safetensors（镜像里没有）'
+        required: false
+        default: true
         type: boolean
+
+# 同一个 runner 池不要并发跑，避免多卡被抢
+concurrency:
+  group: npu-smoke-${{ inputs.runner_label }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: '1'
+  PIP_DISABLE_PIP_VERSION_CHECK: '1'
 
 jobs:
   smoke:
     name: smoke (${{ inputs.runner_label }})
     runs-on: ${{ inputs.runner_label }}
 
-    # 注意：使用昇腾芯片必须指定 container.image，
-    # 不写 container 时 job 会跑在 runner 宿主上但拿不到 NPU。
+    # 拉 6~8 GiB 的 L1 镜像（SWR 约 4 MiB/s，最坏 30 min）+ 装依赖 + 跑 ops 用例
+    timeout-minutes: 90
+
     container:
       image: ${{ inputs.image }}
+      credentials:
+        username: ${{ secrets.SWR_USERNAME }}
+        password: ${{ secrets.SWR_PASSWORD }}
       options: --user root
 
+    defaults:
+      run:
+        shell: bash
+
     steps:
-      - name: Runner 基本信息
+      - name: ① 检出
+        uses: actions/checkout@v4
+
+      - name: ② 镜像 / 容器自检
         run: |
+          set -uo pipefail
           echo "runner label : ${{ inputs.runner_label }}"
           echo "image        : ${{ inputs.image }}"
+          echo "host         : $(hostname)"
           uname -a
-          cat /etc/os-release | head -5
+          head -6 /etc/os-release || true
+          echo "--- cpu / mem / disk ---"
           nproc
           free -h
-
-      - name: NPU 设备可见性
-        run: |
-          which npu-smi
-          npu-smi info
-
-      - name: Python / torch / torch_npu 版本
-        run: |
+          df -h / /tmp || true
+          echo "--- python ---"
           python -V
+          echo "--- 镜像里预装的软件栈 ---"
+          python -m pip list 2>/dev/null \
+            | grep -iE '^(torch|torch[-_]npu|triton|triton[-_]ascend|flash-linear-attention|py-spy|numpy|setuptools|wheel)\b' \
+            || true
+
+      - name: ③ NPU 设备可见性
+        run: |
+          set -uo pipefail
+          echo "--- /dev/davinci* ---"
+          if ls /dev/davinci* >/dev/null 2>&1; then
+            ls -l /dev/davinci*
+            echo "davinci 设备数: $(ls /dev/davinci* | wc -l)"
+          else
+            echo "::error::没有 /dev/davinci* —— NPU 未映射进 pod，检查 runner 标签与 container 配置"
+            exit 1
+          fi
+          echo "--- npu-smi ---"
+          command -v npu-smi || echo "npu-smi NOT in PATH"
+          npu-smi info || true
+
+      - name: ④ torch / torch_npu / fla_npu 版本与 NPU 可用性
+        run: |
+          set -uo pipefail
           python - <<'PY'
           import platform
-          print("machine:", platform.machine())
+          import sys
 
-          try:
-              import torch
-              print("torch:", torch.__version__)
-          except Exception as e:
-              print("torch import FAILED:", e)
-              torch = None
+          print("python  :", sys.version.split()[0])
+          print("machine :", platform.machine())
 
-          try:
-              import torch_npu
-              print("torch_npu:", getattr(torch_npu, "__version__", "unknown"))
-              print("npu.is_available:", torch.npu.is_available() if torch else "n/a")
-              print("npu.device_count:", torch.npu.device_count() if torch else "n/a")
-          except Exception as e:
-              print("torch_npu import FAILED:", e)
+          import torch
+          print("torch   :", torch.__version__)
+
+          import torch_npu
+          print("torch_npu:", getattr(torch_npu, "__version__", "unknown"))
+          print("npu.is_available :", torch.npu.is_available())
+          print("npu.device_count :", torch.npu.device_count())
+
+          for name in ("fla_npu", "fla", "triton", "triton_ascend"):
+              try:
+                  mod = __import__(name)
+                  print(f"{name:14s}:", getattr(mod, "__version__", "?"))
+              except Exception as exc:
+                  print(f"{name:14s}: MISSING ({type(exc).__name__}: {exc})")
+
+          if not torch.npu.is_available():
+              raise SystemExit("torch.npu.is_available() == False，NPU 未分配到本 job")
+          if torch.npu.device_count() == 0:
+              raise SystemExit("torch.npu.device_count() == 0，NPU 未分配到本 job")
+
+          # 镜像必须带 nomimalloc 版 torch（Dockerfile_aarch64 的补丁），否则 DMA 页会被回收
+          if "nomimalloc" not in torch.__version__:
+              print("::warning::torch 版本里没有 nomimalloc 标记，可能不是 image-ci 构建的 L1 镜像")
           PY
 
-      - name: 单卡矩阵乘（最小 NPU 计算验证）
+      - name: ⑤ 每张卡跑一次 matmul（最小 NPU 计算验证）
         run: |
+          set -uo pipefail
           python - <<'PY'
           import torch
           import torch_npu  # noqa: F401
 
-          if not torch.npu.is_available():
-              raise SystemExit("torch.npu.is_available() == False，NPU 未分配到本 job")
+          count = torch.npu.device_count()
+          for index in range(count):
+              device = f"npu:{index}"
+              a = torch.randn(1024, 1024, device=device, dtype=torch.float16)
+              b = torch.randn(1024, 1024, device=device, dtype=torch.float16)
+              out = (a @ b).float()
+              torch.npu.synchronize()
+              err = (out.cpu() - a.float().cpu() @ b.float().cpu()).abs().max().item()
+              print(f"{device} matmul ok, max_abs_err={err:.4f}")
+              assert err < 1.0, f"{device} 结果异常 err={err}"
 
-          d = "npu:0"
-          a = torch.randn(1024, 1024, device=d, dtype=torch.float16)
-          b = torch.randn(1024, 1024, device=d, dtype=torch.float16)
-          c = (a @ b).float()
-          torch.npu.synchronize()
-
-          print("matmul ok, out device =", c.device, "mean =", c.mean().item())
+          print(f"OK: {count} 张卡完成矩阵乘")
           PY
 
-      - name: 检查 torchturbo 可安装可导入
-        if: ${{ inputs.check_torchturbo }}
+      - name: ⑥ 安装 torchturbo 与测试依赖
+        env:
+          TRANSFORMERS_SPEC: ${{ inputs.transformers_spec }}
+          INSTALL_TEST_DEPS: ${{ inputs.install_test_deps }}
         run: |
-          # 用 -e . 让 src/ 布局生效；--no-deps 避免 pip 去解析 torch>=2.10
-          # 而把镜像里预编译好的 torch 覆盖成 PyPI 版本。
-          pip install -e . --no-deps -q
+          set -euo pipefail
+          BEFORE=$(python -c "import torch; print(torch.__version__)")
+
+          if [ "$INSTALL_TEST_DEPS" = "true" ]; then
+            # 镜像里只有 torch / torch_npu / fla_npu / fla / triton-ascend / py-spy，
+            # 没有 pytest 与 torchturbo 的运行时依赖。
+            # numpy<2：triton-ascend 把 numpy 钉在 1.26.4，升到 2.x 会让 NPU 算子栈失效。
+            python -m pip install --no-cache-dir -q \
+              "pytest>=7.0" \
+              "omegaconf>=2.3.0" \
+              "safetensors>=0.4.3" \
+              "numpy<2" \
+              "${TRANSFORMERS_SPEC}"
+          else
+            echo "::notice::install_test_deps=false —— 跳过第三方依赖安装，假定镜像里已有"
+          fi
+
+          # --no-deps：镜像里的 torch 是源码编译的 2.10.0+cpu.nomimalloc，
+          # 让 pip 解析 torch>=2.10.0 会把它换成 PyPI 版本，NPU 栈直接失效。
+          # --no-build-isolation：否则 pip 会在隔离环境里再装一份 torch 来跑 setuptools。
+          python -m pip install -e . --no-deps --no-build-isolation -q
+
+          AFTER=$(python -c "import torch; print(torch.__version__)")
+          echo "torch before: ${BEFORE}"
+          echo "torch after : ${AFTER}"
+          if [ "$BEFORE" != "$AFTER" ]; then
+            echo "::error::torch 被依赖安装改写了（${BEFORE} → ${AFTER}），NPU 栈已不可信"
+            exit 1
+          fi
+
           python -c "import torchturbo; print('torchturbo ok:', torchturbo.__file__)"
+          python -c "import torch_npu; print('torch_npu still ok:', torch_npu.__version__)"
+
+      - name: ⑦ 运行 ops 测试用例
+        id: pytest
+        env:
+          TEST_PATH: ${{ inputs.test_path }}
+          PYTEST_ARGS: ${{ inputs.pytest_args }}
+        run: |
+          set -uo pipefail
+          echo "target : ${TEST_PATH}"
+          echo "args   : ${PYTEST_ARGS}"
+          echo "--- 收集到的用例 ---"
+          python -m pytest "${TEST_PATH}" ${PYTEST_ARGS} --collect-only -q 2>&1 | tail -20 || true
+
+          echo "--- 开始执行 ---"
+          set +e
+          # shellcheck disable=SC2086
+          python -m pytest "${TEST_PATH}" ${PYTEST_ARGS} \
+            --junitxml=/tmp/ops-junit.xml 2>&1 | tee /tmp/ops-pytest.log
+          RC=${PIPESTATUS[0]}
+          echo "rc=${RC}" >> "$GITHUB_OUTPUT"
+          echo "::notice::pytest 退出码 ${RC}"
+          exit "$RC"
+
+      - name: ⑧ 汇总到 Job Summary
+        if: always()
+        env:
+          PYTEST_RC: ${{ steps.pytest.outputs.rc }}
+        run: |
+          set -uo pipefail
+          {
+            echo "## NPU Smoke Test"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| runner | \`${{ inputs.runner_label }}\` |"
+            echo "| image | \`${{ inputs.image }}\` |"
+            echo "| 测试目标 | \`${{ inputs.test_path }}\` |"
+            echo "| pytest 参数 | \`${{ inputs.pytest_args }}\` |"
+            echo "| pytest 退出码 | \`${PYTEST_RC:-n/a}\` |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # heredoc 的结束符必须顶格，所以解析脚本先落盘再调用，不嵌在 if 里
+          cat > /tmp/junit_summary.py <<'PY'
+          import xml.etree.ElementTree as ET
+
+          try:
+              root = ET.parse("/tmp/ops-junit.xml").getroot()
+          except Exception as exc:
+              print(f"解析 junit 失败：{exc}")
+              raise SystemExit(0)
+
+          suites = [root] if root.tag == "testsuite" else root.findall("testsuite")
+          total = sum(int(s.get("tests", 0)) for s in suites)
+          failures = sum(int(s.get("failures", 0)) for s in suites)
+          errors = sum(int(s.get("errors", 0)) for s in suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          seconds = sum(float(s.get("time", 0) or 0) for s in suites)
+
+          print("### 测试结果")
+          print("")
+          print("| 总数 | 通过 | 失败 | 错误 | 跳过 | 耗时 |")
+          print("|---|---|---|---|---|---|")
+          print(
+              f"| {total} | {total - failures - errors - skipped} | "
+              f"{failures} | {errors} | {skipped} | {seconds:.1f} s |"
+          )
+          print("")
+
+          bad = []
+          for suite in suites:
+              for case in suite.iter("testcase"):
+                  if case.find("failure") is not None or case.find("error") is not None:
+                      bad.append(f"{case.get('classname', '')}::{case.get('name', '')}")
+          if bad:
+              print("### 失败用例")
+              print("")
+              for name in bad:
+                  print(f"- `{name}`")
+              print("")
+          PY
+
+          if [ -f /tmp/ops-junit.xml ]; then
+            python /tmp/junit_summary.py >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ -f /tmp/ops-pytest.log ]; then
+            echo "### 日志尾部"
+            echo ""
+            echo '```text'
+            tail -40 /tmp/ops-pytest.log
+            echo '```'
+          fi
