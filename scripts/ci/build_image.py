@@ -4,7 +4,7 @@
 
 为什么全在这里而不是写在 yaml 里：这些判断有过实测依据（见每段注释），
 写在 `run: |` 里既不能本地跑、也过不了 shellcheck，而改一行 yaml 就要推一次
-才能验证。搬出来之后 `python3 scripts/ci/image.py tag --dry-run` 就能复现。
+才能验证。搬出来之后 `python3 scripts/ci/build_image.py tag --dry-run` 就能复现。
 
 子命令（对应 workflow 的步骤）：
 
@@ -476,7 +476,7 @@ def cmd_summary() -> int:
         f"| manifest 格式 | `{env('MEDIA_TYPE', 'n/a')}` |\n"
         f"| 构建耗时 | `{env('ELAPSED', 'n/a')}` s |\n\n"
         "### 消费方式\n\n"
-        "PR / nightly 不写死地址，由 `scripts/ci/image.py resolve` 从最新一份\n"
+        "PR / nightly 不写死地址，由 `scripts/ci/build_image.py resolve` 从最新一份\n"
         "`base-image-ref` artifact 里读；人工覆盖走仓库变量 `BASE_IMAGE_TAG`。\n\n"
         "> tag 是名字、digest 是内容。需要「永远不变」的引用就写 `repo@sha256:...`。\n"
     )

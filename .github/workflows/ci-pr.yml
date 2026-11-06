@@ -1,50 +1,65 @@
-name: CI / PR
+name: CI
 
-# Sole required check: gate.
-# select does static checks + planning on one runner; the three lanes run in
-# parallel and depend only on select. A skipped lane must carry a reason,
-# otherwise gate fails -- that is what keeps lanes from being disabled silently.
+# Sole entry point: mode=pr (gate a PR on the diff) or mode=full.
+# Lanes are inlined -- a `uses:` job renders as "caller / callee" on the graph.
+# l1_/l2_/l3_ prefixes pin the order (jobs sort by key, not by position).
 
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
   workflow_dispatch:
     inputs:
+      mode:
+        description: 'pr = select from the diff, full = run everything'
+        required: true
+        default: 'pr'
+        type: choice
+        options:
+          - pr
+          - full
       force_all:
-        description: 'Run everything (same as the ci:full label)'
+        description: 'pr only: run everything (same as the ci:full label)'
         required: false
         default: false
         type: boolean
+      with_e2e:
+        description: 'pr: one cheapest profile; full: every profile'
+        required: false
+        default: false
+        type: boolean
+      test_path:
+        description: "unit lanes only: dir / file / node id; '-' = normal selection"
+        required: false
+        default: '-'
+        type: string
 
-# A new push cancels the old run; E2E is the expensive part.
+# A shared group with cancel-in-progress: false still cancels *pending* jobs and
+# once wedged this queue. So: PRs cancel per PR, full runs never queue.
 concurrency:
-  group: ci-pr-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || format('full-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
   pull-requests: read
   actions: read          # gate timing reads created_at / run_started_at
 
+env:
+  # Not MODE: run_tests.sh reads MODE as cpu/npu.
+  CI_MODE: ${{ github.event_name == 'pull_request' && 'pr' || inputs.mode }}
+
 jobs:
-  # Static checks and planning share one runner: they are strictly sequential,
-  # so step failure already means "no plan". The trailing always() step reports
-  # which stage broke, since a red job alone cannot tell them apart.
   select:
     name: Lint_Select
     runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
     timeout-minutes: 20
     outputs:
-      mode: ${{ steps.pick.outputs.mode }}
-      npu: ${{ steps.pick.outputs.npu }}
       e2e: ${{ steps.pick.outputs.e2e }}
       stage: ${{ steps.stage.outputs.stage }}
       cpu_unit_run: ${{ steps.pick.outputs.cpu_unit_run }}
       npu_unit_run: ${{ steps.pick.outputs.npu_unit_run }}
       npu_model_run: ${{ steps.pick.outputs.npu_model_run }}
       cpu_unit_files: ${{ steps.pick.outputs.cpu_unit_files }}
-      test_files: ${{ steps.pick.outputs.test_files }}
-      shard_list: ${{ steps.pick.outputs.shard_list }}
       image: ${{ steps.image.outputs.image }}
       summary: ${{ steps.pick.outputs.summary }}
     steps:
@@ -68,200 +83,258 @@ jobs:
           bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
           ./actionlint -color
 
-      # Binary instead of docker run: hadolint/hadolint is amd64 only, while
-      # CI_CPU_RUNNER defaults to an arm64 host.
       - name: hadolint
-        run: |
-          set -uo pipefail
-          case "$(uname -m)" in
-            aarch64|arm64) HARCH=arm64 ;;
-            x86_64|amd64)  HARCH=x86_64 ;;
-            *) echo "::error::unsupported arch $(uname -m)"; exit 1 ;;
-          esac
-          curl -sSfL -o /tmp/hadolint \
-            "https://github.com/hadolint/hadolint/releases/download/v2.15.1/hadolint-linux-$HARCH"
-          chmod +x /tmp/hadolint
-          /tmp/hadolint --failure-threshold error docker/npu/Dockerfile_aarch64
+        run: python3 scripts/ci/check_static.py hadolint docker/npu/Dockerfile_aarch64
 
-      - name: resolve plan
-        id: pick
-        env:
-          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
-          FORCE_INPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.force_all }}
-        run: |
-          set -uo pipefail
-
-          # Label semantics live here only; jobs never re-interpret them.
-          EXTRA=()
-          case ",${LABELS}," in
-            *,ci:full,*)     EXTRA+=(--force-all --e2e-all) ;;
-            *,ci:e2e,*)      EXTRA+=(--e2e-force) ;;
-            *,ci:skip-npu,*) EXTRA+=(--no-npu) ;;
-          esac
-          [ "${FORCE_INPUT}" = "true" ] && EXTRA+=(--force-all --e2e-all)
-
-          # An empty diff means "not enough information" -> full run (fail-open).
-          python3 scripts/ci/affected.py --changed-from git \
-            --dump-changed /tmp/changed.txt \
-            "${EXTRA[@]}" --explain --output /tmp/sel.json --github-output "$GITHUB_OUTPUT"
-
-          wc -l < /tmp/changed.txt
-
-          # The selector is gated too: a silent algorithm regression would
-          # quietly drop test coverage.
-          python3 scripts/ci/affected.py --self-test
-
-      # The image ref is resolved, not hardcoded: vars.BASE_IMAGE_TAG wins,
-      # otherwise the pinned base tag.
       - name: resolve image
         id: image
         env:
           OVERRIDE: ${{ vars.BASE_IMAGE_TAG }}
         run: |
-          set -uo pipefail
-          REF=$(python3 scripts/ci/image.py resolve --override "$OVERRIDE" \
+          REF=$(python3 scripts/ci/build_image.py resolve --override "$OVERRIDE" \
             --fallback 'swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:base-latest')
           echo "image=$REF" >> "$GITHUB_OUTPUT"
+          echo "image: $REF"
 
-          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
-          ## Plan
+      # Labels -> flags live in select_plan.py; a copy here would be a second
+      # definition of what ci:e2e means.
+      - name: resolve plan
+        id: pick
+        env:
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          WITH_E2E: ${{ github.event_name == 'workflow_dispatch' && inputs.with_e2e }}
+          FORCE_INPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.force_all }}
+        run: |
+          set -uo pipefail
+          # Empty diff (no history / no info) -> full run: fail-open on purpose.
+          python3 scripts/ci/select_plan.py --changed-from git \
+            --dump-changed /tmp/changed.txt \
+            --mode "$CI_MODE" --labels "$LABELS" \
+            --with-e2e "$WITH_E2E" --force-all "$FORCE_INPUT" \
+            --explain --output /tmp/sel.json --github-output "$GITHUB_OUTPUT" \
+            --summary-file "$GITHUB_STEP_SUMMARY" \
+            --image-ref '${{ steps.image.outputs.image }}'
 
-          | item | value |
-          |---|---|---|
-          | mode | \`${{ steps.pick.outputs.mode }}\` |
-          | lanes | \`${{ steps.pick.outputs.cpu_unit_run }} / ${{ steps.pick.outputs.npu_unit_run }} / ${{ steps.pick.outputs.npu_model_run }}\` |
-          | e2e | \`${{ steps.pick.outputs.e2e }}\` |
-          | shards | \`${{ steps.pick.outputs.shard_list }}\` |
-          | image | \`$REF\` |
-          | summary | \`${{ steps.pick.outputs.summary }}\` |
+          python3 scripts/ci/select_plan.py --self-test
 
-          <details><summary>changed files</summary>
-
-          \`\`\`
-          $(head -100 /tmp/changed.txt || true)
-          \`\`\`
-          </details>
-          EOF
-
-      # Must be last and always(): earlier steps stop on failure, and job
-      # outputs are still published when the job fails.
+      # Last and always(): outputs are still published when the job fails.
       - name: record stage
         id: stage
         if: always()
-        run: |
-          set -uo pipefail
-          if [ "${{ job.status }}" = "cancelled" ]; then
-            echo "stage=cancelled" >> "$GITHUB_OUTPUT"
-          elif [ "${{ steps.static.outcome }}" != "success" ]; then
-            echo "stage=static" >> "$GITHUB_OUTPUT"
-          elif [ "${{ steps.pick.outcome }}" != "success" ]; then
-            echo "stage=select" >> "$GITHUB_OUTPUT"
-          else
-            echo "stage=ok" >> "$GITHUB_OUTPUT"
-          fi
+        env:
+          JOB_STATUS: ${{ job.status }}
+          STATIC_OUTCOME: ${{ steps.static.outcome }}
+          PICK_OUTCOME: ${{ steps.pick.outcome }}
+        run: python3 scripts/ci/check_static.py stage
 
-  cpu_unit_tests:
-    name: cpu-unit-tests (${{ matrix.shard }})
+  # No matrix, no shards: either would put one box per entry on the graph.
+  l1_cpu_unit:
+    name: cpu-unit-tests
     needs: select
     if: |
       always() && needs.select.result == 'success' &&
       needs.select.outputs.cpu_unit_run == 'true'
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: ${{ fromJSON(needs.select.outputs.shard_list) }}
-    uses: ./.github/workflows/ci-tests.yml
-    with:
-      kind: cpu-unit
-      runner_label: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
-      test_files: ${{ needs.select.outputs.cpu_unit_files }}
-      shard: ${{ matrix.shard }}
-      timeout_minutes: 40
+    runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
+    timeout-minutes: 40
 
-  npu_unit_tests:
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: install
+        env:
+          MODE: cpu
+          RESULT_JSON: /tmp/ci-result.json
+        run: |
+          set -uo pipefail
+          python3 scripts/ci/report_result.py init --file "$RESULT_JSON" \
+            kind=pytest model_type=pytest-cpu-unit mode=cpu \
+            runner_label="${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}"
+          bash scripts/ci/install_deps.sh install
+
+      - name: pytest
+        env:
+          MODE: cpu
+          TEST_FILES: ${{ needs.select.outputs.cpu_unit_files }}
+          TEST_PATH: ${{ inputs.test_path }}
+          RESULT_JSON: /tmp/ci-result.json
+        run: bash scripts/ci/run_tests.sh
+
+      - name: summary
+        if: always()
+        env:
+          RESULT_JSON: /tmp/ci-result.json
+        run: |
+          set -uo pipefail
+          python3 scripts/ci/report_result.py report --file "$RESULT_JSON" \
+            --train-log /tmp/pytest.log --junit /tmp/pytest.xml >> "$GITHUB_STEP_SUMMARY" || true
+          python3 scripts/ci/report_result.py notice --file "$RESULT_JSON" \
+            --model-type pytest-cpu-unit || true
+
+  # Containerised, and the whole lane runs once it starts: operators and images
+  # are repo-wide, so running only the selected files proves nothing.
+  l2_npu_unit:
     name: npu-unit-tests
     needs: select
-    # Fork PRs get no secrets, and passing secrets to fork code is RCE.
+    # Fork PRs get no secrets, and handing secrets to fork code is RCE.
     if: |
       always() && needs.select.result == 'success' &&
       needs.select.outputs.npu_unit_run == 'true' &&
       (github.event_name != 'pull_request' ||
        github.event.pull_request.head.repo.full_name == github.repository)
-    uses: ./.github/workflows/ci-tests.yml
-    with:
-      kind: npu-unit
-      image: ${{ needs.select.outputs.image }}
-      runner_label: ${{ vars.CI_NPU_RUNNER || 'linux-aarch64-a3-800i-2' }}
-      test_files: '[]'
-      timeout_minutes: 40
-    secrets:
-      SWR_USERNAME: ${{ secrets.SWR_USERNAME }}
-      SWR_PASSWORD: ${{ secrets.SWR_PASSWORD }}
+    runs-on: ${{ vars.CI_NPU_RUNNER || 'linux-aarch64-a3-800i-2' }}
+    timeout-minutes: 40
 
-  npu_model_tests:
-    name: npu-model-tests (${{ matrix.profile.model_type }})
+    container:
+      image: ${{ needs.select.outputs.image }}
+      credentials:
+        username: ${{ secrets.SWR_USERNAME }}
+        password: ${{ secrets.SWR_PASSWORD }}
+      options: --user root
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: preflight
+        env:
+          RESULT_JSON: /tmp/ci-result.json
+        run: |
+          set -uo pipefail
+          python3 scripts/ci/report_result.py init --file "$RESULT_JSON" \
+            kind=pytest model_type=pytest-npu-unit mode=npu \
+            runner_label="${{ vars.CI_NPU_RUNNER || 'linux-aarch64-a3-800i-2' }}" \
+            image="${{ needs.select.outputs.image }}"
+
+          # Snapshot torch first; a swapped torch looks like a code bug.
+          python3 scripts/ci/env_pod.py capture --file /tmp/torch-before.json || true
+
+          uname -m; nproc; free -h | head -2; df -h / | tail -1; python -V
+
+      - name: npu self-check
+        run: bash scripts/ci/run_train.sh probe
+
+      - name: install
+        env:
+          MODE: npu
+          RESULT_JSON: /tmp/ci-result.json
+        run: bash scripts/ci/install_deps.sh install
+
+      - name: pytest
+        env:
+          MODE: npu
+          TEST_FILES: '[]'
+          TEST_PATH: ${{ inputs.test_path }}
+          RESULT_JSON: /tmp/ci-result.json
+        run: bash scripts/ci/run_tests.sh
+
+      - name: summary
+        if: always()
+        env:
+          RESULT_JSON: /tmp/ci-result.json
+        run: |
+          set -uo pipefail
+          python3 scripts/ci/report_result.py report --file "$RESULT_JSON" \
+            --train-log /tmp/pytest.log --junit /tmp/pytest.xml >> "$GITHUB_STEP_SUMMARY" || true
+          python3 scripts/ci/report_result.py notice --file "$RESULT_JSON" \
+            --model-type pytest-npu-unit || true
+
+  # Profiles loop inside the job (run_train.sh lane): a matrix would put one box per
+  # profile on the graph.
+  l3_npu_model:
+    name: npu-model-tests
     needs: select
     if: |
       always() && needs.select.result == 'success' &&
       needs.select.outputs.npu_model_run == 'true' &&
       (github.event_name != 'pull_request' ||
        github.event.pull_request.head.repo.full_name == github.repository)
-    strategy:
-      # Serial: the NPU pool shares HBM, so two at once is slower in wall time.
-      max-parallel: 1
-      fail-fast: false
-      matrix:
-        profile: ${{ fromJSON(needs.select.outputs.e2e) }}
-    uses: ./.github/workflows/ci-tests.yml
-    with:
-      kind: npu-model
-      runner_label: ${{ vars.CI_E2E_RUNNER || 'linux-aarch64-a3-800i-8' }}
-      image: ${{ needs.select.outputs.image }}
-      model_type: ${{ matrix.profile.model_type }}
-      framework: lf
-      trim_layers: ${{ matrix.profile.layers }}
-      train_seq_len: '1024'
-      train_dataset: 'gsm8k'
-      train_finetuning_type: 'full'
-      timeout_minutes: 45
-      train_timeout_minutes: 10
-      fetch_timeout_seconds: 600
-    secrets:
-      SWR_USERNAME: ${{ secrets.SWR_USERNAME }}
-      SWR_PASSWORD: ${{ secrets.SWR_PASSWORD }}
+    runs-on: ${{ vars.CI_E2E_RUNNER || 'linux-aarch64-a3-800i-8' }}
+    timeout-minutes: 45
+    outputs:
+      skip_reason: ${{ steps.lane.outputs.skip_reason }}
 
-  # Sole required check. Rules live in scripts/ci/gate.py so PR and full runs
-  # cannot drift apart.
-  #
-  # select is a direct dependency: when planning fails the lanes skip
-  # immediately (their if requires select to succeed) and gate still runs,
-  # reporting the result in seconds instead of minutes.
+    container:
+      image: ${{ needs.select.outputs.image }}
+      credentials:
+        username: ${{ secrets.SWR_USERNAME }}
+        password: ${{ secrets.SWR_PASSWORD }}
+      options: --user root
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 20 s to find "no NPU" beats discovering it after installing deps.
+      - name: npu and stack self-check
+        run: bash scripts/ci/run_train.sh probe
+
+      - name: train
+        id: lane
+        timeout-minutes: 25
+        env:
+          E2E_PROFILES: ${{ needs.select.outputs.e2e }}
+          FRAMEWORK: lf
+          RUNNER_LABEL: ${{ vars.CI_E2E_RUNNER || 'linux-aarch64-a3-800i-8' }}
+          IMAGE: ${{ needs.select.outputs.image }}
+          SEQ_LEN: '4096'
+          DATASET_IN: 'gsm8k'
+          FINETUNING_TYPE: 'full'
+          FETCH_TIMEOUT: '600'
+          DIAG: 'true'
+          RESULT_JSON: /tmp/ci-result.json
+        run: bash scripts/ci/run_train.sh lane
+
+      # timeout-minutes only kills the process; children would keep the cards.
+      - name: cleanup
+        if: always()
+        continue-on-error: true
+        run: python3 scripts/ci/env_pod.py cleanup
+
+  # Sole required check; the rules live in report_gate.py so pr/full cannot drift.
+  # select is a direct dep: a failed plan skips the lanes in seconds.
   gate:
     name: gate
-    needs: [select, cpu_unit_tests, npu_unit_tests, npu_model_tests]
+    needs: [select, l1_cpu_unit, l2_npu_unit, l3_npu_model]
     if: always()
     runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4        # gate.py lives in scripts/ci
+      - uses: actions/checkout@v4
 
       - name: timing
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python3 scripts/ci/gate.py timing
+        run: python3 scripts/ci/report_gate.py timing
 
       - name: judge
         env:
           R_SEL: ${{ needs.select.result }}
           SEL_STAGE: ${{ needs.select.outputs.stage }}
-          R_CPU_UNIT: ${{ needs.cpu_unit_tests.result }}
-          R_NPU_UNIT: ${{ needs.npu_unit_tests.result }}
-          R_NPU_MODEL: ${{ needs.npu_model_tests.result }}
+          R_CPU_UNIT: ${{ needs.l1_cpu_unit.result }}
+          R_NPU_UNIT: ${{ needs.l2_npu_unit.result }}
+          R_NPU_MODEL: ${{ needs.l3_npu_model.result }}
           CPU_UNIT_RUN: ${{ needs.select.outputs.cpu_unit_run }}
           NPU_UNIT_RUN: ${{ needs.select.outputs.npu_unit_run }}
           NPU_MODEL_RUN: ${{ needs.select.outputs.npu_model_run }}
-          SKIP_REASON: ${{ needs.npu_model_tests.outputs.skip_reason }}
-          STRICT: ${{ contains(github.event.pull_request.labels.*.name, 'ci:e2e:strict') }}
+          SKIP_REASON: ${{ needs.l3_npu_model.outputs.skip_reason }}
+          # Only the string is passed; report_gate.py decides what ci:e2e:strict means.
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
           IS_FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
           SUMMARY: ${{ needs.select.outputs.summary }}
-        run: python3 scripts/ci/gate.py judge --mode pr
+        run: python3 scripts/ci/report_gate.py judge --mode "$CI_MODE"

@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """「这个测试文件要不要真 NPU 卡」的唯一判据。
 
-原来这条规则在三个地方各写了一遍（tests/conftest.py、affected.py、
-pytest.sh），任意一份漂了都不会报错，只会**静默换掉跑的集合**。
+原来这条规则在三个地方各写了一遍（tests/conftest.py、select_plan.py、
+run_tests.sh），任意一份漂了都不会报错，只会**静默换掉跑的集合**。
 现在只留这一份，另外三处都调它（check_static.py 的 npu-rule 项会拦重复实现）。
 
 ## 为什么要区分「真设备」和「假 torch_npu」
@@ -109,7 +109,7 @@ def filter_device(paths: list[Path]) -> list[Path]:
 
 
 def main(argv: list[str]) -> int:
-    """命令行入口，供 pytest.sh 使用。
+    """命令行入口，供 run_tests.sh 使用。
 
     ``--filter``：从 stdin 读文件列表，输出仍要留在 NPU 泳道的那些。
     ``--explain``：逐条打印判定结果与命中的特征。

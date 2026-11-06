@@ -20,7 +20,7 @@
 # keep holding the NPUs until the pod is recycled. The EXIT/INT/TERM trap tears the
 # group down on every path.
 #
-# Output convention matches model.py: logs on stderr, `KEY=value` to --output.
+# Output convention matches fetch_model.py: logs on stderr, `KEY=value` to --output.
 
 set -uo pipefail
 
@@ -35,7 +35,7 @@ die() { log "error: $*"; exit 2; }
 
 usage() {
     cat >&2 <<USAGE
-usage: train_supervisor.sh --script PATH [--log PATH] [--output FILE]
+usage: supervise_train.sh --script PATH [--log PATH] [--output FILE]
                            [--poll SECONDS] [--stuck-limit N]
 USAGE
     exit 2

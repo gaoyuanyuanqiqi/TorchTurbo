@@ -12,14 +12,14 @@ name: CI · 基础镜像
 # 所以「建过没有」是问 registry 就能答的无状态查询。年周用来兜住上游漂移
 # （cann 基础镜像、pip 里的 torch 都是同一份 Dockerfile、不同产物）。
 #
-# 全部逻辑在 scripts/ci/image.py（env / tag / build / verify / publish /
+# 全部逻辑在 scripts/ci/build_image.py（env / tag / build / verify / publish /
 # resolve / summary / cleanup）。为什么不在 yaml 里：那段判断有实测依据，
 # 写在 `run: |` 里不能本地跑、过不了 shellcheck，改一行只能推上去才知道对不对。
 # 实测数据见 docs/ci/README.md「镜像」一节。
 
 on:
   # 暂不启用。要恢复每晚构建时把这段解开：UTC 13:00 = 北京 21:00，
-  # 4~5 h 的构建在 18:00 UTC 前结束，正好赶上 19:00 UTC 的 ci-full。
+  # 4~5 h 的构建在 18:00 UTC 前结束，正好赶上 19:00 UTC 的全量。
   # schedule:
   #   - cron: '0 13 * * *'
 
@@ -87,14 +87,14 @@ jobs:
       - name: ② 环境自检
         env:
           RUNNER_LABEL: ${{ inputs.runner || 'ubuntu-22.04-arm' }}
-        run: python3 scripts/ci/image.py env
+        run: python3 scripts/ci/build_image.py env
 
       - name: ③ 内容 tag + 判断是否需要构建
         id: tag
         env:
           FORCE: ${{ inputs.force_rebuild }}
           SHOULD_PUSH: ${{ inputs.should_push }}
-        run: python3 scripts/ci/image.py tag
+        run: python3 scripts/ci/build_image.py tag
 
       - name: ④ 登录 SWR
         if: steps.tag.outputs.build == 'true' && steps.tag.outputs.should_push == 'true'
@@ -143,7 +143,7 @@ jobs:
           SHOULD_PUSH: ${{ steps.tag.outputs.should_push }}
           USE_CACHE: ${{ inputs.use_cache }}
           BUILDER: ${{ steps.builder.outputs.name }}
-        run: python3 scripts/ci/image.py build
+        run: python3 scripts/ci/build_image.py build
 
       - name: ⑥b 上传构建日志（失败时唯一线索）
         if: always() && steps.tag.outputs.build == 'true'
@@ -160,7 +160,7 @@ jobs:
         if: steps.tag.outputs.build == 'true' && steps.tag.outputs.should_push == 'true'
         env:
           TAG_IMM: ${{ steps.tag.outputs.immutable }}
-        run: python3 scripts/ci/image.py verify
+        run: python3 scripts/ci/build_image.py verify
 
       # 发布「当前该用哪个镜像」给 PR 侧。跳过构建时也发布：那份信息同样有效。
       - name: ⑧ 发布镜像引用（artifact）
@@ -168,7 +168,7 @@ jobs:
         env:
           TAG_IMM: ${{ steps.tag.outputs.immutable }}
           DIGEST: ${{ steps.build.outputs.digest }}
-        run: python3 scripts/ci/image.py publish
+        run: python3 scripts/ci/build_image.py publish
 
       - name: ⑧b 上传引用
         if: always() && steps.tag.outputs.should_push == 'true'
@@ -193,11 +193,11 @@ jobs:
           DIGEST: ${{ steps.build.outputs.digest }}
           MEDIA_TYPE: ${{ steps.verify.outputs.media_type }}
           ELAPSED: ${{ steps.build.outputs.elapsed }}
-        run: python3 scripts/ci/image.py summary
+        run: python3 scripts/ci/build_image.py summary
 
       - name: ⑩ 清理 builder + 悬空镜像
         if: always()
         continue-on-error: true
         env:
           BUILDER: ${{ steps.builder.outputs.name }}
-        run: python3 scripts/ci/image.py cleanup
+        run: python3 scripts/ci/build_image.py cleanup

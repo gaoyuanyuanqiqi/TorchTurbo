@@ -20,11 +20,11 @@
 （映射表一定会随重构腐烂，而腐烂是静默的）。
 
 用法：
-    affected.py --changed-file a.py --changed-file b.py
-    git diff --name-only base...HEAD | affected.py --changed-from -
-    affected.py --changed-file x.py --explain      # 打印每个文件命中了哪层
-    affected.py --audit                            # 覆盖体检（不进 PR 门禁）
-    affected.py --self-test                        # 断言算法没退化
+    select_plan.py --changed-file a.py --changed-file b.py
+    git diff --name-only base...HEAD | select_plan.py --changed-from -
+    select_plan.py --changed-file x.py --explain      # 打印每个文件命中了哪层
+    select_plan.py --audit                            # 覆盖体检（不进 PR 门禁）
+    select_plan.py --self-test                        # 断言算法没退化
 """
 
 from __future__ import annotations
@@ -306,7 +306,7 @@ _NPU_CACHE: dict[Path, bool] = {}
 def _load_npu_rule():
     """加载唯一判据模块。
 
-    规则写在 `npu_rule.py` 一份里，conftest / pytest.sh / 这里都调它。
+    规则写在 `npu_rule.py` 一份里，conftest / run_tests.sh / 这里都调它。
     原先三处各写一遍「文件里含 torch_npu」—— 那份规则把注释里提了一句的
     CPU 测试拖上了卡，又把要 `fla_npu` / `torch.npu` 的文件漏在两条泳道之外。
     按路径加载而不是 import：scripts/ci 不是包，直接 import 会依赖 sys.path[0]。
@@ -605,7 +605,7 @@ def self_test(root: Path) -> int:
         if not cond:
             failures.append(name)
 
-    print("affected.py --self-test")
+    print("select_plan.py --self-test")
 
     # ---- 泳道开关（yaml 只读这四个值） ------------------------------------
     def lane_runs(r: dict) -> dict[str, bool]:
@@ -643,7 +643,7 @@ def self_test(root: Path) -> int:
     r = select(index, ["docker/npu/Dockerfile_aarch64"])
     check("镜像配方 -> 起 npu-unit（选不中测试也要跑）", r["lanes"]["npu_unit"]["run"], str(lane_runs(r)))
 
-    r = select(index, ["scripts/ci/affected.py"])
+    r = select(index, ["scripts/ci/select_plan.py"])
     check("CI 自身改动 -> 全量 CPU", r["mode"] == "all", r["mode"])
     check("CI 自身改动 -> 不起 npu-model", r["e2e"] == [], str(r["e2e"]))
 
@@ -671,6 +671,37 @@ def self_test(root: Path) -> int:
           f"（{a['modules']} 模块 / {a['test_files']} 测试文件）")
     check("精准定位率 >= 65%（回归护栏）", a["precision"] >= 65.0, f"{a['precision']}%")
     check("含目录兜底 >= 90%", a["precision_dir"] >= 90.0, f"{a['precision_dir']}%")
+
+    # ---- 事件输入 -> 四个开关 ---------------------------------------------
+    # 这段规则原先分散在 workflow 的 bash case 里，yaml 里加一个标签就等于多
+    # 一份实现。这里把每个组合钉死。
+    def flags(mode: str, labels: str = "", with_e2e: bool = False,
+              force_all: bool = False) -> tuple:
+        f = flags_from_event(mode, labels, with_e2e, force_all)
+        return tuple(f[k] for k in ("force_all", "e2e_all", "e2e_force", "no_npu"))
+
+    check("full -> 全量单测，不带 E2E", flags("full") == (True, False, False, False),
+          str(flags("full")))
+    check("full + with_e2e -> 全部画像", flags("full", with_e2e=True) == (True, True, False, False),
+          str(flags("full", with_e2e=True)))
+    check("pr 无标签无输入 -> 什么都不要", flags("pr") == (False, False, False, False),
+          str(flags("pr")))
+    check("ci:full 标签 -> 全量 + 全部画像",
+          flags("pr", "ci:full") == (True, True, False, False), str(flags("pr", "ci:full")))
+    check("ci:e2e 标签 -> 只跑最便宜画像",
+          flags("pr", "ci:e2e") == (False, False, True, False), str(flags("pr", "ci:e2e")))
+    check("ci:skip-npu 标签 -> 不起 NPU",
+          flags("pr", "ci:skip-npu") == (False, False, False, True),
+          str(flags("pr", "ci:skip-npu")))
+    check("标签里的空格不影响判定",
+          flags("pr", "bug, ci:e2e ,docs") == (False, False, True, False),
+          str(flags("pr", "bug, ci:e2e ,docs")))
+    check("pr + force_all 不隐含 E2E（8 卡必须显式要）",
+          flags("pr", force_all=True) == (True, False, False, False),
+          str(flags("pr", force_all=True)))
+    check("pr + with_e2e -> 一个画像",
+          flags("pr", with_e2e=True) == (False, False, True, False),
+          str(flags("pr", with_e2e=True)))
 
     print(f"\n{'PASS' if not failures else 'FAILED: ' + ', '.join(failures)}")
     return 0 if not failures else 1
@@ -734,6 +765,86 @@ def read_changed(args) -> list[str]:
     return sorted(set(files))
 
 
+def flags_from_event(mode: str, labels: str, with_e2e: bool,
+                     force_all: bool = False) -> dict[str, bool]:
+    """事件输入 -> select() 的四个开关。**规则只在这里。**
+
+    原先这段是 workflow 里的一个 bash `case`,于是「标签什么意思」这件事同时
+    存在于 yaml 和文档里，两边加一个标签就漂了。放到这里之后有一条自测序列
+    （见 self_test）能把它钉死。
+
+    mode=full  : 全量单测；with_e2e 才连 E2E 一起。
+    mode=pr    : 标签优先（ci:full > ci:e2e > ci:skip-npu），再看 dispatch 的
+                 force_all / with_e2e。PR 事件本身永远不会给出 with_e2e，
+                 所以「PR 免费拿 E2E」这件事在结构上不可能发生。
+    """
+    want = {"force_all": False, "e2e_all": False,
+            "e2e_force": False, "no_npu": False}
+
+    if mode == "full":
+        want["force_all"] = True
+        want["e2e_all"] = bool(with_e2e)
+        return want
+
+    tags = {t.strip() for t in labels.split(",") if t.strip()}
+    if "ci:full" in tags:
+        want["force_all"] = True
+        want["e2e_all"] = True
+    elif "ci:e2e" in tags:
+        want["e2e_force"] = True
+    elif "ci:skip-npu" in tags:
+        want["no_npu"] = True
+
+    # force_all 的意思是「全部单测」，不是「连 E2E 也全跑」：8 卡那条泳道
+    # 才是最贵的，保持 opt-in。
+    if force_all:
+        want["force_all"] = True
+    if with_e2e:
+        want["e2e_force"] = True
+    return want
+
+
+def render_plan(result: dict, mode: str, image: str,
+                changed_files: list[str], limit: int = 100) -> str:
+    """Job Summary 里的计划表。放在这里是因为它渲染的就是 select() 的产出。"""
+    counts = result["counts"]
+    lanes = result["lanes"]
+    runs = " / ".join(str(lanes[k]["run"]).lower()
+                      for k in ("cpu_unit", "npu_unit", "npu_model"))
+    e2e = ", ".join(p["model_type"] for p in result["e2e"]) or "-"
+    head = "\n".join([
+        "## Plan",
+        "",
+        "| item | value |",
+        "|---|---|---|",
+        f"| mode | `{mode}` |",
+        f"| lanes (cpu/npu/model) | `{runs}` |",
+        f"| e2e | `{e2e}` |",
+        f"| changed | {counts['files']} files |",
+        f"| selected | {counts['tests']}/{counts['total']} files "
+        f"({counts['pct']}%), ~{counts['cases']} cases |",
+        f"| image | `{image}` |",
+        f"| valves | {', '.join(result['valves']) or '-'} |",
+    ])
+    shown = changed_files[:limit]
+    more = len(changed_files) - len(shown)
+    body = "\n".join(shown) + (f"\n... (+{more} more)" if more > 0 else "")
+    return (head
+            + "\n\n<details><summary>changed files</summary>\n\n```\n"
+            + body + "\n```\n</details>\n")
+
+
+def _bool(raw: str | bool) -> bool:
+    """'true' / 'false'（GitHub 的表达式求值结果）-> bool。
+
+    yaml 里写 `--with-e2e "$WITH_E2E"` 比 `$( [ ... ] && echo --with-e2e )`
+    短且不会因为空展开把参数错位。
+    """
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
 def main(argv: list[str]) -> int:
     here = Path(__file__).resolve()
     ap = argparse.ArgumentParser(description="按改动文件选出测试 / NPU / E2E 画像")
@@ -747,10 +858,22 @@ def main(argv: list[str]) -> int:
                     help="--changed-from git 时的基线（默认 origin/main）")
     ap.add_argument("--dump-changed", default=None,
                     help="把算出的改动清单另存一份（供 summary / 阀门判断用）")
-    ap.add_argument("--force-all", action="store_true", help="强制全量（ci:full）")
+    ap.add_argument("--force-all", nargs="?", const=True, default=False, type=_bool,
+                    help="强制全量（ci:full）；可显式给 true/false")
     ap.add_argument("--e2e-all", action="store_true", help="所有有画像的族都跑 E2E")
     ap.add_argument("--e2e-force", action="store_true", help="路径没命中时也跑最便宜画像")
     ap.add_argument("--no-npu", action="store_true", help="强制不起 NPU（ci:skip-npu）")
+    # ---- 事件输入的解读（取代 workflow 里的 bash case）--------------------
+    ap.add_argument("--mode", choices=("pr", "full"), default=None,
+                    help="pr = 按改动选测；full = 全量。给了就从这里算四个开关")
+    ap.add_argument("--labels", default="",
+                    help="逗号分隔的 PR 标签；只认 ci:full / ci:e2e / ci:skip-npu")
+    ap.add_argument("--with-e2e", nargs="?", const=True, default=False, type=_bool,
+                    help="pr = 最便宜的一个画像；full = 全部画像")
+    ap.add_argument("--summary-file", default=None,
+                    help="把计划表追加到这个文件（GITHUB_STEP_SUMMARY）")
+    ap.add_argument("--image-ref", default="-",
+                    help="只用于 --summary-file 里的展示")
     ap.add_argument("--explain", action="store_true", help="打印每个文件的命中情况")
     ap.add_argument("--audit", action="store_true", help="覆盖体检")
     ap.add_argument("--self-test", action="store_true", help="断言算法没退化")
@@ -780,8 +903,16 @@ def main(argv: list[str]) -> int:
         Path(args.dump_changed).write_text(
             "\n".join(changed) + ("\n" if changed else ""), encoding="utf-8"
         )
-    result = select(index, changed, force_all=args.force_all, e2e_all=args.e2e_all,
-                    e2e_force=args.e2e_force, no_npu=args.no_npu)
+
+    # --mode 给了就以它为准（规则集中在 flags_from_event）；否则用逐个
+    # --force-all / --e2e-* 参数（ci-full 之外的调用方、以及自测都在用）。
+    if args.mode:
+        flags = flags_from_event(args.mode, args.labels, args.with_e2e,
+                                 args.force_all)
+    else:
+        flags = {"force_all": args.force_all, "e2e_all": args.e2e_all,
+                 "e2e_force": args.e2e_force, "no_npu": args.no_npu}
+    result = select(index, changed, **flags)
 
     if args.shard:
         i, n = (int(x) for x in args.shard.split("/"))
@@ -813,6 +944,11 @@ def main(argv: list[str]) -> int:
     else:
         print(payload)
 
+    if args.summary_file:
+        with open(args.summary_file, "a", encoding="utf-8") as fh:
+            fh.write(render_plan(result, args.mode or result["mode"],
+                                 args.image_ref, changed))
+
     if args.github_output:
         lanes = result["lanes"]
         with open(args.github_output, "a", encoding="utf-8") as fh:
@@ -831,7 +967,7 @@ def main(argv: list[str]) -> int:
             fh.write(f"npu={str(result['npu']).lower()}\n")
             fh.write(f"targets={json.dumps(result['targets'], ensure_ascii=False)}\n")
             fh.write(f"e2e={json.dumps(result['e2e'], ensure_ascii=False)}\n")
-            # 保底：pytest.sh 在不给 TEST_FILES 时自己 glob 全量，这里保留原语义。
+            # 保底：run_tests.sh 在不给 TEST_FILES 时自己 glob 全量，这里保留原语义。
             fh.write(f"test_files={json.dumps(index.test_files, ensure_ascii=False)}\n")
             fh.write(f"summary={result['mode']} {result['counts']['files']}f "
                      f"{result['counts']['tests']}/{result['counts']['total']}f "
@@ -843,6 +979,6 @@ if __name__ == "__main__":
     try:
         sys.exit(main(sys.argv[1:]))
     except BrokenPipeError:
-        # `affected.py --explain | head` 会提前关掉管道；别让它刷一堆噪音。
+        # `select_plan.py --explain | head` 会提前关掉管道；别让它刷一堆噪音。
         sys.stdout = None
         sys.exit(0)

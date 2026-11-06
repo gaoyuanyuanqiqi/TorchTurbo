@@ -1,15 +1,12 @@
 # CI 体系
 
-五个 workflow，一个必过检查（`gate`）。改动的路径决定跑哪几条泳道，其余一律跳过——
+**两个 workflow，一个必过检查（`gate`）。** 改动的路径决定跑哪几条泳道，其余一律跳过——
 但**跳过必须带原因**，否则门禁判红。
 
 ```
 .github/workflows/
-  ci-pr.yml           PR 门禁（唯一 required check：gate）
-  ci-full.yml         main 全量（调试期只手动）
+  ci-pr.yml          唯一入口：mode=pr 选测门禁 / mode=full 全量
   ci-image.yml        构建基础镜像（只手动）
-  ci-tests.yml        三条测试泳道的唯一入口（kind 选择）
-  ci-tests-model.yml  npu-model 的实现体（被 ci-tests.yml 调用，无 dispatch）
   model_map.json      模型 -> 启动脚本 / 权重 / 端到端画像
 
 pull_request ──► ci-pr.yml
@@ -17,13 +14,22 @@ pull_request ──► ci-pr.yml
                    │           + actionlint + hadolint）
                    │           然后算改动 → 出计划（泳道开关 + 文件清单）
                    │           两者**同一个 job、同一个 runner**
-                   ├─ cpu-unit-tests   CPU pytest（affected 选中的文件 ×N 片）
-                   ├─ npu-unit-tests   NPU pytest（一旦开跑就泳道内全跑）
-                   ├─ npu-model-tests  E2E：一个族内小模型跑一步
+                   ├─ cpu-unit-tests    CPU pytest（选中的文件，不分片）
+                   ├─ npu-unit-tests    NPU pytest（一旦开跑就泳道内全跑）
+                   ├─ npu-model-tests   E2E：按 profiles 逐个跑一步
                    └─ gate     唯一 required check
 
-手动 ─────────────► ci-full.yml / ci-image.yml / ci-tests.yml
+手动 ─────────────► ci-pr.yml（mode 选 pr / full） / ci-image.yml
 ```
+
+**每条泳道在图上只有一个盒子，而且名字就是泳道名。** 两个约束都是结构性的：
+
+- 可复用 workflow 会把被调文件的**所有** job 展开成图上的盒子，而 `uses:` 的
+  job 一律显示成 `调用方名 / 被调方名`，两段合不成一段 —— 所以泳道必须**内联**。
+- `strategy.matrix` 会把一个 job 乘以条目数 —— 所以 CPU **不分片**，model 的多
+  画像在 job 内部循环（`run_train.sh lane`）。
+- job key 带 `l1_` / `l2_` / `l3_` 前缀：图上的同级 job 按 key 排序，这是
+  cpu → npu-unit → npu-model 从上到下的唯一保证。
 
 ### 文件名规范
 
@@ -62,7 +68,7 @@ select（静态检查 → 算计划） ─┼─► npu-unit-tests         ─�
 
 代价只有一处：job 红了只看 `needs.select.result` 分不清倒在哪一步。所以最后
 一步用 `if: always()` 把 `stage`（`ok` / `static` / `select` / `cancelled`）写进
-job 输出，`gate.py` 用它决定摘要该写「静态检查未通过」还是「计划未算出」。
+job 输出，`report_gate.py` 用它决定摘要该写「静态检查未通过」还是「计划未算出」。
 
 同时，`actionlint` / `hadolint` 是**无条件跑**的（早先靠 `ci_changed` /
 `docker_changed` 判断，那两个输出已经删除）：为省一次 2 s 的二进制下载去复制
@@ -70,8 +76,8 @@ job 输出，`gate.py` 用它决定摘要该写「静态检查未通过」还是
 
 `check_static.py` 的 `contract` 检查守这个拓扑，写错会当场报错：
 
-1. 跑 `check_static.py` 的 job 必须**同时**跑 `affected.py`（别拆成两个 job）；
-2. 同一个 job 里 `check_static.py` 必须**排在** `affected.py` 之前；
+1. 跑 `check_static.py` 的 job 必须**同时**跑 `select_plan.py`（别拆成两个 job）；
+2. 同一个 job 里 `check_static.py` 必须**排在** `select_plan.py` 之前；
 3. 算计划的入口只能有一处（`--changed-from git` 不许出现两次）；
 4. `l1` / `l2a` / `l2b` 的 `needs` 必须**恰好**是 `[select]`（并行，不许串起来）；
 5. `gate.needs` 必须包含 `select`（提前结束通路）。
@@ -97,7 +103,7 @@ job 输出，`gate.py` 用它决定摘要该写「静态检查未通过」还是
 
 ### gate 的判定
 
-并行之后不再有「上游红了所以下游 skipped」这种因果，所以 `gate.py` 里也**不再
+并行之后不再有「上游红了所以下游 skipped」这种因果，所以 `report_gate.py` 里也**不再
 有** `cpu_bad` / `npu_bad` 这类传递判断。跳过只剩两种原因：
 
 | 情形 | 结论 |
@@ -111,46 +117,36 @@ job 输出，`gate.py` 用它决定摘要该写「静态检查未通过」还是
 
 ```
 PR ──────────────► ci-pr.yml（select[静态+计划] -> {三条测试泳道} -> gate）
-每晚 ─────────────► ci-full.yml（全量，不选测）
+每晚 ─────────────► ci-pr.yml mode=full（全量，不选测）
 每晚 ─────────────► ci-image.yml（基础镜像，内容没变就跳过）
-手动 ─────────────► ci-tests.yml（kind 选一条泳道）
+手动排查 ─────────► ci-pr.yml mode=pr + force_all（跑全部 CPU/NPU 单测）
 ```
 
 
-`ci-tests.yml` 同时是 `workflow_call`（给门禁调用）与 `workflow_dispatch`
-（给自己排查用）：**手动入口全仓只有一个**。合成一个文件而不是维护两个入口，
-是因为**两边的默认值刚好相反**：
+### 为什么全量和 PR 是同一个文件
 
-| | 调用方要的 | 手动要的 |
-|---|---|---|
-| 训练超时 | 45 min（截死就跑不完了） | 300 min（全量权重 255 GB） |
-| 模型获取超时 | 跳过并判绿 | 判红（不能把网络问题当通过） |
-| pytest 目标 | 选中的分片 | 一个目录 / node id |
+两者的差别只有三行：select 里是否 `--force-all`、gate 用 `judge --mode pr|full`、
+以及 `concurrency`。早先拆成两个文件的结果是 90% 的行重复写两追，
+而“全量忘了同步 PR 的新泳道”是一种只能靠 review 发现的错。
 
-拆成两个文件就得人肉维护一份重复的输入声明，而且两份会慢慢漂。
-合成一个后，dispatch 的默认值只影响手动跑，调用方永远显式传值。
+现在用一个 `CI_MODE` 环境变量分叉，静态检查（`check_static.py`）同时扫这一个文件，
+两边不可能漂。`mode` 只影响选测与判定，泳道体完全共用。
 
-### 为什么 `ci-tests-model.yml` 又是单独一个文件
+### 为什么泳道要内联
 
-因为它**不是同一个问题**：单位测试的差别只在「在哪跑、跑哪些」，而模型测试
-要取权重、减层、按卡数收敛 sp/ep、看门狗、超时收尾 —— 实现体比两条 unit 泳道
-加起来还长。塞进 `ci-tests.yml` 只会让「哪条泳道」和「训练怎么跑」这两件事
-互相牵制。
-
-所以分界线是：**`ci-tests.yml` 负责「选哪条泳道」，`ci-tests-model.yml`
-负责「模型测试怎么跑」**。前者用一个 `kind` 输入 + 一个 `uses:` 转发，
-后者的输入原样透传；后者**没有** `workflow_dispatch`，避免默认值再次分叉。
-
-`kind` 同时吸收了原来的 `use_container`：`cpu-unit` 一定裸机、`npu-unit` 一定
-容器。少一个布尔输入，就少一类「cpu-unit 却给了镜像」的无效组合。
+图上的泳道名只能是**一段**，而可复用 workflow 的 job 一律显示成
+`调用方名 / 被调方名`（早先是 `1. cpu-unit / run`），GitHub 没有合并成一段的选项。
+所以三条泳道直接写在这个文件里：job key 用 `l1_` / `l2_` / `l3_` 前缀保证顺序，
+`name` 就是泳道名。
 
 ## 决策层：一个计划，三个开关
 
-分支判断**只允许存在一处**，在 `scripts/ci/affected.py` 里。它输出一份计划：
+分支判断**只允许存在一处**，在 `scripts/ci/select_plan.py` 里。它输出一份计划：
 
 ```
 cpu_unit_run=true   npu_unit_run=true   npu_model_run=false
-cpu_unit_files=["tests/ops/cpu/test_x.py", ...]     shard_list=["0/5","1/5",...]
+cpu_unit_files=["tests/ops/cpu/test_x.py", ...]
+e2e=[{"model_type": "qwen3_5", "layers": 0}, ...]
 ```
 
 yaml 里**只读布尔值，不做任何判断**。没有 `if: contains(github.event.pull_request.labels...)`，
@@ -172,13 +168,13 @@ if: |
 显式拦住「计划没算出来」这一种，所以第一行永远是
 `needs.select.result == 'success'`。
 
-`gate.py` 拿同样的开关做判定：该跑却 `skipped` 是 `skipped-unknown`（红），
+`report_gate.py` 拿同样的开关做判定：该跑却 `skipped` 是 `skipped-unknown`（红），
 不该跑而 `skipped` 是 ⏭（绿）。两边用**同一组变量名**，否则摘要会给出
 和实际执行相反的解释。
 
 ### 决策层契约由 select 里的静态检查看守
 
-`check_static.py` 的 `contract` 项会**真的跑一次** `affected.py`，断言那四个
+`check_static.py` 的 `contract` 项会**真的跑一次** `select_plan.py`，断言那四个
 输出真的被写出来，再逐个 workflow 校验 `needs.select.outputs.X` 都已声明。
 
 这类 bug 的特点就是「能跑、能绿」：拼错一个输出名 → GitHub 给空字符串 →
@@ -210,8 +206,8 @@ npu-unit 一旦开跑就是**泳道内全跑**（17 个含 `torch_npu` 的文件
 cpu-unit 只跑选中的文件，所以「一个改文档的 PR」连 CPU 泳道都不开——静态那 15 s
 就是它的全部成本。
 
-两张表对应两个脚本：路径 → 用例是 `scripts/ci/affected.py`，路径 → 画像在
-`affected.py` 的 `pick_e2e()` 里，画像本身写在 `model_map.json` 的 `e2e` 字段。
+两张表对应两个脚本：路径 → 用例是 `scripts/ci/select_plan.py`，路径 → 画像在
+`select_plan.py` 的 `pick_e2e()` 里，画像本身写在 `model_map.json` 的 `e2e` 字段。
 
 改 CI 自身为什么跑全量 CPU：这些脚本就是「怎么跑测试」本身，改错了会**静默少跑**，
 只有全量能看出来。但它们不烧 NPU。
@@ -229,7 +225,7 @@ cpu-unit 只跑选中的文件，所以「一个改文档的 PR」连 CPU 泳道
 构建成功后会把 `{ref, tag, digest}` 写成 `base-image-ref` artifact（保留 90 天）。
 **生产开着、消费暂关**：`ci-image.yml` 照旧发布，但 PR / 全量的 `select`
 不读它，只用上面的固定链接。要接上时把 `--repo "$GITHUB_REPOSITORY"` 加回
-`image.py resolve` 那一行即可（解析顺序：人工覆盖 → artifact → 固定链接）。
+`build_image.py resolve` 那一行即可（解析顺序：人工覆盖 → artifact → 固定链接）。
 **整条链路不需要任何长期凭据** —— `gh variable set` 对 `GITHUB_TOKEN` 是 403，
 所以才走 artifact。
 
@@ -243,11 +239,11 @@ cpu-unit 只跑选中的文件，所以「一个改文档的 PR」连 CPU 泳道
 1. 选择器异常 / 非 0 退出
 2. 改动文件为空（`merge-base` 失败、浅克隆没历史……）
 3. `ci:full` 标签（或 `workflow_dispatch` 的 `force_all`）
-4. 手动全量（`ci-full.yml` 只走全量）；`push` / `schedule` 当前都不触发 CI
+4. 手动全量（`mode=full` 只走全量）；`push` / `schedule` 当前都不触发 CI
 5. 改动 **> 300 文件**
 
 第 5 条的方向是审过的：**大 PR 该跑更多测试，不是更少**。改 1000 个文件的 PR
-往往是大重构，正是全量最能抓问题的时候；全量分片后也就 8~10 min。
+往往是大重构，正是全量最能抓问题的时候；全量不分片，CPU 也就 5~8 min。
 
 ## 标签
 
@@ -257,6 +253,10 @@ cpu-unit 只跑选中的文件，所以「一个改文档的 PR」连 CPU 泳道
 | `ci:e2e` | 路径没命中时也强制跑 L2（起 NPU + 最便宜画像） |
 | `ci:e2e:strict` | E2E 因模型超时跳过时**判红**；默认是「跳过但绿」 |
 | `ci:skip-npu` | 强制关掉 L2（hotfix 用） |
+
+标签的语义在 `scripts/ci/select_plan.py` 的 `flags_from_event()` 里，**不在 yaml**
+里：yaml 只把标签拼成字符串传过去。这样 `--self-test` 能把 8 种组合钉死，
+而「加一个标签」只需要改一处，不会出现 yaml 和文档两套说法。
 
 ## fork PR 的 L2 不自动跑
 
@@ -273,7 +273,8 @@ git push origin ci/pr-123
 gh workflow run ci-pr.yml -F ref=ci/pr-123
 ```
 
-或者直接手动跑 `ci-tests.yml`（用 `kind` 选泳道）。
+或者直接 dispatch `ci-pr.yml`：`mode=pr` + `force_all` 跑全部单测，
+`mode=full` 连 E2E 一起跑。
 
 ## 时间预算
 
@@ -290,28 +291,29 @@ gh workflow run ci-pr.yml -F ref=ci/pr-123
 超时只负责**拦住卡死**，不负责卡住正常但较慢的运行——所以 step 级超时给到实测值的
 3~4 倍，而不是贴着实测值。
 
-超时之后一定有收尾（`if: always()` → `scripts/ci/env.py cleanup`）：被杀掉的训练会
+超时之后一定有收尾（`if: always()` → `scripts/ci/env_pod.py cleanup`）：被杀掉的训练会
 留下占卡的子进程、没释放的显存和半个 checkpoint，下个 job 会以完全无关的方式失败。
 
 ## NPU 池串行：不要用 job 级 `concurrency`
 
-第一版在 `ci-tests.yml` 里按 runner 标签分过组
+第一版在泳道文件里按 runner 标签分过组
 （`ci-tests-<label>`，`cancel-in-progress: false`），想的是"让手动跑和 PR 排同一个队"。
-实测**这个做法会吃掉分片**：
+实测**这个做法会吃掉并发**：
 
 > 同一个 concurrency group 里，GitHub 只保留**一个** pending 的 job；
 > 新排进来的会把前一个 pending 的 cancel 掉（`cancel-in-progress: false` 只保证
 > 不打断 *正在跑* 的那个）。
 
-`ci-full` 第一次 run 就是这么挂的：5 个 cpu-unit 分片在 12:19:20 同时入队，
-2/3/4 在 1 秒后全部变成 `cancelled`，只剩 0 和 1 真的跑了。
+全量第一次 run 就是这么挂的：同时在队的 job 只剩最后一个，其余的都被
+`cancelled`。
 
-所以现在两个可复用泳道里**没有任何 `concurrency`**。串行本来就由 runner 提供：
+所以现在三个泳道文件里**没有任何 `concurrency`**。串行本来就由 runner 提供：
 self-hosted runner 忙着的时候，下一个 job 天然停在 `queued`。要给某个池限并发，
 应该去 ARC / runner group 那一层做，而不是在被调用的 workflow 里。
 
-workflow 级 `concurrency` 仍然保留在三个入口文件里（`ci-pr-*` / `ci-full-*` /
-`image-ci-base`），那里语义是"同一条 ref 的新 run 顶掉旧的"，是对的。
+workflow 级 `concurrency` 现在只留在一个入口文件里（`ci-pr.yml`），并且按
+模式分 group：PR 用 `pr-<number>`（新 push 顶掉旧 run），全量用 `full-<run_id>`
+（每次唯一，永远排不到队）。
 
 ## `timeout-minutes` 必须包 `fromJSON`
 
@@ -335,7 +337,7 @@ timeout-minutes: ${{ fromJSON(inputs.timeout_minutes || 60) }}
 `fromJSON` 对 number 和字符串两种输入都成立（number 输入在 `workflow_call` 下
 仍然走这条路，实测同样正常），所以两条触发链可以用同一份表达式。
 
-这个 bug 让 `ci-tests.yml` 的**手动入口**完全不可用 —— 提交
+这个 bug 让泳道文件的**手动入口**完全不可用 —— 提交
 `f2acd5d` 之后的三次 dispatch 全是这个原因。定位过程：二分探针（`applied` 过的
 `zz-probe*.yml` 已删除），`p`/`q` 两个不带 `timeout-minutes` 的 job 正常创建，
 而带表达式的 `r` 直接消失。
@@ -354,18 +356,18 @@ timeout-minutes: ${{ fromJSON(inputs.timeout_minutes || 60) }}
 
 ```bash
 python3 scripts/ci/check_static.py            # 静态六项（含跑一次选择器验契约）
-python3 scripts/ci/affected.py --self-test    # 选测算法没退化（24 条断言）
-python3 scripts/ci/affected.py --audit        # 覆盖体检
-bash scripts/ci/pytest.sh                     # 真在本机跑一遍（MODE=cpu）
-python3 scripts/ci/gate.py judge --mode pr    # 用手写的 env 验判定
-python3 scripts/ci/image.py tag --dry-run     # 看当前内容的镜像 tag
+python3 scripts/ci/select_plan.py --self-test    # 选测算法没退化（24 条断言）
+python3 scripts/ci/select_plan.py --audit        # 覆盖体检
+bash scripts/ci/run_tests.sh                     # 真在本机跑一遍（MODE=cpu）
+python3 scripts/ci/report_gate.py judge --mode pr    # 用手写的 env 验判定
+python3 scripts/ci/build_image.py tag --dry-run     # 看当前内容的镜像 tag
 
 # 某个改动会被怎么选（含四个泳道开关）
-python3 scripts/ci/affected.py --changed-file src/torchturbo/engine/core.py --explain
+python3 scripts/ci/select_plan.py --changed-file src/torchturbo/engine/core.py --explain
 
 # 装完依赖 torch 有没有被 pip 换掉
-python3 scripts/ci/env.py capture --file /tmp/t.json
-python3 scripts/ci/env.py check   --file /tmp/t.json
+python3 scripts/ci/env_pod.py capture --file /tmp/t.json
+python3 scripts/ci/env_pod.py check   --file /tmp/t.json
 ```
 
 验泳道判定最快的方法（不跑 CI，只看 gate 怎么说）：
@@ -373,7 +375,7 @@ python3 scripts/ci/env.py check   --file /tmp/t.json
 ```bash
 run() { env R_SEL=$1 SEL_STAGE=$2 R_CPU_UNIT=$3 R_NPU_UNIT=$4 R_NPU_MODEL=$5 \
   CPU_UNIT_RUN=$6 NPU_UNIT_RUN=$7 NPU_MODEL_RUN=$8 STRICT=false SUMMARY=t \
-  python3 scripts/ci/gate.py judge --mode pr; }
+  python3 scripts/ci/report_gate.py judge --mode pr; }
 
 run success ok      skipped skipped skipped false false false  # 改文档：什么都不跑
 run success ok      success skipped skipped true  false false  # 改模型：cpu-unit
@@ -385,7 +387,7 @@ run failure select  skipped skipped skipped true  true  true   # 计划没算出
 
 ## 一个刻意的取舍
 
-`ci-tests.yml` 的**裸机**泳道不用 `pip install -e ".[dev]"`，而是先装
+cpu-unit-tests 的**裸机**泳道不用 `pip install -e ".[dev]"`，而是先装
 「可用版本」的 torch，再 `--no-deps` 装本包。
 
 原因：`pyproject` 钉的是 `torch>=2.10.0`（NPU 镜像里那套），GH 托管机只能从 PyPI 拿

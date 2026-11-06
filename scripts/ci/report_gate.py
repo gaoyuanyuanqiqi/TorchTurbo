@@ -5,8 +5,8 @@
 两边的规则本来几乎一样，但抄成了两段 bash，于是「fork PR 的 L2 算不算合法跳过」
 只在一个文件里修对过。收进这里之后两边不可能再分叉。
 
-    gate.py timing   排队 / 执行 / 端到端，写进 Job Summary（不参与判定）
-    gate.py judge    逐泳道判定，退出码即门禁结论
+    report_gate.py timing   排队 / 执行 / 端到端，写进 Job Summary（不参与判定）
+    report_gate.py judge    逐泳道判定，退出码即门禁结论
 
 判定只用两条规则：
 
@@ -35,6 +35,13 @@ OK, SKIP, BAD = "✅ 通过", "⏭ 跳过", "❌"
 
 def _env(name: str, default: str = "") -> str:
     return os.environ.get(name, default) or default
+
+
+def _has_label(tag: str) -> bool:
+    """标签判定只在这里（与 select_plan.py 的 flags_from_event 分工相同：
+    选什么归它，算不算过归这里）。"""
+    tags = {t.strip() for t in _env("LABELS").split(",") if t.strip()}
+    return tag in tags
 
 
 def _summary(markdown: str) -> None:
@@ -185,7 +192,7 @@ def judge_pr() -> int:
     skip_reason = _env("SKIP_REASON")
     if skip_reason and results["NPU_MODEL"] == "success":
         rep.note("npu-model 跳过原因", f"⚠️ {skip_reason}")
-        if _env("STRICT") == "true":
+        if _has_label("ci:e2e:strict"):
             rep.failed = True
 
     # select 是计划本身：没算出来就没有「跑不跑」可言，直接判红。

@@ -36,7 +36,7 @@ DIAG_PREFIX = "[ttdiag]"
 KIND_TRAIN = "train"
 KIND_PYTEST = "pytest"
 
-# 映射表的字段顺序。train.sh 的 cmd_prepare 按这个顺序 set -- 分区，
+# 映射表的字段顺序。run_train.sh 的 cmd_prepare 按这个顺序 set -- 分区，
 # 所以只能往后追加，不能插队。
 _MAP_FIELDS = ("run_dir", "lf", "swift", "hf_repo", "e2e")
 
@@ -382,7 +382,7 @@ def main(argv: list[str]) -> int:
         return 0
 
     # ---- 映射表查询 -------------------------------------------------------
-    # train.sh 以前用 awk 取第 2/3/4/5 列。改成 JSON 之后用 awk 就得现写
+    # run_train.sh 以前用 awk 取第 2/3/4/5 列。改成 JSON 之后用 awk 就得现写
     # 一个 JSON 解析器，所以挪到这里：shell 只负责把值读进变量。
     # 这两个不需要 --file（它们不碰事实文件），所以放在必填校验之前。
     if args.command == "map-row":

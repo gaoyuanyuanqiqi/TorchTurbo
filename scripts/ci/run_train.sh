@@ -10,6 +10,7 @@
 #   install  ③④ pip 装 torchturbo 与模型依赖（torch 归属校验）
 #   run      ⑤  取模型 → 推并行策略 → 起训练 → 落事实
 #   report   ⑥  渲染 Job Summary 与注解
+#   lane     prepare → install → run → report，按 E2E_PROFILES 逐个跑
 #
 # 事实写进 $RESULT_JSON 而不是 step outputs：step 失败时 outputs 是空的，
 # 而失败的那次恰恰是唯一会被人翻出来看的。
@@ -21,7 +22,19 @@ RESULT_JSON="${RESULT_JSON:-/tmp/ci-result.json}"
 GITHUB_OUTPUT="${GITHUB_OUTPUT:-/dev/null}"
 MAP="${MAP:-.github/workflows/model_map.json}"
 
-result() { python3 "$CI_SCRIPTS/result.py" "$@"; }
+# set -u turns any missing input into a crash halfway through a 20 min job.
+# Default everything the functions read, in one place.
+: "${MODEL_TYPE:=}"; : "${FRAMEWORK:=lf}"; : "${RUNNER_LABEL:=}"
+: "${IMAGE:=}"; : "${LAYERS:=0}"
+: "${MODEL_HINT:=}"; : "${REPO_MAP:=}"; : "${REPO_IN:=}"
+: "${SP_IN:=auto}"; : "${EP_IN:=auto}"; : "${SEQ_LEN:=1024}"
+: "${FINETUNING_TYPE:=full}"; : "${DATASET_IN:=gsm8k}"
+# DATASET = what the launchers read; DATASET_IN = the workflow input name.
+: "${DATASET:=${DATASET_IN}}"
+: "${DIAG:=false}"; : "${FETCH_TIMEOUT:=600}"; : "${STRICT:=false}"
+: "${INSTALL_SCRIPT:=}"; : "${TRAIN_SCRIPT:=}"; : "${E2E_PROFILES:=[]}"
+
+result() { python3 "$CI_SCRIPTS/report_result.py" "$@"; }
 
 # 每步都落一条 phase，摘要里按执行顺序列表。
 phase_run() {                       # phase_run <名字> <命令...>
@@ -38,7 +51,7 @@ phase_run() {                       # phase_run <名字> <命令...>
 
 # ---------------------------------------------------------------- prepare
 # 先确认这个 model_type 真能跑，再去装依赖；否则白等几十分钟。
-# 字段：run_dir lf swift hf_repo e2e（顺序由 result.py 的 _MAP_FIELDS 决定）
+# 字段：run_dir lf swift hf_repo e2e（顺序由 report_result.py 的 _MAP_FIELDS 决定）
 cmd_prepare() {
   result init --file "$RESULT_JSON" \
     kind=train model_type="$MODEL_TYPE" framework="$FRAMEWORK" \
@@ -48,7 +61,7 @@ cmd_prepare() {
   [ -f "$MAP" ] || { echo "::error::缺少 $MAP"; return 1; }
 
   # 映射表是 JSON，用 awk 取字段就得现写一个 JSON 解析器 —— 所以让
-  # result.py 读，shell 只负责把值读进变量。字段顺序见 _MAP_FIELDS。
+  # report_result.py 读，shell 只负责把值读进变量。字段顺序见 _MAP_FIELDS。
   local row
   if ! row=$(result map-row --map "$MAP" --model-type "$MODEL_TYPE"); then
     echo "::error::model_type '$MODEL_TYPE' 不在 $MAP 里；可选项："
@@ -116,17 +129,17 @@ cmd_prepare() {
 
 # ---------------------------------------------------------------- probe
 # 花 20 s 发现「没有 NPU」，比装完两套依赖再发现省一整轮超时，
-# 而且那时的报错长得像训练 bug。env.py verify 会真的在每张卡上算一次 matmul，
+# 而且那时的报错长得像训练 bug。env_pod.py verify 会真的在每张卡上算一次 matmul，
 # 这是唯一能区分「没设备」和「有设备但栈坏了」的检查。
 cmd_probe() {
   # 在任何 pip 之前记录；install 会拿它比对。
-  python3 "$CI_SCRIPTS/env.py" capture --file /tmp/torch-before.json
+  python3 "$CI_SCRIPTS/env_pod.py" capture --file /tmp/torch-before.json
 
   ls /dev/davinci* >/dev/null 2>&1 \
     || { echo "::error::no /dev/davinci*, NPUs not mapped into the pod"; return 1; }
   echo "davinci count: $(ls /dev/davinci* | wc -l)"
 
-  phase_run '②b NPU 自检' python3 "$CI_SCRIPTS/env.py" verify
+  phase_run '②b NPU 自检' python3 "$CI_SCRIPTS/env_pod.py" verify
 }
 
 # ---------------------------------------------------------------- install
@@ -167,7 +180,7 @@ PROBE
   cat /tmp/after.txt
 
   if [ "$rc" -eq 0 ]; then
-    python3 "$CI_SCRIPTS/env.py" check --file /tmp/torch-before.json || rc=1
+    python3 "$CI_SCRIPTS/env_pod.py" check --file /tmp/torch-before.json || rc=1
   fi
   result phase --file "$RESULT_JSON" --name "$name" --seconds "$elapsed" --rc "$rc"
   echo "::notice::${name} 耗时 ${elapsed}s（rc=${rc}）"
@@ -216,18 +229,24 @@ cmd_run() {
   : > "$cache_out"
 
   if [ -n "$MODEL_HINT" ]; then
-    if r=$(python3 "$CI_SCRIPTS/model.py" probe --dir "$MODEL_HINT"); then
+    if r=$(python3 "$CI_SCRIPTS/fetch_model.py" probe --dir "$MODEL_HINT"); then
       model=$MODEL_HINT; bytes=${r% *}; shards=${r#* }; hit=yes
       echo "使用显式模型：$model  bytes=$bytes shards=$shards"
     else
       echo "::error::train_model_path 不完整：$MODEL_HINT"; return 1
     fi
   else
-    python3 "$CI_SCRIPTS/model.py" find --repo "$hf_repo" \
+    python3 "$CI_SCRIPTS/fetch_model.py" find --repo "$hf_repo" \
       --marker "$marker" --output "$cache_out"
+    # find writes uppercase MODEL / BYTES / SHARDS / HIT; the rest of this
+    # function works in lowercase. Sourcing alone leaves `model` empty, which
+    # silently exports MODEL="" and the launcher falls back to a path that
+    # does not exist (HFValidationError on '/models/...' several minutes in).
     # shellcheck disable=SC1090
     . "$cache_out"
     if [ "${HIT:-no}" = yes ]; then
+      model="${MODEL:-}"; bytes="${BYTES:-0}"; shards="${SHARDS:-0}"
+      [ -n "$model" ] || { echo "::error::fetch_model.py find 报了 HIT 但没给 MODEL"; return 1; }
       echo "缓存命中：$model"
     else
       local fetch_start trc
@@ -235,13 +254,13 @@ cmd_run() {
       if [ -z "${LAYERS:-0}" ] || [ "${LAYERS:-0}" -eq 0 ]; then
         model="/root/.cache/models/$hf_repo"
         echo "::notice::缓存未命中（sfs=${uuid:-?}），下载 $hf_repo"
-        timeout "$FETCH_TIMEOUT" python3 "$CI_SCRIPTS/model.py" fetch \
+        timeout "$FETCH_TIMEOUT" python3 "$CI_SCRIPTS/fetch_model.py" fetch \
           --repo "$hf_repo" --dir "$model"
         trc=$?
       else
         model="/root/.cache/models/$(basename "$hf_repo")-L${LAYERS}"
         echo "::notice::缓存未命中（sfs=${uuid:-?}），裁剪 $hf_repo 到 $LAYERS 层"
-        timeout "$FETCH_TIMEOUT" python3 "$CI_SCRIPTS/model.py" trim \
+        timeout "$FETCH_TIMEOUT" python3 "$CI_SCRIPTS/fetch_model.py" trim \
           --repo "$hf_repo" --dir "$model" --layers "$LAYERS"
         trc=$?
       fi
@@ -253,11 +272,11 @@ cmd_run() {
         echo "::error::模型获取失败（rc=${trc}）：$hf_repo"
         return 1
       fi
-      if ! r=$(python3 "$CI_SCRIPTS/model.py" probe --dir "$model"); then
+      if ! r=$(python3 "$CI_SCRIPTS/fetch_model.py" probe --dir "$model"); then
         echo "::error::模型不完整：$model"; return 1
       fi
       bytes=${r% *}; shards=${r#* }
-      python3 "$CI_SCRIPTS/model.py" mark --dir "$model" --text "$marker"
+      python3 "$CI_SCRIPTS/fetch_model.py" mark --dir "$model" --text "$marker"
     fi
   fi
   echo "model: $model  bytes=$bytes shards=$shards  layers=${LAYERS:-0}"
@@ -277,14 +296,14 @@ cmd_run() {
 
   plan_out=/tmp/plan.out
   : > "$plan_out"
-  python3 "$CI_SCRIPTS/parallel_plan.py" \
+  python3 "$CI_SCRIPTS/plan_parallel.py" \
     --yaml "$src" --cards "$NPUS_PER_NODE" \
     --sp "$SP_IN" --ep "$EP_IN" --layers "${LAYERS:-0}" \
     --out "/tmp/tt_${MODEL_TYPE}.yaml" --output "$plan_out"
   # shellcheck disable=SC1090
   . "$plan_out"
   [ -n "${SP:-}" ] && [ -n "${EP:-}" ] \
-    || { echo "::error::并行策略推导失败（见上面的 parallel_plan.py 输出）"; return 1; }
+    || { echo "::error::并行策略推导失败（见上面的 plan_parallel.py 输出）"; return 1; }
   echo "train script: $TRAIN_SCRIPT"
   echo "tt_config: $TT_CONFIG"
 
@@ -306,7 +325,7 @@ cmd_run() {
 
   local train_out=/tmp/train_meta.out elapsed=0 last_loss="" watchdog=no stuck=no
   : > "$train_out"
-  bash "$CI_SCRIPTS/train_supervisor.sh" \
+  bash "$CI_SCRIPTS/supervise_train.sh" \
     --script "$TRAIN_SCRIPT" --log /tmp/train.log --output "$train_out"
   local rc=$?
   # shellcheck disable=SC1090
@@ -351,6 +370,72 @@ cmd_report() {
   result notice --file "$RESULT_JSON" --model-type "${MODEL_TYPE:-}" || true
 }
 
+# ---------------------------------------------------------------- lane
+# One job, N profiles.
+# A reusable workflow call expands into *all* of its jobs, and a matrix
+# expands once per entry, so selecting profiles with a matrix turns one lane
+# into one box per profile. The loop lives here instead: the graph always
+# shows exactly one box per lane.
+cmd_lane() {
+  local rc=0 total=0 skipped=0 per mt layers
+
+  # Callers pass the *_IN spellings (they mirror the workflow input names);
+  # the inner functions read the short ones.
+  export DATASET="${DATASET_IN:-${DATASET:-gsm8k}}"
+
+  while IFS=$'\t' read -r mt layers; do
+    [ -n "$mt" ] || continue
+    total=$((total + 1))
+    per="/tmp/profile-$total.env"; : > "$per"
+    echo "::group::profile $total: $mt (layers=${layers:-0})"
+    export MODEL_TYPE="$mt" LAYERS="${layers:-0}"
+
+    # prepare/run talk to $GITHUB_OUTPUT; point it at a temp file so the
+    # resolved script paths can be read back per profile.
+    if ! GITHUB_OUTPUT="$per" cmd_prepare; then
+      rc=1
+    else
+      # prepare writes lowercase keys (run_dir / install_script / train_script /
+      # hf_repo); install and run read the uppercase spellings. In a single
+      # workflow job the step outputs bridge the two, here nothing does, so
+      # map them explicitly -- empty values are silent (deps not installed,
+      # hf_repo='' -> HFValidationError hours later).
+      local run_dir install_script train_script hf_repo
+      set -a
+      # shellcheck disable=SC1090
+      . "$per"
+      set +a
+      RUN_DIR="${run_dir:-}"
+      INSTALL_SCRIPT="${install_script:-}"
+      TRAIN_SCRIPT="${train_script:-}"
+      REPO_MAP="${hf_repo:-}"
+      export RUN_DIR INSTALL_SCRIPT TRAIN_SCRIPT REPO_MAP
+      if ! cmd_install; then
+        rc=1
+      else
+        # cmd_run exits on a skipped fetch; the subshell keeps the loop alive.
+        ( GITHUB_OUTPUT="$per" cmd_run ) || rc=1
+        grep -q '^skip_reason=' "$per" && skipped=$((skipped + 1))
+      fi
+    fi
+
+    cmd_report || true
+    echo "::endgroup::"
+  done < <(python3 -c '
+import json, sys
+for p in json.loads(sys.argv[1] or "[]"):
+    print("%s\t%s" % (p["model_type"], p.get("layers", 0)))
+' "${E2E_PROFILES:-[]}")
+
+  if [ "$total" -eq 0 ]; then
+    echo "::notice::no profile selected, nothing to train"
+    echo "skip_reason=no profile selected" >> "$GITHUB_OUTPUT"
+  elif [ "$skipped" -eq "$total" ]; then
+    echo "skip_reason=all $total profile(s) skipped" >> "$GITHUB_OUTPUT"
+  fi
+  return "$rc"
+}
+
 # ---------------------------------------------------------------- 调度
 case "${1:-}" in
   prepare) cmd_prepare ;;
@@ -358,8 +443,9 @@ case "${1:-}" in
   install) cmd_install ;;
   run)     cmd_run ;;
   report)  cmd_report ;;
+  lane)    cmd_lane ;;
   *)
-    echo "用法：$0 {prepare|probe|install|run|report}" >&2
+    echo "用法：$0 {prepare|probe|install|run|report|lane}" >&2
     exit 2
     ;;
 esac

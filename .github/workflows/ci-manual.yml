@@ -1,0 +1,218 @@
+name: Manual lane test
+
+# Hand-run ONE lane at a time: no selection, no gate, no sibling lanes, so a red
+# run points at the lane instead of the diff. ci-pr.yml stays the only PR entry.
+#
+# Two ways in, both landing on the same three jobs:
+#   label     add ci:manual:<lane> to a PR. pull_request workflows are read from
+#             the PR head, so this works even before the file reaches main.
+#   dispatch  pick `lane` in the UI (needs this file on the default branch).
+#
+# Re-run after a fix: remove the label, then add it again.
+#
+# Suggested order: cpu-unit -> npu-unit -> npu-model.
+
+on:
+  pull_request:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      lane:
+        description: 'lane to run'
+        required: true
+        default: 'cpu-unit'
+        type: choice
+        options:
+          - cpu-unit
+          - npu-unit
+          - npu-model
+      test_path:
+        description: "unit lanes: dir / file / node id; '-' = whole suite"
+        required: false
+        default: '-'
+        type: string
+      profiles:
+        description: 'npu-model: JSON list of {model_type, layers}'
+        required: false
+        default: '[{"model_type":"qwen3_5","layers":0}]'
+        type: string
+      image:
+        description: 'npu lanes: container image'
+        required: false
+        default: 'swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:base-latest'
+        type: string
+
+# Same PR labelled twice (or re-labelled mid-run) must not stack runs.
+concurrency:
+  group: manual-${{ github.event.pull_request.number || github.run_id }}-${{ github.event.label.name || inputs.lane }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  E2E_PROFILE: '[{"model_type":"qwen3_5","layers":0}]'
+
+jobs:
+  cpu_unit:
+    name: cpu-unit-tests
+    if: >-
+      (github.event_name == 'pull_request' && github.event.label.name == 'ci:manual:cpu-unit')
+      || (github.event_name == 'workflow_dispatch' && inputs.lane == 'cpu-unit')
+    runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
+    timeout-minutes: 40
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: install
+        env:
+          MODE: cpu
+          RESULT_JSON: /tmp/ci-result.json
+        run: |
+          set -uo pipefail
+          python3 scripts/ci/report_result.py init --file "$RESULT_JSON" \
+            kind=pytest model_type=pytest-cpu-unit mode=cpu \
+            runner_label="${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}"
+          bash scripts/ci/install_deps.sh install
+
+      - name: pytest
+        env:
+          MODE: cpu
+          TEST_PATH: ${{ inputs.test_path || '-' }}
+          RESULT_JSON: /tmp/ci-result.json
+        run: bash scripts/ci/run_tests.sh
+
+      - name: summary
+        if: always()
+        env:
+          RESULT_JSON: /tmp/ci-result.json
+        run: |
+          set -uo pipefail
+          python3 scripts/ci/report_result.py report --file "$RESULT_JSON" \
+            --train-log /tmp/pytest.log --junit /tmp/pytest.xml >> "$GITHUB_STEP_SUMMARY" || true
+          python3 scripts/ci/report_result.py notice --file "$RESULT_JSON" \
+            --model-type pytest-cpu-unit || true
+
+  npu_unit:
+    name: npu-unit-tests
+    # Fork PRs get no secrets, and a container pull without them fails opaquely.
+    if: |
+      ((github.event_name == 'pull_request' && github.event.label.name == 'ci:manual:npu-unit')
+       || (github.event_name == 'workflow_dispatch' && inputs.lane == 'npu-unit'))
+      && (github.event_name != 'pull_request'
+          || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ${{ vars.CI_NPU_RUNNER || 'linux-aarch64-a3-800i-2' }}
+    timeout-minutes: 40
+
+    container:
+      image: ${{ inputs.image || vars.CI_NPU_IMAGE || 'swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:base-latest' }}
+      credentials:
+        username: ${{ secrets.SWR_USERNAME }}
+        password: ${{ secrets.SWR_PASSWORD }}
+      options: --user root
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: preflight
+        env:
+          RESULT_JSON: /tmp/ci-result.json
+        run: |
+          set -uo pipefail
+          python3 scripts/ci/report_result.py init --file "$RESULT_JSON" \
+            kind=pytest model_type=pytest-npu-unit mode=npu \
+            runner_label="${{ vars.CI_NPU_RUNNER || 'linux-aarch64-a3-800i-2' }}" \
+            image="${{ inputs.image || vars.CI_NPU_IMAGE || 'swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:base-latest' }}"
+          uname -m; nproc; free -h | head -2; python -V
+
+      # 20 s to find "no NPU" beats discovering it after installing deps.
+      - name: npu self-check
+        run: bash scripts/ci/run_train.sh probe
+
+      - name: install
+        env:
+          MODE: npu
+          RESULT_JSON: /tmp/ci-result.json
+        run: bash scripts/ci/install_deps.sh install
+
+      - name: pytest
+        env:
+          MODE: npu
+          TEST_PATH: ${{ inputs.test_path || '-' }}
+          RESULT_JSON: /tmp/ci-result.json
+        run: bash scripts/ci/run_tests.sh
+
+      - name: summary
+        if: always()
+        env:
+          RESULT_JSON: /tmp/ci-result.json
+        run: |
+          set -uo pipefail
+          python3 scripts/ci/report_result.py report --file "$RESULT_JSON" \
+            --train-log /tmp/pytest.log --junit /tmp/pytest.xml >> "$GITHUB_STEP_SUMMARY" || true
+          python3 scripts/ci/report_result.py notice --file "$RESULT_JSON" \
+            --model-type pytest-npu-unit || true
+
+  npu_model:
+    name: npu-model-tests
+    if: |
+      ((github.event_name == 'pull_request' && github.event.label.name == 'ci:manual:npu-model')
+       || (github.event_name == 'workflow_dispatch' && inputs.lane == 'npu-model'))
+      && (github.event_name != 'pull_request'
+          || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ${{ vars.CI_E2E_RUNNER || 'linux-aarch64-a3-800i-8' }}
+    timeout-minutes: 45
+
+    container:
+      image: ${{ inputs.image || vars.CI_NPU_IMAGE || 'swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:base-latest' }}
+      credentials:
+        username: ${{ secrets.SWR_USERNAME }}
+        password: ${{ secrets.SWR_PASSWORD }}
+      options: --user root
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: npu and stack self-check
+        run: bash scripts/ci/run_train.sh probe
+
+      - name: train
+        id: lane
+        timeout-minutes: 25
+        env:
+          E2E_PROFILES: ${{ inputs.profiles || env.E2E_PROFILE }}
+          FRAMEWORK: lf
+          RUNNER_LABEL: ${{ vars.CI_E2E_RUNNER || 'linux-aarch64-a3-800i-8' }}
+          IMAGE: ${{ inputs.image || vars.CI_NPU_IMAGE || 'swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:base-latest' }}
+          SEQ_LEN: '4096'
+          DATASET_IN: 'gsm8k'
+          FINETUNING_TYPE: 'full'
+          FETCH_TIMEOUT: '600'
+          DIAG: 'true'
+          RESULT_JSON: /tmp/ci-result.json
+        run: bash scripts/ci/run_train.sh lane
+
+      # timeout-minutes only kills the process; children would keep the cards.
+      - name: cleanup
+        if: always()
+        continue-on-error: true
+        run: python3 scripts/ci/env_pod.py cleanup

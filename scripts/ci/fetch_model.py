@@ -3,7 +3,7 @@
 """模型获取：这个目录能不能用、从哪儿找、拿一份来。
 
 原先是三个文件（`model_cache.sh` + `hf_fetch.py` + `flash_trim.py`），但它们
-回答的是同一个问题 —— **「给我一个可用的模型目录」**。拆开之后 train.sh 为了
+回答的是同一个问题 —— **「给我一个可用的模型目录」**。拆开之后 run_train.sh 为了
 一件事要认三个文件名、三种参数风格（bash 长选项 / python 长选项），而 probe
 与 fetch 之间「什么算完整」的判据还得两边各写一遍。
 
@@ -12,6 +12,8 @@
     mark    记下这个目录是按什么配方建的
     fetch   下载整个仓库（带重试）
     trim    只下前 N 层需要的分片，再裁剪 index 与 config
+
+卡数 -> sp/ep 是另一个问题，在 `plan_parallel.py` 里。
 
 约定：人看的日志走 stderr，机器读的 `KEY=value` 走 `--output`（可 source）。
 
@@ -38,6 +40,7 @@ import shutil
 import subprocess
 import sys
 import time
+
 from pathlib import Path
 
 MIN_BYTES = 3_000_000_000
@@ -325,7 +328,9 @@ def main(argv: list[str]) -> int:
         return cmd_mark(args.dir, args.text)
     if args.cmd == "fetch":
         return cmd_fetch(args.repo, args.dir, args.patterns, args.attempts, args.backoff)
-    return cmd_trim(args.repo, args.dir, args.layers, args.attempts)
+    if args.cmd == "trim":
+        return cmd_trim(args.repo, args.dir, args.layers, args.attempts)
+    return 1
 
 
 if __name__ == "__main__":

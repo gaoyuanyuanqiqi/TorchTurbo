@@ -31,13 +31,6 @@
       "hf_repo": "Qwen/Qwen3.5-35B-A3B",
       "e2e": "trim:6"
     },
-    "qwen3_5_moe_text": {
-      "run_dir": "qwen3_5_moe",
-      "lf": "lf_text_sft.sh",
-      "swift": "swift_mllm_sft.sh",
-      "hf_repo": "Qwen/Qwen3.5-35B-A3B",
-      "e2e": "-"
-    },
     "bailing_hybrid": {
       "run_dir": "bailing_v3",
       "lf": "lf_sft.sh,lf_pt.sh,lf_dpo.sh",
