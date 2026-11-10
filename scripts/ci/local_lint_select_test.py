@@ -112,7 +112,8 @@ def cases(got: dict) -> list[dict]:
 
 def families_with_case() -> int:
     rows = json.loads(MODEL_MAP.read_text(encoding="utf-8")).get("models", {})
-    return sum(1 for row in rows.values() if row.get("e2e", "-") != "-")
+    return sum(1 for row in rows.values()
+               if str((row.get("download") or {}).get("e2e", "-")) != "-")
 
 
 # ---------------------------------------------------------------- stages

@@ -76,11 +76,8 @@ def _arch() -> str:
     raise RuntimeError(f"unsupported architecture: {machine}")
 
 
-# Version probes for the tools that bootstrap themselves. A runner image may
-# already ship an older build on PATH, and shellcheck/hadolint/actionlint all
-# change which rules fire between releases, so a mismatch must not be used.
-PROBE = {"actionlint": "-version", "hadolint": "--version",
-         "shellcheck": "--version"}
+
+PROBE = {"actionlint": "-version", "hadolint": "--version", "shellcheck": "--version"}
 
 
 def _tool_path(name: str, version: str | None = None) -> Path | None:

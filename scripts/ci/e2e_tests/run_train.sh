@@ -5,9 +5,9 @@
 #   environment cleanup    - workflow: env_pod.py cleanup
 #
 # Training stages:
-#   1. resolve    - map model_type to launcher, dependency script, and repo
+#   1. plan       - model_map.json -> scripts, card count, sp/ep
 #   2. install    - install torchturbo and model dependencies
-#   3. prepare    - download/cache model weights and derive sp/ep
+#   3. prepare    - rewrite the engine config, then obtain the weights
 #   4. train      - launch training under a watchdog
 #   5. report     - render facts, job summary, and annotation
 #
@@ -24,8 +24,7 @@ MAP="${MAP:-.github/workflows/model_map.json}"
 
 : "${MODEL_TYPE:=}"; : "${FRAMEWORK:=lf}"; : "${RUNNER_LABEL:=}"
 : "${IMAGE:=}"; : "${LAYERS:=0}"; : "${MODEL_HINT:=}"; : "${REPO_IN:=}"
-: "${SP_IN:=auto}"; : "${EP_IN:=auto}"; : "${SEQ_LEN:=1024}"
-: "${FINETUNING_TYPE:=full}"; : "${DATASET_IN:=gsm8k}"; : "${DATASET:=${DATASET_IN}}"
+: "${SEQ_LEN:=1024}"; : "${FINETUNING_TYPE:=full}"; : "${DATASET_IN:=gsm8k}"; : "${DATASET:=${DATASET_IN}}"
 : "${FETCH_TIMEOUT:=600}"; : "${STRICT:=false}"; : "${E2E_CASES:=[]}"
 : "${INSTALL_SCRIPT:=}"; : "${TRAIN_SCRIPT:=}"; : "${HF_REPO:=}"
 
@@ -38,23 +37,27 @@ parse_kv() {  # parse_kv <KEY=value lines>
   done <<< "$1"
 }
 
-# ---------------------------------------------------------------- Stage 1: resolve
-# Map model_type to its run directory, launcher, install script, and model repo.
-cmd_resolve() {
+# ---------------------------------------------------------------- Stage 1: plan
+# Map model_type to its scripts, repo, and the declared card/parallel plan.
+cmd_plan() {
   result init --file "$RESULT_JSON" \
     kind=train model_type="$MODEL_TYPE" framework="$FRAMEWORK" \
     runner_label="$RUNNER_LABEL" image="$IMAGE" layers="$LAYERS" dataset="$DATASET"
 
   local resolved
-  if ! resolved=$(python3 "$MODEL_HELPER" resolve \
+  if ! resolved=$(python3 "$MODEL_HELPER" plan \
       --map "$MAP" --model-type "$MODEL_TYPE" --framework "$FRAMEWORK"); then
     return 1
   fi
   parse_kv "$resolved"
   [ -n "${TRAIN_SCRIPT:-}" ] && [ -n "${INSTALL_SCRIPT:-}" ] \
     || { echo "::error::模型脚本解析结果为空"; return 1; }
+  # Declared per model in model_map.json. Kept in PLAN_* so the stage-3 parse
+  # cannot be confused with the values patch_run_scripts.py echoes back.
+  PLAN_CARDS=$CARDS; PLAN_SP=$SP; PLAN_EP=$EP
 
   echo "model_type=$MODEL_TYPE framework=$FRAMEWORK run_dir=$RUN_DIR train=$TRAIN_SCRIPT repo=$HF_REPO"
+  echo "plan: cards=$PLAN_CARDS sp=$PLAN_SP ep=$PLAN_EP"
   result set --file "$RESULT_JSON" \
     run_dir="$RUN_DIR" install_script="$INSTALL_SCRIPT" train_script="$TRAIN_SCRIPT"
   printf 'run_dir=%s\ninstall_script=%s\ntrain_script=%s\nhf_repo=%s\n' \
@@ -100,11 +103,16 @@ PROBE
 cmd_install() {
   # shellcheck disable=SC2016  # backticks are literal text for the log line
   pip_step 'torchturbo `-e .[dev]`' || return 1
+  # The script is written for a persistent disk; CI runs on a shared NFS where
+  # its trailing `rm -rf` races other pods. Strip it here, in place -- the
+  # checkout is disposable, and the script's own relative paths stay valid.
+  python3 "$CI_SCRIPTS/e2e_tests/patch_run_scripts.py" install --src "$INSTALL_SCRIPT" \
+    || return 1
   pip_step "模型依赖 \`${INSTALL_SCRIPT}\`" "$INSTALL_SCRIPT"
 }
 
-# ---------------------------------------------------------------- Stage 3: preprocess
-# Acquire and validate model weights, then derive the per-card engine config.
+# ---------------------------------------------------------------- Stage 3: prepare
+# Rewrite the declared plan into the engine config, then obtain the weights.
 PREP_NPUS_PER_NODE=""
 PREP_MODEL=""
 PREP_BYTES=0
@@ -115,10 +123,7 @@ PREP_EP=""
 PREP_TT_CONFIG=""
 PREP_SFS_UUID="?"
 
-cmd_preprocess() {
-  local NPUS_PER_NODE="${RUNNER_LABEL##*-}"
-  case "$NPUS_PER_NODE" in ''|*[!0-9]*) NPUS_PER_NODE=2 ;; esac
-  echo "cards=${NPUS_PER_NODE} (来自 ${RUNNER_LABEL})"
+cmd_prepare() {
   [ -f "$TRAIN_SCRIPT" ] || { echo "::error::缺少 $TRAIN_SCRIPT"; return 1; }
   local uuid hf_repo="${REPO_IN:-$HF_REPO}"
   uuid=$(findmnt -nT /root/.cache -o SOURCE 2>/dev/null | sed -n '1p' | cut -d. -f1)
@@ -139,9 +144,28 @@ cmd_preprocess() {
     return 3
   }
 
-  local MODEL="" BYTES=0 SHARDS=0 HIT=no SP="" EP="" TT_CONFIG="" prepared start trc
-  local -a args=(preprocess --repo "$hf_repo" --layers "${LAYERS:-0}" --cards "$NPUS_PER_NODE"
-    --sp "$SP_IN" --ep "$EP_IN" --train-script "$TRAIN_SCRIPT" --out "/tmp/tt_${MODEL_TYPE}.yaml")
+  local MODEL="" BYTES=0 SHARDS=0 HIT=no CARDS="" SP="" EP="" TT_CONFIG=""
+  local configured prepared start trc
+  # The plan is declared in model_map.json and does not depend on the runner
+  # label: real labels carry a location suffix (`...-8-cn12-001`) whose last
+  # segment parses as 1, so an 8-card pod would start one process and stay
+  # green. The same call rewrites the engine config in place, which is why the
+  # launcher keeps its own TT_CONFIG default.
+  case "$PLAN_CARDS" in
+    ''|-|*[!0-9]*)
+      echo "::error::model_map.json 里 ${MODEL_TYPE} 没有 params.cards/sp/ep，无法确定卡数与并行策略"
+      return 1 ;;
+  esac
+  if ! configured=$(python3 "$CI_SCRIPTS/e2e_tests/patch_run_scripts.py" config \
+      --src "$TRAIN_SCRIPT" --cards "$PLAN_CARDS" --layers "${LAYERS:-0}" \
+      --sp "$PLAN_SP" --ep "$PLAN_EP"); then
+    echo "::error::引擎配置改写失败（cards=$PLAN_CARDS sp=$PLAN_SP ep=$PLAN_EP）"
+    return 1
+  fi
+  parse_kv "$configured"
+  NPUS_PER_NODE=$CARDS
+  echo "cards=${NPUS_PER_NODE} (model_map.json)"
+  local -a args=(fetch --repo "$hf_repo" --layers "${LAYERS:-0}")
   [ -n "$MODEL_HINT" ] && args+=(--hint "$MODEL_HINT")
   start=$(date +%s)
   prepared=$(timeout "$FETCH_TIMEOUT" python3 "$MODEL_HELPER" "${args[@]}")
@@ -250,6 +274,10 @@ cmd_train() {
   [ -n "$PREP_MODEL" ] || { echo "::error::缺少预处理结果，无法训练"; return 1; }
   export MODEL="$PREP_MODEL" NPUS_PER_NODE="$PREP_NPUS_PER_NODE" DATASET="$DATASET_IN" \
     SEQ_LEN FINETUNING_TYPE TT_CONFIG="$PREP_TT_CONFIG"
+  # A smoke run must not fill the pod's overlay with checkpoints or tb events.
+  # Runs after preprocess, which reads the unpatched launcher for TT_CONFIG.
+  python3 "$CI_SCRIPTS/e2e_tests/patch_run_scripts.py" train --src "$TRAIN_SCRIPT" \
+    || return 1
   run_supervised "$TRAIN_SCRIPT" /tmp/train.log
   local rc=$? elapsed="$TRAIN_ELAPSED" last_loss="$TRAIN_LAST_LOSS"
   echo "::notice::训练 rc=${rc} 用时 ${elapsed}s；hit=${PREP_HIT}；${last_loss:-无 loss 记录}"
@@ -277,7 +305,7 @@ cmd_report() {
 
 # Run stages 3-4 for one E2E case; orchestration lives outside the stage bodies.
 cmd_run() {
-  cmd_preprocess || return $?
+  cmd_prepare || return $?
   cmd_train
 }
 
@@ -292,7 +320,7 @@ cmd_lane() {
     total=$((total + 1))
     echo "::group::training case $total: $mt (layers=${layers:-0})"
     export MODEL_TYPE="$mt" LAYERS="${layers:-0}"
-    if ! GITHUB_OUTPUT=/dev/null cmd_resolve; then
+    if ! GITHUB_OUTPUT=/dev/null cmd_plan; then
       rc=1
     elif ! cmd_install; then
       rc=1
@@ -321,11 +349,11 @@ cmd_lane() {
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   case "${1:-}" in
-    resolve) cmd_resolve ;;
+    plan) cmd_plan ;;
     install) cmd_install ;;
     run) cmd_run; rc=$?; [ "$rc" -eq 3 ] && exit 0; exit "$rc" ;;
     report) cmd_report ;;
     lane) cmd_lane ;;
-    *) echo "用法：$0 {resolve|install|run|report|lane}" >&2; exit 2 ;;
+    *) echo "用法：$0 {plan|install|run|report|lane}" >&2; exit 2 ;;
   esac
 fi

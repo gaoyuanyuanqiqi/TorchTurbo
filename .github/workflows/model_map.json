@@ -1,98 +1,92 @@
 {
-  "$schema": "CI 测试映射表：model_type -> 启动脚本 / 权重 / 端到端训练用例",
-  "_comment": [
-    "每一条的键必须与 src/torchturbo/models/<dir>/model.py 里 @register_model(...) 的",
-    "名字一字不差；漏一个就是 endpoint 跑不起来而不是被选测。",
-    "",
-    "字段：",
-    "  run_dir   scripts/runs 下的目录（放这套模型的启动脚本）；\"-\" = 还没有 CI 启动器",
-    "  lf        llama-factory 脚本，逗号分隔，第一个是默认；\"-\" = 不支持",
-    "  swift     ms-swift 脚本，同上",
-    "  hf_repo   CI 下载的 HuggingFace 仓库；\"-\" = 未知（不给 train_model_path 就拒绝跑）",
-    "  e2e       PR 端到端训练用例：",
-    "              full    全量权重（train_layers=0）",
-    "              trim:N  只留前 N 层（flash_trim -> model.py trim），train_layers=N",
-    "              -       不参与 PR 端到端",
-    "            「族内小模型优先」：已经有 tiny/2B 版的不再减层；只有 35B 这种",
-    "            跑不动的才减层，否则一次 PR 要几十分钟。"
-  ],
   "models": {
     "qwen3_5": {
       "run_dir": "qwen3_5_dense",
-      "lf": "lf_text_sft.sh",
-      "swift": "-",
-      "hf_repo": "Qwen/Qwen3.5-2B",
-      "e2e": "full"
+      "download": {
+        "hf_repo": "Qwen/Qwen3.5-2B",
+        "e2e": "full"
+      },
+      "install": {
+        "lf": "install_lf_deps.sh"
+      },
+      "train": {
+        "lf": "lf_text_sft.sh"
+      },
+      "params": {
+        "cards": 8,
+        "sp": 2,
+        "ep": 1
+      }
     },
     "qwen3_5_moe": {
       "run_dir": "qwen3_5_moe",
-      "lf": "lf_text_sft.sh",
-      "swift": "swift_mllm_sft.sh,swift_text_dpo.sh",
-      "hf_repo": "Qwen/Qwen3.5-35B-A3B",
-      "e2e": "trim:6"
+      "download": {
+        "hf_repo": "Qwen/Qwen3.5-35B-A3B",
+        "e2e": "trim:6"
+      },
+      "install": {
+        "lf": "install_lf_deps.sh",
+        "swift": "install_swift_deps.sh"
+      },
+      "train": {
+        "lf": "lf_text_sft.sh",
+        "swift": "swift_mllm_sft.sh,swift_text_dpo.sh"
+      },
+      "params": {
+        "cards": 8,
+        "sp": 2,
+        "ep": 4
+      }
     },
     "qwen3_5_moe_text": {
-      "run_dir": "-",
-      "lf": "-",
-      "swift": "-",
-      "hf_repo": "-",
-      "e2e": "-"
+      "run_dir": "-"
     },
     "bailing_hybrid": {
       "run_dir": "bailing_v3",
-      "lf": "lf_sft.sh,lf_pt.sh,lf_dpo.sh",
-      "swift": "swift_sft.sh,swift_pt.sh,swift_dpo.sh",
-      "hf_repo": "inclusionAI/Ling-3.0-tiny",
-      "e2e": "full"
+      "download": {
+        "hf_repo": "inclusionAI/Ling-3.0-tiny",
+        "e2e": "full"
+      },
+      "install": {
+        "lf": "install_lf_deps.sh",
+        "swift": "install_swift_deps.sh"
+      },
+      "train": {
+        "lf": "lf_sft.sh,lf_pt.sh,lf_dpo.sh",
+        "swift": "swift_sft.sh,swift_pt.sh,swift_dpo.sh"
+      },
+      "params": {
+        "cards": 8,
+        "sp": 2,
+        "ep": 4
+      }
     },
     "bailing_moe_v3_vl": {
-      "run_dir": "-",
-      "lf": "-",
-      "swift": "-",
-      "hf_repo": "-",
-      "e2e": "-"
+      "run_dir": "-"
     },
     "deepseek_v4": {
-      "run_dir": "deepseek_v4",
-      "lf": "-",
-      "swift": "-",
-      "hf_repo": "-",
-      "e2e": "-"
+      "run_dir": "deepseek_v4"
     },
     "kimi_k25": {
-      "run_dir": "kimi_k25",
-      "lf": "-",
-      "swift": "-",
-      "hf_repo": "-",
-      "e2e": "-"
+      "run_dir": "kimi_k25"
     },
     "llada2_moe": {
-      "run_dir": "llada2",
-      "lf": "-",
-      "swift": "-",
-      "hf_repo": "-",
-      "e2e": "-"
+      "run_dir": "llada2"
     },
     "qwen4_exp": {
       "run_dir": "qwen4_exp",
-      "lf": "-",
-      "swift": "swift_text_sft.sh",
-      "hf_repo": "-",
-      "e2e": "-"
+      "install": {
+        "swift": "install_swift_deps.sh"
+      },
+      "train": {
+        "swift": "swift_text_sft.sh"
+      }
     },
     "qwen3_moe": {
-      "run_dir": "-",
-      "lf": "-",
-      "swift": "-",
-      "hf_repo": "-",
-      "e2e": "-"
+      "run_dir": "-"
     },
     "glm_moe_dsa": {
-      "run_dir": "-",
-      "lf": "-",
-      "swift": "-",
-      "hf_repo": "-",
-      "e2e": "-"
+      "run_dir": "-"
     }
   }
 }

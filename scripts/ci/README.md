@@ -32,7 +32,7 @@ marker。
 | `lint_select/select_tests.py` | 这次改动该跑什么？ | `--explain` / `--coverage` / `--verify` / `--changed-from git` / `--mode pr\|full --labels …` |
 | `lint_select/lint_check.py` | 静态体检总入口；通用检查先跑，Turbo 契约后跑 | 无参数 = 全跑 / `--only NAME` |
 | `unit_tests/run_tests.sh` | 单测泳道怎么装、怎么跑？ | `install` / `test`（`MODE=cpu` 用 `-m cpu`，`MODE=npu` 用 `-m npu`） |
-| `e2e_tests/prepare_model.py` | 模型和派生配置是否完成预处理？ | `probe` / `resolve` / `preprocess` / `cases` |
+| `e2e_tests/prepare_model.py` | 模型和派生配置是否完成预处理？ | `plan` / `fetch` / `probe` / `cases` |
 | `e2e_tests/run_train.sh` | 一次训练冒烟分几步？ | `resolve` / `install` / `run` / `report` / `lane` |
 | `common/env_pod.py` | 这台 pod 现在是什么状态？ | `probe` / `check` / `cleanup` |
 | `image/build_image.py` | 基础镜像该不该建 / 怎么建 / 发什么引用 / SWR 上传链路是否可用 | `env` / `tag` / `build` / `verify` / `selftest` / `publish` / `resolve` / `hadolint` / `summary` / `cleanup` |
@@ -116,8 +116,8 @@ yaml 里只留「输什么、调哪个脚本」，超过 10 行的 bash 一律�
 
 | 合并 | 原来的问题 |
 |---|---|
-| `model_cache.sh` + `hf_fetch.py` + `flash_trim.py` → `prepare_model.py preprocess` | 三个都在回答「模型能不能用」，拆开后 probe 与 fetch 对「什么算完整」各写一遍 |
-| `fetch_model.py` + `plan_parallel.py` → `prepare_model.py preprocess` | 一次调用返回模型、分片数和派生 sp/ep，Shell 不再重复解析 YAML 和临时文件 |
+| `model_cache.sh` + `hf_fetch.py` + `flash_trim.py` → `prepare_model.py fetch` | 三个都在回答「模型能不能用」，拆开后 probe 与 fetch 对「什么算完整」各写一遍 |
+| `plan_parallel.py` → `prepare_model.py plan` | 卡数与 sp/ep 由 `model_map.json` 声明，不再从 runner 标签或 yaml 推断 |
 | `supervise_train.sh` → `run_train.sh` 的 `run_supervised()` | 监督逻辑只服务一次训练启动，独立文件增加参数与临时 `KEY=value` 往返 |
 | `verify_env.py` + `torch_guard.sh` + `npu_cleanup.sh` → `env_pod.py` | 三个都在回答「pod 现在什么状态」（体检 / 防破坏 / 复原） |
 | `run_pytest.sh` + `junit_merge.py` → `run_tests.sh` | 后者只被前者调用，而且只用了它的单分片路径 |
@@ -167,11 +167,16 @@ python3 scripts/ci/common/env_pod.py check   --file /tmp/t.json
 python3 scripts/ci/lint_select/select_tests.py --force-all --output /tmp/s.json
 
 # 解析模型对应的启动脚本 / 依赖脚本
-python3 scripts/ci/e2e_tests/prepare_model.py resolve --map .github/workflows/model_map.json \
+python3 scripts/ci/e2e_tests/prepare_model.py plan --map .github/workflows/model_map.json \
   --model-type qwen3_5 --framework lf
 
-# 模型目录完不完整（不需要网络）
-python3 scripts/ci/e2e_tests/prepare_model.py probe --dir /root/.cache/models/<repo>
+# 模型目录完不完整（不需要网络；--layers N 同时校验减层结果）
+python3 scripts/ci/e2e_tests/prepare_model.py probe --dir /root/.cache/models/<repo> \
+  [--layers N]
+
+# 全量小模型 / 减层大模型（0 = 全量；N = 只保留前 N 层）
+python3 scripts/ci/e2e_tests/prepare_model.py fetch --repo Qwen/Qwen3.5-2B --layers 0
+python3 scripts/ci/e2e_tests/prepare_model.py fetch --repo Qwen/Qwen3.5-35B-A3B --layers 6
 
 # junit 计数
 python3 scripts/ci/report/report_result.py junit --file /tmp/r.json --junit /tmp/pytest.xml

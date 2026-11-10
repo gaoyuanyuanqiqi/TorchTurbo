@@ -23,8 +23,6 @@ dev = [
 ]
 test = [
     "pytest>=7.0",
-    # 测试里直接 import 的。把它们写在这里而不是散在 workflow 的 pip 列表里，
-    # 是因为 CI 两条泳道（镜像 / 裸机）必须装同一套，漏一个就是 collection error。
     "einops",
     "transformers",
     "huggingface_hub",

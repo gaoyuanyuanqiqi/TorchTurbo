@@ -12,7 +12,8 @@ from pathlib import Path
 
 from lint_common_check import CI, ROOT, WORKFLOWS, Check, Problem, relative, run, text
 
-MODEL_MAP_FIELDS = ("run_dir", "lf", "swift", "hf_repo", "e2e")
+MODEL_MAP_SECTIONS = ("download", "install", "train", "params")
+MODEL_FRAMEWORKS = ("lf", "swift")
 BUILTIN_MARKERS = frozenset({
     "filterwarnings",
     "parametrize",
@@ -231,9 +232,37 @@ def check_model_map() -> list[Problem]:
         if not isinstance(row, dict):
             problems.append(Problem(relative(path), f"{name}: row is not a mapping"))
             continue
-        for field in MODEL_MAP_FIELDS:
-            if field not in row:
-                problems.append(Problem(relative(path), f"{name}: missing field {field!r}"))
+        if not isinstance(row.get("run_dir"), str):
+            problems.append(Problem(relative(path), f"{name}: missing 'run_dir'"))
+        for section in MODEL_MAP_SECTIONS:
+            if section in row and not isinstance(row[section], dict):
+                problems.append(Problem(relative(path),
+                                        f"{name}: {section!r} must be a mapping"))
+        # Script names are declared per framework, so a typo has to be caught
+        # here rather than on an 8-card pod.
+        for section in ("install", "train"):
+            for framework in MODEL_FRAMEWORKS:
+                if framework not in (row.get(section) or {}):
+                    continue
+                run_dir = Path("scripts") / "runs" / str(row.get("run_dir", "-"))
+                for script in str(row[section][framework]).split(","):
+                    if script != "-" and not (ROOT / run_dir / script).is_file():
+                        problems.append(Problem(
+                            relative(path),
+                            f"{name}: {section}.{framework} names a missing script: "
+                            f"{run_dir / script}"))
+        # cards/sp/ep are the torchrun size, declared rather than inferred from
+        # the runner label, so a runnable model without a valid plan cannot run.
+        if str((row.get("download") or {}).get("e2e", "-")) != "-":
+            params = row.get("params") or {}
+            cards, sp, ep = (params.get(k) for k in ("cards", "sp", "ep"))
+            if not all(isinstance(v, int) and v >= 1 for v in (cards, sp, ep)):
+                problems.append(Problem(
+                    relative(path), f"{name}: e2e model needs integer params.cards/sp/ep, "
+                    f"got cards={cards!r} sp={sp!r} ep={ep!r}"))
+            elif cards % sp or (cards // sp) % ep:
+                problems.append(Problem(
+                    relative(path), f"{name}: cards={cards} cannot host sp={sp} ep={ep}"))
     return problems
 
 

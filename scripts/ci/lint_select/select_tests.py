@@ -315,10 +315,13 @@ class Index:
 # --------------------------------------------------------------------------
 @lru_cache(maxsize=None)
 def load_model_map(root: Path) -> dict[str, dict[str, str]]:
-    """model_map.json -> {model_type: {run_dir, lf, swift, hf_repo, e2e}}.
+    """model_map.json -> {model_type: {run_dir, e2e}}.
 
-    Missing fields default to "-"; an unreadable file yields {} rather than
-    silently changing the selection.
+    The map groups a model into download / install / train / params sections;
+    selection only needs where the launcher lives and whether the model takes
+    part in E2E, so the other sections are not flattened here. Missing values
+    become "-"; an unreadable file yields {} rather than silently changing the
+    selection.
     """
     path = root / ".github" / "workflows" / "model_map.json"
     if not path.exists():
@@ -332,11 +335,17 @@ def load_model_map(root: Path) -> dict[str, dict[str, str]]:
     raw = doc.get("models") if isinstance(doc, dict) else None
     if not isinstance(raw, dict):
         return {}
-    fields = ("run_dir", "lf", "swift", "hf_repo", "e2e")
-    return {
-        name: {k: str(row.get(k, "-") or "-") for k in fields}
-        for name, row in raw.items() if isinstance(row, dict)
-    }
+    out: dict[str, dict[str, str]] = {}
+    for name, row in raw.items():
+        if not isinstance(row, dict):
+            continue
+        download = row.get("download")
+        download = download if isinstance(download, dict) else {}
+        out[name] = {
+            "run_dir": str(row.get("run_dir") or "-"),
+            "e2e": str(download.get("e2e") or "-"),
+        }
+    return out
 
 
 def pick_e2e(changed: list[str], models: dict[str, dict[str, str]]) -> list[dict]:
