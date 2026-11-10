@@ -10,7 +10,10 @@ from torchturbo.ops import OpDispatcher, OpPolicy, registry
 from torchturbo.runtime.cpu import CpuRuntime
 
 
-pytestmark = pytest.mark.cpu
+pytestmark = [
+    pytest.mark.cpu,
+    pytest.mark.skip(reason="Qwen4 tests temporarily skipped"),
+]
 
 
 

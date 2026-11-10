@@ -9,7 +9,10 @@ from math import ceil
 
 import torch
 
-from torchturbo.scripts.dequant.dequantize import DequantizationFormat, Dequantizer, TensorSource
+if __package__:
+    from .dequantize import DequantizationFormat, Dequantizer, TensorSource
+else:
+    from dequantize import DequantizationFormat, Dequantizer, TensorSource
 
 
 class DeepSeekV41Format(DequantizationFormat):
@@ -195,7 +198,10 @@ class DeepSeekV41Format(DequantizationFormat):
 
 
 def main(argv: list[str] | None = None) -> None:
-    from torchturbo.scripts.dequant.converter import Converter
+    if __package__:
+        from .converter import Converter
+    else:
+        from converter import Converter
 
     parser = argparse.ArgumentParser(
         description="Convert a DeepSeek V4.1 FP8/FP4 checkpoint to BF16."

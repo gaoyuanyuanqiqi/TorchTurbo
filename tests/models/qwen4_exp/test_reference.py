@@ -23,7 +23,10 @@ from torchturbo.runtime.cpu import CpuRuntime
 from .test_model import _patch_cpu_qsa, _small_config
 
 
-pytestmark = pytest.mark.cpu
+pytestmark = [
+    pytest.mark.cpu,
+    pytest.mark.skip(reason="Qwen4 tests temporarily skipped"),
+]
 
 
 

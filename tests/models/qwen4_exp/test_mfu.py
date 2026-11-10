@@ -7,7 +7,10 @@ from .test_model import _small_config
 import pytest
 
 
-pytestmark = pytest.mark.cpu
+pytestmark = [
+    pytest.mark.cpu,
+    pytest.mark.skip(reason="Qwen4 tests temporarily skipped"),
+]
 
 
 

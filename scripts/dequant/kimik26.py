@@ -10,7 +10,10 @@ from pathlib import Path
 
 import torch
 
-from torchturbo.scripts.dequant.dequantize import DequantizationFormat, Dequantizer, TensorSource
+if __package__:
+    from .dequantize import DequantizationFormat, Dequantizer, TensorSource
+else:
+    from dequantize import DequantizationFormat, Dequantizer, TensorSource
 
 
 class KimiK26Format(DequantizationFormat):
@@ -216,7 +219,10 @@ class KimiK26Format(DequantizationFormat):
 
 
 def main(argv: list[str] | None = None) -> None:
-    from torchturbo.scripts.dequant.converter import Converter
+    if __package__:
+        from .converter import Converter
+    else:
+        from converter import Converter
 
     parser = argparse.ArgumentParser(
         description="Convert a Kimi-K2.6 packed INT4 checkpoint to BF16."

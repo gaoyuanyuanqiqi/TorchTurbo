@@ -13,7 +13,10 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-from torchturbo.scripts.dequant.dequantize import DequantizationFormat, Dequantizer, TensorSource
+if __package__:
+    from .dequantize import DequantizationFormat, Dequantizer, TensorSource
+else:
+    from dequantize import DequantizationFormat, Dequantizer, TensorSource
 
 
 @dataclass(frozen=True)

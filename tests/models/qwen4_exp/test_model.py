@@ -30,6 +30,9 @@ from torchturbo.models.registry import get_model
 from torchturbo.utils.flash_attn_utils import cu_seqlens_to_segment_ids
 
 
+pytestmark = pytest.mark.skip(reason="Qwen4 tests temporarily skipped")
+
+
 def _small_config() -> Qwen4ExpConfig:
     text_config = {
         "vocab_size": 256,

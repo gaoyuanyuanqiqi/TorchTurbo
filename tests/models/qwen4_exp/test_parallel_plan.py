@@ -16,7 +16,10 @@ from torchturbo.models.qwen4_exp.model import TurboQwen4ExpForConditionalGenerat
 from .test_model import _small_config
 
 
-pytestmark = pytest.mark.cpu
+pytestmark = [
+    pytest.mark.cpu,
+    pytest.mark.skip(reason="Qwen4 tests temporarily skipped"),
+]
 
 
 

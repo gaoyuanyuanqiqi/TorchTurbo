@@ -28,6 +28,8 @@ MAP="${MAP:-.github/workflows/model_map.json}"
 : "${FETCH_TIMEOUT:=600}"; : "${STRICT:=false}"; : "${E2E_CASES:=[]}"
 : "${INSTALL_SCRIPT:=}"; : "${TRAIN_SCRIPT:=}"; : "${HF_REPO:=}"
 
+export HF_MODULES_CACHE="${HF_MODULES_CACHE:-/tmp/hf-modules}"
+
 result() { python3 "$CI_SCRIPTS/report/report_result.py" "$@"; }
 
 parse_kv() {  # parse_kv <KEY=value lines>
@@ -103,9 +105,9 @@ PROBE
 cmd_install() {
   # shellcheck disable=SC2016  # backticks are literal text for the log line
   pip_step 'torchturbo `-e .[dev]`' || return 1
-  # The script is written for a persistent disk; CI runs on a shared NFS where
-  # its trailing `rm -rf` races other pods. Strip it here, in place -- the
-  # checkout is disposable, and the script's own relative paths stay valid.
+  # Model install scripts must not mutate shared caches. Strip destructive
+  # commands here, in place -- the checkout is disposable, and the script's
+  # own relative paths stay valid.
   python3 "$CI_SCRIPTS/e2e_tests/patch_run_scripts.py" install --src "$INSTALL_SCRIPT" \
     || return 1
   pip_step "模型依赖 \`${INSTALL_SCRIPT}\`" "$INSTALL_SCRIPT"
@@ -270,8 +272,32 @@ run_supervised() {  # run_supervised <launch script> <log>
   return "$rc"
 }
 
+prefer_cached_dataset() {
+  local root cache hub key hit
+  root=$(cd "$CI_SCRIPTS/../.." && pwd)
+  cache="${HF_DATASETS_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}/datasets}"
+  hub=$(python3 - "$root/dataset/dataset_info.json" "$DATASET" <<'PY'
+import json
+import sys
+
+try:
+    entry = json.load(open(sys.argv[1], encoding="utf-8")).get(sys.argv[2], {})
+except (OSError, ValueError):
+    entry = {}
+print(entry.get("hf_hub_url", ""))
+PY
+)
+  [ -n "$hub" ] || return 0
+  key=${hub//\//___}
+  hit=$(find "$cache/$key" -mindepth 3 -maxdepth 3 -type d -print -quit 2>/dev/null)
+  [ -n "$hit" ] || return 0
+  export HF_DATASETS_OFFLINE=1
+  echo "dataset cache: $hit (offline)"
+}
+
 cmd_train() {
   [ -n "$PREP_MODEL" ] || { echo "::error::缺少预处理结果，无法训练"; return 1; }
+  prefer_cached_dataset
   export MODEL="$PREP_MODEL" NPUS_PER_NODE="$PREP_NPUS_PER_NODE" DATASET="$DATASET_IN" \
     SEQ_LEN FINETUNING_TYPE TT_CONFIG="$PREP_TT_CONFIG"
   # A smoke run must not fill the pod's overlay with checkpoints or tb events.

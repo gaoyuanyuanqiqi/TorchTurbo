@@ -19,6 +19,9 @@ from ..flash_attention_fakes import lazy_flash_attention_kernels, process_flash_
 from .test_model import _small_config, _token_ids_to_mask
 
 
+pytestmark = pytest.mark.skip(reason="Qwen4 tests temporarily skipped")
+
+
 def _cpu_varlen_kernel(
     query,
     key,

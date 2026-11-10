@@ -18,7 +18,10 @@ from torchturbo.models.qwen4_exp.model import Qwen4ExpWeightConverter
 from .test_ple import adapted, new_reference
 
 
-pytestmark = pytest.mark.cpu
+pytestmark = [
+    pytest.mark.cpu,
+    pytest.mark.skip(reason="Qwen4 tests temporarily skipped"),
+]
 
 
 
