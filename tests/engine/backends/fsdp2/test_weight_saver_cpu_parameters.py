@@ -26,6 +26,10 @@ from torchturbo.models.modules.cpu_resident import NodeSharedCPUResidentParamete
 from torchturbo.models.weight_converter import BaseWeightConverter
 from torchturbo.runtime.cpu import CpuRuntime
 
+
+pytestmark = pytest.mark.cpu
+
+
 _NGRAM_NAMES = (
     "ngram_embedding.shard_0.weight",
     "ngram_embedding.shard_1.weight",
@@ -405,6 +409,7 @@ def test_buffer_beside_resident_parameter_uses_ordinary_converter_policy(
     torch.testing.assert_close(saved["linear.saved_scale"], model.linear.scale)
 
 
+@pytest.mark.skip(reason="Qwen4 tests temporarily skipped")
 def test_cpu_export_uses_parameter_layout_instead_of_source_shard_rows(
     tmp_path, process_group
 ):

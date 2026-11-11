@@ -24,6 +24,10 @@ from torchturbo.models.modules.cpu_resident import (
 )
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 class ResidentStateModel(nn.Module):
     _version = 7
 

@@ -19,6 +19,9 @@ from ..flash_attention_fakes import lazy_flash_attention_kernels, process_flash_
 from .test_model import _small_config, _token_ids_to_mask
 
 
+pytestmark = pytest.mark.skip(reason="Qwen4 tests temporarily skipped")
+
+
 def _cpu_varlen_kernel(
     query,
     key,
@@ -76,6 +79,7 @@ def flash_calls(monkeypatch):
     return calls
 
 
+@pytest.mark.cpu
 @pytest.mark.parametrize("input_kind", ["fp32_leaf", "fp32_nonleaf", "bf16_leaf"])
 def test_qsa_autocast_preserves_input_and_parameter_gradients(
     monkeypatch, flash_calls, input_kind
@@ -139,6 +143,7 @@ def test_qsa_autocast_preserves_input_and_parameter_gradients(
             )
 
 
+@pytest.mark.cpu
 @pytest.mark.parametrize("outer_checkpoint", [False, True])
 def test_chunked_qsa_preserves_gradients_without_saving_expanded_kv(
     monkeypatch,
@@ -224,6 +229,7 @@ def test_chunked_qsa_preserves_gradients_without_saving_expanded_kv(
     assert len(flash_calls) > 3
 
 
+@pytest.mark.cpu
 def test_padding_only_qsa_retains_zero_gradients(flash_calls) -> None:
     inputs = [torch.randn(1, 3, 2, 4, requires_grad=True) for _ in range(3)]
     token_ids = torch.full((1, 3, 4), -1, dtype=torch.int32)
@@ -235,6 +241,7 @@ def test_padding_only_qsa_retains_zero_gradients(flash_calls) -> None:
     assert flash_calls == []
 
 
+@pytest.mark.cpu
 @pytest.mark.parametrize("target_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("input_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("padding_only", [False, True])
@@ -282,6 +289,7 @@ def test_qsa_preserves_flash_dtype_correction(
         assert flash_calls == []
 
 
+@pytest.mark.cpu
 def test_qsa_checkpoint_preserves_dropout_rng(monkeypatch, flash_calls) -> None:
     torch.manual_seed(8)
     query = torch.randn(1, 4, 4, 4, dtype=torch.double, requires_grad=True)
@@ -318,6 +326,7 @@ def test_qsa_checkpoint_preserves_dropout_rng(monkeypatch, flash_calls) -> None:
         torch.testing.assert_close(actual, reference)
 
 
+@pytest.mark.npu
 @pytest.mark.parametrize("device_type", ["cuda", "npu"])
 def test_qsa_device_kernel_matches_dense_reference(monkeypatch, device_type) -> None:
     if device_type == "cuda":

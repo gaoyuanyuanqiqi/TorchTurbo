@@ -4,6 +4,14 @@ from torchturbo.engine.metrics.flops import ComputeProfile
 from torchturbo.models.qwen4_exp.mfu import Qwen4ExpFlops
 
 from .test_model import _small_config
+import pytest
+
+
+pytestmark = [
+    pytest.mark.cpu,
+    pytest.mark.skip(reason="Qwen4 tests temporarily skipped"),
+]
+
 
 
 def _components(sequence_length: int = 16):

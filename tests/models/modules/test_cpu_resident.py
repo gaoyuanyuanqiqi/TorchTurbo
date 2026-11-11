@@ -18,6 +18,10 @@ from safetensors.torch import load_file, save_file
 from torch import nn
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 def _package():
     name = "_torchturbo_cpu_resident_under_test"
     if name not in sys.modules:

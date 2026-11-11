@@ -4,6 +4,10 @@ import torch
 from torchturbo.ops.packed_params import get_packed_params
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 def test_padding_metadata_preserves_prefix_and_reuses_host_offsets():
     cu = torch.tensor([0, 2, 5], dtype=torch.int32)
 

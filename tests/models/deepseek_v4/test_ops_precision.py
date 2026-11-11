@@ -20,6 +20,10 @@ from pathlib import Path
 
 import pytest
 
+
+pytestmark = pytest.mark.cpu
+
+
 try:
     import torch
     import torch.nn.functional as F

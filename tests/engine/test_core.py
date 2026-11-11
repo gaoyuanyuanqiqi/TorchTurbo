@@ -42,6 +42,10 @@ from torchturbo.models.modules.moe.moe_utils import MoEAuxLossAutoScaler
 from torchturbo.runtime.cpu import CpuRuntime
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

@@ -16,6 +16,10 @@ from torchturbo.models.modules.moe.moe_utils import (
 from torchturbo.models.modules.moe.router import TopKRouter
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 def _router_config(**kwargs):
     values = {
         "hidden_size": 3,

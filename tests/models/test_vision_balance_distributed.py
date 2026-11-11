@@ -22,6 +22,10 @@ from torchturbo.models.modules.vision import (
 from torchturbo.parallel import VisionBalanceMode, VisionBalanceSpec
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 @dataclass
 class _VisionOutput:
     raw: torch.Tensor

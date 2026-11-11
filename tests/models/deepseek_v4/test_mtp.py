@@ -31,6 +31,10 @@ from .test_packed_inputs import (
 )
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 def _make_mtp_model(block_size=0, num_stages=2):
     model = _make_model(1)
     config = model.config

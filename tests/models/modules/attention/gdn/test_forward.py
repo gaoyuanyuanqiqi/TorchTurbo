@@ -21,6 +21,10 @@ from torchturbo.ops.dispatcher import OpDispatcher
 from torchturbo.runtime.cpu import CpuRuntime
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 def _cpu_dispatch(op_name, *args, packed_params=None, **kwargs):
     boundaries = (
         packed_params.cu_seqlens_list

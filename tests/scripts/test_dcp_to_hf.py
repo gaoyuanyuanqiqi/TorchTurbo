@@ -16,6 +16,10 @@ import torchturbo.engine as engine_module
 import torchturbo.engine.args as args_module
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 

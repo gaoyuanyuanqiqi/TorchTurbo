@@ -8,6 +8,10 @@ from torchturbo.models.modules.moe.router import TopKRouter
 from torchturbo.models.modules.moe.utils import RoutingResult, topk_softmax_with_capacity
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 @pytest.mark.parametrize("score_function", ["softmax", "sigmoid", "sqrtsoftplus"])
 @pytest.mark.parametrize("grouped", [False, True])
 @pytest.mark.parametrize("hash_routing", [False, True])

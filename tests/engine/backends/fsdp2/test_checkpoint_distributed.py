@@ -19,6 +19,10 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Shard, distribute_tensor
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 _HAS_GLOO = dist.is_available() and dist.is_gloo_available()
 
 

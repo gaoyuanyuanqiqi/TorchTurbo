@@ -1,0 +1,353 @@
+name: CI
+
+# Sole entry point: mode=pr (gate a PR on the diff) or mode=full.
+# Lanes are inlined -- a `uses:` job renders as "caller / callee" on the graph.
+# l1_/l2_/l3_ prefixes pin the order (jobs sort by key, not by position).
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'pr = select from the diff, full = run everything'
+        required: true
+        default: 'pr'
+        type: choice
+        options:
+          - pr
+          - full
+      force_all:
+        description: 'pr only: run everything (same as the ci:full label)'
+        required: false
+        default: false
+        type: boolean
+      with_e2e:
+        description: 'pr: one cheapest E2E case; full: every E2E case'
+        required: false
+        default: false
+        type: boolean
+      test_path:
+        description: "unit lanes only: dir / file / node id; '-' = normal selection"
+        required: false
+        default: '-'
+        type: string
+
+# A shared group with cancel-in-progress: false still cancels *pending* jobs and
+# once wedged this queue. So: PRs cancel per PR, full runs never queue.
+# ci:manual:* labels are ci-manual.yml's triggers; a separate group keeps the
+# resulting no-op run from cancelling a real CI run.
+concurrency:
+  group: ci-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || format('full-{0}', github.run_id) }}${{ startsWith(github.event.label.name || '', 'ci:manual:') && '-manual-label' || '' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+  pull-requests: read
+  actions: read          # gate timing reads created_at / run_started_at
+
+env:
+  # Not MODE: run_tests.sh reads MODE as cpu/npu.
+  CI_MODE: ${{ github.event_name == 'pull_request' && 'pr' || inputs.mode }}
+
+jobs:
+  select:
+    name: lint-select
+    # Lint and selection are strictly serial and together take seconds, so they
+    # share one runner and one full checkout. Keep them in separate steps: a lint
+    # failure then naturally prevents a plan, without another `needs` edge.
+    # ci:manual:* exists to run one lane via ci-manual.yml. Without this guard a
+    # manual label also starts a full CI run, which is both slow and confusing.
+    if: ${{ !startsWith(github.event.label.name || '', 'ci:manual:') }}
+    runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
+    timeout-minutes: 20
+    outputs:
+      cpu_unit_run: ${{ steps.select.outputs.cpu_unit_run }}
+      npu_unit_run: ${{ steps.select.outputs.npu_unit_run }}
+      npu_e2e_run: ${{ steps.select.outputs.npu_e2e_run }}
+      cpu_unit_files: ${{ steps.select.outputs.cpu_unit_files }}
+      npu_unit_files: ${{ steps.select.outputs.npu_unit_files }}
+      e2e_cases: ${{ steps.select.outputs.e2e_cases }}
+      image: ${{ steps.image.outputs.image }}
+      summary: ${{ steps.select.outputs.summary }}
+      failed_step: ${{ steps.failed_step.outputs.failed_step }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # merge-base needs history
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # Generic linters run first, then TorchTurbo contracts. Keeping both in
+      # one driver makes every finding visible in one pass; `--verify` for the
+      # selector also runs here. Only ruff and PyYAML need installing up front;
+      # shellcheck, actionlint and hadolint bootstrap themselves.
+      - name: lint
+        id: lint
+        env:
+          PYTHONUNBUFFERED: '1'
+        run: |
+          set -uo pipefail
+          python3 -m pip install --quiet --disable-pip-version-check \
+            -r requirements-lint.txt
+          python3 scripts/ci/lint_select/lint_check.py
+
+      - name: resolve image
+        id: image
+        env:
+          OVERRIDE: ${{ vars.BASE_IMAGE_TAG }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # --repo enables the artifact lookup published by ci-image.yml.
+          REF=$(python3 scripts/ci/image/build_image.py resolve --override "$OVERRIDE" \
+            --repo "$GITHUB_REPOSITORY" \
+            --fallback 'swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:base-latest')
+          test -n "$REF"
+          echo "image=$REF" >> "$GITHUB_OUTPUT"
+          echo "image: $REF"
+
+      # Labels -> flags live in select_tests.py; a copy here would be a second
+      # definition of what ci:e2e means.
+      - name: select
+        id: select
+        env:
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          WITH_E2E: ${{ github.event_name == 'workflow_dispatch' && inputs.with_e2e }}
+          FORCE_INPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.force_all }}
+          BASE_REF: origin/${{ github.base_ref || 'main' }}
+        run: |
+          set -uo pipefail
+          # Empty diff (no history / no info) -> full run: fail-open on purpose.
+          python3 scripts/ci/lint_select/select_tests.py --changed-from git \
+            --base-ref "$BASE_REF" \
+            --dump-changed /tmp/changed.txt \
+            --mode "$CI_MODE" --labels "$LABELS" \
+            --with-e2e "$WITH_E2E" --force-all "$FORCE_INPUT" \
+            --explain --output /tmp/sel.json --github-output "$GITHUB_OUTPUT" \
+            --summary-file "$GITHUB_STEP_SUMMARY" \
+            --image-ref '${{ steps.image.outputs.image }}'
+
+      # Last and always(): outputs are still published when the job fails.
+      - name: record failed step
+        id: failed_step
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+          LINT_OUTCOME: ${{ steps.lint.outcome }}
+          IMAGE_OUTCOME: ${{ steps.image.outcome }}
+          SELECT_OUTCOME: ${{ steps.select.outcome }}
+        run: python3 scripts/ci/report/report_gate.py failed-step
+
+  # No matrix, no shards: either would put one box per entry on the graph.
+  l1_cpu_unit:
+    name: cpu-unit-tests
+    needs: select
+    if: |
+      always() && needs.select.result == 'success' &&
+      needs.select.outputs.cpu_unit_run == 'true'
+    runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
+    timeout-minutes: 40
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: install
+        env:
+          MODE: cpu
+          RESULT_JSON: /tmp/ci-result.json
+        run: |
+          set -uo pipefail
+          python3 scripts/ci/report/report_result.py init --file "$RESULT_JSON" \
+            kind=pytest model_type=pytest-cpu-unit mode=cpu \
+            runner_label="${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}"
+          bash scripts/ci/unit_tests/run_tests.sh install
+
+      - name: pytest
+        env:
+          MODE: cpu
+          TEST_FILES: ${{ needs.select.outputs.cpu_unit_files }}
+          TEST_PATH: ${{ inputs.test_path }}
+          RESULT_JSON: /tmp/ci-result.json
+        run: bash scripts/ci/unit_tests/run_tests.sh
+
+      - name: summary
+        if: always()
+        env:
+          RESULT_JSON: /tmp/ci-result.json
+        run: |
+          set -uo pipefail
+          python3 scripts/ci/report/report_result.py report --file "$RESULT_JSON" \
+            --train-log /tmp/pytest.log --junit /tmp/pytest.xml >> "$GITHUB_STEP_SUMMARY" || true
+          python3 scripts/ci/report/report_result.py notice --file "$RESULT_JSON" \
+            --model-type pytest-cpu-unit || true
+
+  # Containerised. Empty TEST_FILES means the whole lane: image and repo-wide
+  # changes use that; targeted changes pass the selected NPU files.
+  l2_npu_unit:
+    name: npu-unit-tests
+    needs: select
+    # Fork PRs get no secrets, and handing secrets to fork code is RCE.
+    if: |
+      always() && needs.select.result == 'success' &&
+      needs.select.outputs.npu_unit_run == 'true' &&
+      (github.event_name != 'pull_request' ||
+       github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ${{ vars.CI_NPU_RUNNER || 'linux-aarch64-a3-800i-2' }}
+    timeout-minutes: 40
+
+    container:
+      image: ${{ needs.select.outputs.image }}
+      credentials:
+        username: ${{ secrets.SWR_USERNAME }}
+        password: ${{ secrets.SWR_PASSWORD }}
+      options: --user root
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: preflight
+        env:
+          RESULT_JSON: /tmp/ci-result.json
+        run: |
+          set -uo pipefail
+          python3 scripts/ci/report/report_result.py init --file "$RESULT_JSON" \
+            kind=pytest model_type=pytest-npu-unit mode=npu \
+            runner_label="${{ vars.CI_NPU_RUNNER || 'linux-aarch64-a3-800i-2' }}" \
+            image="${{ needs.select.outputs.image }}"
+
+          uname -m; nproc; free -h | head -2; df -h / | tail -1; python -V
+
+      - name: environment check
+        run: python3 scripts/ci/common/env_pod.py probe --file /tmp/torch-before.json
+
+      - name: install
+        env:
+          MODE: npu
+          RESULT_JSON: /tmp/ci-result.json
+        run: bash scripts/ci/unit_tests/run_tests.sh install
+
+      - name: pytest
+        env:
+          MODE: npu
+          TEST_FILES: ${{ needs.select.outputs.npu_unit_files }}
+          TEST_PATH: ${{ inputs.test_path }}
+          RESULT_JSON: /tmp/ci-result.json
+        run: bash scripts/ci/unit_tests/run_tests.sh
+
+      - name: summary
+        if: always()
+        env:
+          RESULT_JSON: /tmp/ci-result.json
+        run: |
+          set -uo pipefail
+          python3 scripts/ci/report/report_result.py report --file "$RESULT_JSON" \
+            --train-log /tmp/pytest.log --junit /tmp/pytest.xml >> "$GITHUB_STEP_SUMMARY" || true
+          python3 scripts/ci/report/report_result.py notice --file "$RESULT_JSON" \
+            --model-type pytest-npu-unit || true
+
+  # Training cases loop inside the job (run_train.sh lane): a matrix would put one
+  # box per case on the graph.
+  l3_npu_e2e:
+    name: npu-e2e-tests
+    needs: select
+    if: |
+      always() && needs.select.result == 'success' &&
+      needs.select.outputs.npu_e2e_run == 'true' &&
+      (github.event_name != 'pull_request' ||
+       github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ${{ vars.CI_E2E_RUNNER || 'linux-aarch64-a3-800i-8' }}
+    timeout-minutes: 45
+    outputs:
+      skip_reason: ${{ steps.lane.outputs.skip_reason }}
+
+    container:
+      image: ${{ needs.select.outputs.image }}
+      credentials:
+        username: ${{ secrets.SWR_USERNAME }}
+        password: ${{ secrets.SWR_PASSWORD }}
+      options: --user root
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 20 s to find "no NPU" beats discovering it after installing deps.
+      - name: environment check
+        id: environment
+        run: python3 scripts/ci/common/env_pod.py probe --file /tmp/torch-before.json
+
+      - name: training orchestration
+        id: lane
+        timeout-minutes: 25
+        env:
+          E2E_CASES: ${{ needs.select.outputs.e2e_cases }}
+          FRAMEWORK: lf
+          RUNNER_LABEL: ${{ vars.CI_E2E_RUNNER || 'linux-aarch64-a3-800i-8' }}
+          IMAGE: ${{ needs.select.outputs.image }}
+          SEQ_LEN: '4096'
+          DATASET_IN: 'gsm8k'
+          FINETUNING_TYPE: 'full'
+          FETCH_TIMEOUT: '600'
+          RESULT_JSON: /tmp/ci-result.json
+        run: bash scripts/ci/e2e_tests/run_train.sh lane
+
+      # timeout-minutes only kills the process; children would keep the cards.
+      - name: environment cleanup
+        if: always()
+        continue-on-error: true
+        run: python3 scripts/ci/common/env_pod.py cleanup
+
+  # Sole required check; the rules live in report_gate.py so pr/full cannot drift.
+  # select is a direct dep: a failed plan skips the lanes in seconds.
+  gate:
+    name: gate
+    needs: [select, l1_cpu_unit, l2_npu_unit, l3_npu_e2e]
+    # always() so lanes' results are judged even when select failed; the label
+    # guard mirrors select, or a manual-label run would judge an empty plan.
+    if: ${{ always() && !startsWith(github.event.label.name || '', 'ci:manual:') }}
+    runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: timing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/ci/report/report_gate.py timing
+
+      - name: judge
+        env:
+          R_SEL: ${{ needs.select.result }}
+          SEL_FAILED_STEP: ${{ needs.select.outputs.failed_step }}
+          R_CPU_UNIT: ${{ needs.l1_cpu_unit.result }}
+          R_NPU_UNIT: ${{ needs.l2_npu_unit.result }}
+          R_NPU_E2E: ${{ needs.l3_npu_e2e.result }}
+          CPU_UNIT_RUN: ${{ needs.select.outputs.cpu_unit_run }}
+          NPU_UNIT_RUN: ${{ needs.select.outputs.npu_unit_run }}
+          NPU_E2E_RUN: ${{ needs.select.outputs.npu_e2e_run }}
+          SKIP_REASON: ${{ needs.l3_npu_e2e.outputs.skip_reason }}
+          # Only the string is passed; report_gate.py decides what ci:e2e:strict means.
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          IS_FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+          SUMMARY: ${{ needs.select.outputs.summary }}
+        run: python3 scripts/ci/report/report_gate.py judge --mode "$CI_MODE"

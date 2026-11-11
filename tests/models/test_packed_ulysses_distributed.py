@@ -27,6 +27,10 @@ from torchturbo.runtime.cpu import CpuRuntime
 from .flash_attention_fakes import lazy_flash_attention_kernels, process_flash_kwargs
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 def _cpu_varlen_attention(
     query: Tensor,
     key: Tensor,

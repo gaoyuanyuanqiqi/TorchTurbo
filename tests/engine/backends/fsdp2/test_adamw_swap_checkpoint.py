@@ -19,6 +19,10 @@ from torchturbo.engine.backends.fsdp2.optimizers.adamw import AdamWSwap
 from torchturbo.runtime.cpu import CpuRuntime
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 class SyncRuntime(CpuRuntime):
     """Plain CPU runtime for exercising host-side control flow."""
 

@@ -29,6 +29,10 @@ from torchturbo.runtime import TurboDevice
 from torchturbo.runtime.cpu import CpuRuntime
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 class SyncRuntime(CpuRuntime):
     """Plain CPU runtime for exercising host-side control flow."""
 

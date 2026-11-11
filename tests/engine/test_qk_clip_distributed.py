@@ -44,6 +44,10 @@ from torchturbo.parallel import FSDPParallelPlan, FSDPPlanSpec
 from torchturbo.runtime.cpu import CpuRuntime
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 class _MLAAttention(nn.Module):
     def __init__(self, query: Tensor, key_value: Tensor) -> None:
         super().__init__()

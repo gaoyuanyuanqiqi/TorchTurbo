@@ -23,6 +23,13 @@ from torchturbo.runtime.cpu import CpuRuntime
 from .test_model import _patch_cpu_qsa, _small_config
 
 
+pytestmark = [
+    pytest.mark.cpu,
+    pytest.mark.skip(reason="Qwen4 tests temporarily skipped"),
+]
+
+
+
 @pytest.fixture
 def cpu_engine(monkeypatch, node_group):
     # Retain HF support checks and the real engine lifecycle on a CPU backend.

@@ -11,6 +11,10 @@ from torchturbo.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Co
 from torchturbo.models.deepseek_v4.model import TurboDeepseekV4ForCausalLM
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 @pytest.fixture(autouse=True)
 def restore_attention_forwards(monkeypatch):
     monkeypatch.setattr(dsv4, "DSAIndexerLossAutoScaler", dsv4.DSAIndexerLossAutoScaler)

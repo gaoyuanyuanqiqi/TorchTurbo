@@ -3,6 +3,7 @@
 import sys
 from pathlib import Path
 
+import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -16,6 +17,8 @@ for path in (SRC_ROOT, REPO_ROOT):
 from torchturbo.models.modules.attention.ulysses import (  # noqa: E402
     all_gather_sp_with_grad_reduce,
 )
+
+pytestmark = [pytest.mark.npu, pytest.mark.multi_npu]
 
 D, L = 32, 256
 HALF = L // 2

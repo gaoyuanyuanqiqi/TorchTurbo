@@ -30,6 +30,10 @@ from torchturbo.engine.optimizers import (
 from torchturbo.runtime.cpu import CpuRuntime
 from torchturbo.utils.torch_utils import torch_version
 
+
+pytestmark = pytest.mark.cpu
+
+
 _HAS_GLOO = dist.is_available() and dist.is_gloo_available()
 _HAS_FSDP_MUON = torch_version() >= (2, 10, 0)
 

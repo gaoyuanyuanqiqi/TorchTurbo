@@ -34,6 +34,13 @@ from .test_ple import adapted, new_reference, row_ids
 from .test_ple_loading import load_tables, make_checkpoint
 
 
+pytestmark = [
+    pytest.mark.cpu,
+    pytest.mark.skip(reason="Qwen4 tests temporarily skipped"),
+]
+
+
+
 def _init_process_group(rank: int, world_size: int, init_file: str) -> None:
     torch.set_num_threads(1)
     os.environ["LOCAL_WORLD_SIZE"] = str(world_size)

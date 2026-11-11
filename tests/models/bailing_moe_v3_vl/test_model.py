@@ -27,6 +27,10 @@ from torchturbo.models.bailing_moe_v3_vl.vision_balance import BailingVisionBala
 from torchturbo.models.modules.vision.io import VisionBatch
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 def make_config(*, hybrid=False, mtp=0):
     config = BailingMoeV3VLConfig(
         text_config=dict(

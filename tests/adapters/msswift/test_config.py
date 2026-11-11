@@ -59,6 +59,10 @@ from torchturbo.engine.config import (  # noqa: E402
 )
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 def _set_tt(**overrides):
     """Stash a ``TorchTurboArgs`` for the config builder to read back."""
     from torchturbo.engine.args import set_torchturbo_args

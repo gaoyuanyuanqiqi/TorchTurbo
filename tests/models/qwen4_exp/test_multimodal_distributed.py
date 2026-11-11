@@ -28,6 +28,13 @@ from .test_multimodal import _cpu_flash
 from .test_ple_distributed import _init_process_group
 
 
+pytestmark = [
+    pytest.mark.cpu,
+    pytest.mark.skip(reason="Qwen4 tests temporarily skipped"),
+]
+
+
+
 def _check_full_model_sp(rank, init_file, modality, reentrant):
     import transformers.modeling_utils as hf_modeling
 

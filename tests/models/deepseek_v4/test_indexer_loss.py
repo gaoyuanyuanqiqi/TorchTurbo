@@ -17,6 +17,10 @@ from .test_packed_inputs import (
 )
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 @pytest.fixture(autouse=True)
 def restore_auxiliary_loss_scale(monkeypatch):
     monkeypatch.setattr(MoEAuxLossAutoScaler, "loss_scale", 1.0)

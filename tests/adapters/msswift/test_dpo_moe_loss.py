@@ -26,6 +26,10 @@ from torchturbo.runtime.cpu import CpuRuntime
 from .test_trainer_packed import _packed_batch
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 @pytest.fixture
 def cpu_moe(monkeypatch, tmp_path):
     runtime = CpuRuntime()

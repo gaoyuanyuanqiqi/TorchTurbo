@@ -1,0 +1,92 @@
+{
+  "models": {
+    "qwen3_5": {
+      "run_dir": "qwen3_5_dense",
+      "download": {
+        "hf_repo": "Qwen/Qwen3.5-2B",
+        "e2e": "full"
+      },
+      "install": {
+        "lf": "install_lf_deps.sh"
+      },
+      "train": {
+        "lf": "lf_text_sft.sh"
+      },
+      "params": {
+        "cards": 8,
+        "sp": 2,
+        "ep": 1
+      }
+    },
+    "qwen3_5_moe": {
+      "run_dir": "qwen3_5_moe",
+      "download": {
+        "hf_repo": "Qwen/Qwen3.5-35B-A3B",
+        "e2e": "trim:6"
+      },
+      "install": {
+        "lf": "install_lf_deps.sh",
+        "swift": "install_swift_deps.sh"
+      },
+      "train": {
+        "lf": "lf_text_sft.sh",
+        "swift": "swift_mllm_sft.sh,swift_text_dpo.sh"
+      },
+      "params": {
+        "cards": 8,
+        "sp": 2,
+        "ep": 4
+      }
+    },
+    "qwen3_5_moe_text": {
+      "run_dir": "-"
+    },
+    "bailing_hybrid": {
+      "run_dir": "bailing_v3",
+      "download": {
+        "hf_repo": "inclusionAI/Ling-3.0-tiny",
+        "e2e": "full"
+      },
+      "install": {
+        "lf": "install_lf_deps.sh",
+        "swift": "install_swift_deps.sh"
+      },
+      "train": {
+        "lf": "lf_sft.sh,lf_pt.sh,lf_dpo.sh",
+        "swift": "swift_sft.sh,swift_pt.sh,swift_dpo.sh"
+      },
+      "params": {
+        "cards": 8,
+        "sp": 2,
+        "ep": 4
+      }
+    },
+    "bailing_moe_v3_vl": {
+      "run_dir": "-"
+    },
+    "deepseek_v4": {
+      "run_dir": "deepseek_v4"
+    },
+    "kimi_k25": {
+      "run_dir": "kimi_k25"
+    },
+    "llada2_moe": {
+      "run_dir": "llada2"
+    },
+    "qwen4_exp": {
+      "run_dir": "qwen4_exp",
+      "install": {
+        "swift": "install_swift_deps.sh"
+      },
+      "train": {
+        "swift": "swift_text_sft.sh"
+      }
+    },
+    "qwen3_moe": {
+      "run_dir": "-"
+    },
+    "glm_moe_dsa": {
+      "run_dir": "-"
+    }
+  }
+}

@@ -26,6 +26,10 @@ from torchturbo.models.qwen3_5_moe.configuration_qwen3_5_moe import (
 )
 
 
+pytestmark = pytest.mark.cpu
+
+
+
 def _disable_mtp(config):
     """Apply the config changes of model construction with MTP disabled."""
     with TurboModel.init_context(config, EngineConfig()):

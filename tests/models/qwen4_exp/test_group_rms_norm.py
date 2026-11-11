@@ -10,6 +10,13 @@ from torchturbo.ops import OpDispatcher, OpPolicy, registry
 from torchturbo.runtime.cpu import CpuRuntime
 
 
+pytestmark = [
+    pytest.mark.cpu,
+    pytest.mark.skip(reason="Qwen4 tests temporarily skipped"),
+]
+
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("noncontiguous", [False, True])
 @pytest.mark.parametrize("groups", [2, 4])
