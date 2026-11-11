@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import uuid
 from collections import defaultdict
 from dataclasses import replace
 from pathlib import Path
@@ -16,6 +17,59 @@ from facts import CiCatalog, PlanError, TestFacts, load_catalog, scan_tests
 
 def _load_selection(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _apply_test_path(root: Path, selection: dict[str, Any], value: str,
+                     test_facts: dict[str, TestFacts]) -> tuple[
+                         dict[str, Any], dict[str, list[str]], list[PlanError]]:
+    """Replace the CPU file list with an explicit manual test path."""
+    if not value or value == "-":
+        return selection, {}, []
+    selectors: dict[str, list[str]] = {}
+    errors: list[PlanError] = []
+    for token in value.split():
+        base = token.split("::", 1)[0]
+        candidate = (root / base).resolve()
+        try:
+            relative = candidate.relative_to(root).as_posix()
+        except ValueError:
+            errors.append(PlanError(token, "test path is outside the repository"))
+            continue
+        if candidate.is_dir():
+            paths = sorted(path for path in test_facts if path.startswith(relative + "/"))
+            paths = [path for path in paths if (root / path).is_file()]
+        elif candidate.is_file():
+            paths = [relative]
+        else:
+            errors.append(PlanError(token, "test path does not exist"))
+            continue
+        for path in paths:
+            facts = test_facts.get(path)
+            if facts is None:
+                errors.append(PlanError(path, "manual test path has no marker facts"))
+                continue
+            if facts.cpu_ranks:
+                selectors.setdefault(path, []).append(token if candidate.is_file() else path)
+    files = sorted(selectors)
+    updated = dict(selection)
+    lanes = dict(selection.get("lanes") or {})
+    lanes["cpu_unit"] = {"run": bool(files), "files": files}
+    updated["lanes"] = lanes
+    return updated, selectors, errors
+
+
+def _rewrite_test_path_files(plan: dict[str, Any],
+                             selectors: dict[str, list[str]]) -> None:
+    for job in plan["jobs"]:
+        if job["device"] != "cpu":
+            continue
+        for step in job["steps"]:
+            if step["kind"] == "pytest":
+                step["files"] = sorted({
+                    selected
+                    for path in step["files"]
+                    for selected in selectors.get(path, [path])
+                })
 
 
 def _add_test(job: dict[str, Any], facts: TestFacts, device: str,
@@ -147,7 +201,7 @@ def compile_plan(catalog: CiCatalog, test_facts: dict[str, TestFacts],
 
 
 def _summary(plan: dict[str, Any]) -> str:
-    lines = ["## Plan (shadow)", "", "| job | runner | env | work |", "|---|---|---|---|"]
+    lines = ["## Plan", "", "| job | runner | env | work |", "|---|---|---|---|"]
     for job in plan["jobs"]:
         for step in job["steps"]:
             if step["kind"] == "pytest":
@@ -160,6 +214,17 @@ def _summary(plan: dict[str, Any]) -> str:
     if len(lines) == 4:
         lines.append("| - | - | - | no work selected |")
     return "\n".join(lines) + "\n"
+
+
+def host_jobs(plan: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return CPU jobs in the compact shape consumed by an Actions matrix."""
+    return [job for job in plan["jobs"] if job["device"] == "cpu"]
+
+
+def _write_github_output(path: Path, key: str, value: str) -> None:
+    delimiter = f"EOF_{uuid.uuid4().hex}"
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(f"{key}<<{delimiter}\n{value}\n{delimiter}\n")
 
 
 def _render_errors(errors: list[PlanError]) -> None:
@@ -180,13 +245,28 @@ def verify(catalog: CiCatalog, test_facts: dict[str, TestFacts],
     sample = {
         "mode": "pr",
         "lanes": {
-            "cpu_unit": {"files": [cpu.path] if cpu else []},
-            "npu_unit": {"files": [npu.path] if npu else []},
+            "cpu_unit": {"run": cpu is not None, "files": [cpu.path] if cpu else []},
+            "npu_unit": {"run": npu is not None, "files": [npu.path] if npu else []},
         },
         "e2e_cases": [e2e.as_selection("verify")] if e2e else [],
     }
-    _, plan_errors = compile_plan(catalog, test_facts, sample)
+    sample_plan, plan_errors = compile_plan(catalog, test_facts, sample)
     failures.extend(plan_errors)
+    cpu_jobs = host_jobs(sample_plan)
+    if cpu_jobs:
+        try:
+            json.dumps(cpu_jobs, separators=(",", ":"))
+        except (TypeError, ValueError) as exc:
+            failures.append(PlanError("verify", f"host matrix is not JSON serializable: {exc}"))
+    else:
+        failures.append(PlanError("verify", "sample CPU selection produced no host job"))
+    if cpu is not None:
+        _, manual_files, manual_errors = _apply_test_path(
+            catalog.root, sample, cpu.path, test_facts
+        )
+        failures.extend(manual_errors)
+        if not manual_files:
+            failures.append(PlanError("verify", "manual CPU test path produced no files"))
     failures.extend(_verify_rejections(catalog, test_facts, cpu, npu))
     return failures
 
@@ -251,6 +331,10 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--selection", default=None, help="selector JSON")
     parser.add_argument("--output", default=None, help="write plan JSON here")
     parser.add_argument("--summary-file", default=None)
+    parser.add_argument("--github-output", default=None,
+                        help="append host_jobs matrix JSON to a GitHub output file")
+    parser.add_argument("--test-path", default="",
+                        help="manual CPU test path; '-' keeps the selector output")
     parser.add_argument("--verify", action="store_true", help="validate facts only")
     args = parser.parse_args(argv)
 
@@ -271,10 +355,17 @@ def main(argv: list[str]) -> int:
         parser.error("--selection is required unless --verify is used")
 
     selection = _load_selection(Path(args.selection))
+    selection, selectors, path_errors = _apply_test_path(
+        root, selection, args.test_path, test_facts
+    )
+    if path_errors:
+        _render_errors(path_errors)
+        return 1
     plan, plan_errors = compile_plan(catalog, test_facts, selection)
     if plan_errors:
         _render_errors(plan_errors)
         return 1
+    _rewrite_test_path_files(plan, selectors)
     text = json.dumps(plan, ensure_ascii=False, indent=2) + "\n"
     if args.output:
         Path(args.output).write_text(text, encoding="utf-8")
@@ -283,6 +374,11 @@ def main(argv: list[str]) -> int:
     if args.summary_file:
         with open(args.summary_file, "a", encoding="utf-8") as handle:
             handle.write(_summary(plan))
+    if args.github_output:
+        jobs = host_jobs(plan)
+        value = json.dumps(jobs, ensure_ascii=False, separators=(",", ":"))
+        _write_github_output(Path(args.github_output), "host_jobs", value)
+        _write_github_output(Path(args.github_output), "host_job_count", str(len(jobs)))
     return 0
 
 

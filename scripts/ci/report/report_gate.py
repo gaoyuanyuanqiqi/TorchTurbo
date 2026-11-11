@@ -51,6 +51,7 @@ def _skip_why() -> str:
         "lint": "静态检查未通过，按设计未启动",
         "image": "镜像解析未通过，按设计未启动",
         "select": "计划未算出，按设计未启动",
+        "plan": "plan 编译未通过，按设计未启动",
         "cancelled": "run 被取消，按设计未启动",
     }.get(_env("SEL_FAILED_STEP"), "计划未算出，按设计未启动")
 
@@ -62,6 +63,7 @@ FAILED_STEPS = (
     ("lint", ("LINT_OUTCOME",)),
     ("image", ("IMAGE_OUTCOME",)),
     ("select", ("SELECT_OUTCOME",)),
+    ("plan", ("PLAN_OUTCOME",)),
 )
 
 

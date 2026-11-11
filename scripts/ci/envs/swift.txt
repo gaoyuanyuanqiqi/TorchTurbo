@@ -1,7 +1,8 @@
 -r common.txt
 # Keep training dependency pins aligned with scripts/runs/deps/swift_deps.sh.
 # ms-swift 4.4.2 metadata excludes datasets 5.x; the training script installs
-# ms-swift first and datasets==5.0.1 afterwards. CI must preserve that order.
+# ms-swift first and datasets==5.0.1 afterwards. The override file preserves
+# that order instead of asking pip to resolve both pins in one transaction.
 transformers==5.9.0
 safetensors==0.7.0
 deepspeed==0.16.0
@@ -18,6 +19,5 @@ trl==0.29.0
 matplotlib
 ms_swift==4.4.2
 peft==0.18.0
-datasets==5.0.1
 binpacking==1.5.2
 qwen-vl-utils==0.0.14

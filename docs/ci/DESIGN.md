@@ -419,20 +419,22 @@ run-container     matrix: npu lane（container.image 来自 lane）
 gate              校验 plan、结果、skip 白名单
 ```
 
-两个 run job 都是通用模板：
+两个 run job 都是通用模板。PR2 已把 CPU 路径切到该模板；NPU 在 PR3 切换：
 
 ```yaml
 strategy:
   matrix:
-    include: ${{ fromJSON(needs.plan.outputs.host_jobs) }}
+    include: ${{ fromJSON(needs.select.outputs.host_jobs) }}
 runs-on: ${{ matrix.runner }}
 # container 版本再加：
 container:
   image: ${{ matrix.image }}
 ```
 
-每个 matrix job 只执行一个 `scripts/ci/run_job.py --job-id <id>`。脚本按
-plan 里的 `steps` 顺序执行，不再为 cpu / npu / e2e 写三套 YAML。
+CPU matrix 直接携带一个 plan job 对象，并执行
+`scripts/ci/run_job.py --job-json <job>`；本地也可以传
+`--plan <plan.json> --job-id <id>`。脚本按 `steps` 顺序执行，不再为
+cpu / npu / e2e 写三套 YAML。
 
 ### 3.2 venv 执行
 
@@ -465,6 +467,8 @@ pip install --no-build-isolation --no-deps -e .
   NPU 的 `/dev/davinci*` 和 `torch_npu` 检查；
 - venv 按内容 hash 放在专用 cache 目录，PR 之间复用；只创建 / 复用，不在
   CI 中执行 `rm -rf`。缓存缺失时新建目录，不做清理式回收。
+- 同一个 env 的 requirements 分阶段安装；`overrides` 在基础依赖之后执行，
+  用来复现训练脚本“先框架、后覆盖 pin”的顺序。
 
 依赖版本和安装顺序以 `scripts/runs/deps/*.sh` 为准。训练脚本有意采用
 “先安装框架、再覆盖某个依赖”的顺序时，CI 必须复现同一顺序，不能把

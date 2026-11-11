@@ -221,8 +221,10 @@ def check_ruff() -> list[Problem]:
 
 
 def check_shellcheck() -> list[Problem]:
-    """Shellcheck every shell script under scripts/ci."""
-    scripts = sorted(str(path) for path in CI.rglob("*.sh"))
+    """Shellcheck every shell script and bin wrapper under scripts/ci."""
+    scripts = {str(path) for path in CI.rglob("*.sh")}
+    scripts.update(str(path) for path in (CI / "bin").glob("*") if path.is_file())
+    scripts = sorted(scripts)
     if not scripts:
         return []
     try:

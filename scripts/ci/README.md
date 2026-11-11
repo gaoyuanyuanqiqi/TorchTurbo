@@ -8,16 +8,20 @@
 ```text
 scripts/ci/
   lint_select/   lint 与 select 阶段
-  unit_tests/    CPU / NPU 单测共用的安装与 pytest runner
+  unit_tests/    旧 NPU / 手动 CPU 单测的回退 runner
   e2e_tests/     NPU 模型用例：取模型、并行策略、训练监督
   image/         基础镜像构建
   common/        pod 环境
   report/        结果汇总与门禁判定
+  bin/           venv 内训练脚本使用的工具 wrapper
+  run_job.py     按 plan 执行一个 job
+  venv_manager.py  内容哈希 cache 的 env venv
   local_*        本机自检脚本，不进 CI
 ```
 
-`unit_tests/` 同时服务 CPU 和 NPU 两个 job：两者只差 `MODE`、runner 和
-pytest marker，runner 本身必须共用，否则两条泳道会慢慢跑偏。
+正式 CPU 路径由 `plan.py` 生成 `host_jobs` matrix，再由 `run_job.py` 按 env
+创建 venv 执行。`unit_tests/run_tests.sh` 只保留给旧 NPU job 和手动回退使用；
+PR3 切换容器 matrix 后再删除。
 
 通用规则交给 Ruff（Python）、`shellcheck`、`actionlint` 和 `hadolint`；自定义
 检查只保留通用工具看不到的仓库契约：job 依赖图、选测器自检、模型映射和 pytest
@@ -31,7 +35,10 @@ marker。
 |---|---|---|
 | `lint_select/select_tests.py` | 这次改动该跑什么？ | `--explain` / `--coverage` / `--verify` / `--changed-from git` / `--mode pr\|full --labels …` |
 | `lint_select/lint_check.py` | 静态体检总入口；通用检查先跑，Turbo 契约后跑 | 无参数 = 全跑 / `--only NAME` |
-| `unit_tests/run_tests.sh` | 单测泳道怎么装、怎么跑？ | `install` / `test`（`MODE=cpu` 用 `-m cpu`，`MODE=npu` 用 `-m npu`） |
+| `plan.py` | 选中项怎么变成 job / env / 进程？ | `--selection` / `--verify` / `--github-output` |
+| `run_job.py` | 一个 plan job 怎么装依赖、跑 pytest？ | `--job-json` 或 `--plan + --job-id` |
+| `venv_manager.py` | env 依赖装在哪、何时复用？ | 被 `run_job.py` 调用 |
+| `unit_tests/run_tests.sh` | 旧 NPU / 手动回退泳道怎么跑？ | `install` / `test`（`MODE=cpu\|npu`） |
 | `e2e_tests/prepare_model.py` | 模型和派生配置是否完成预处理？ | `plan` / `fetch` / `probe` / `cases` |
 | `e2e_tests/run_train.sh` | 一次训练冒烟分几步？ | `resolve` / `install` / `run` / `report` / `lane` |
 | `common/env_pod.py` | 这台 pod 现在是什么状态？ | `probe` / `check` / `cleanup` |
@@ -97,7 +104,7 @@ python3 scripts/ci/local_lint_select_test.py --only docker
 被下面这些 workflow 调用，`.github/workflows` 里的入口只负责声明输入：
 
 ```
-ci-pr.yml          唯一入口  select -> {cpu-unit-tests, npu-unit-tests, npu-e2e-tests} -> gate
+ci-pr.yml          唯一入口  select{lint,plan} -> {cpu matrix, npu-unit-tests, npu-e2e-tests} -> gate
                     mode=pr（PR 门禁） / mode=full（全量，不选测）
 ci-image.yml        构建基础镜像（**只手动 dispatch**）
 model_map.json      模型 -> 启动脚本 / 权重 / 端到端用例（被上面两个读）
@@ -154,17 +161,22 @@ python3 scripts/ci/lint_select/lint_check.py --only shellcheck   # 只查 shell
 python3 scripts/ci/lint_select/select_tests.py --verify   # 选测规则没退化（CI 也跑这条，失败判红）
 python3 scripts/ci/lint_select/select_tests.py --coverage # 覆盖报告（只出 JSON，判绿）
 
-bash -n scripts/ci/unit_tests/*.sh scripts/ci/e2e_tests/*.sh
+bash -n scripts/ci/bin/* scripts/ci/unit_tests/*.sh scripts/ci/e2e_tests/*.sh
 
 # 看某个改动会被怎么选
 python3 scripts/ci/lint_select/select_tests.py --changed-file src/torchturbo/engine/core.py --explain
 
 # 装依赖前后 torch 有没有被换掉
-python3 scripts/ci/common/env_pod.py probe   --file /tmp/t.json
-python3 scripts/ci/common/env_pod.py check   --file /tmp/t.json
+python3 scripts/ci/common/env_pod.py probe --device cpu --file /tmp/t.json
+python3 scripts/ci/common/env_pod.py check --device cpu --file /tmp/t.json
 
 # 全量计划，不需要网络
 python3 scripts/ci/lint_select/select_tests.py --force-all --output /tmp/s.json
+python3 scripts/ci/plan.py --selection /tmp/s.json --output /tmp/p.json \
+  --github-output /tmp/github-output
+
+# 执行计划中的一个 CPU job（会创建 venv 并安装依赖）
+python3 scripts/ci/run_job.py --plan /tmp/p.json --job-id default/cpu-1
 
 # 解析模型对应的启动脚本 / 依赖脚本
 python3 scripts/ci/e2e_tests/prepare_model.py plan --map .github/workflows/model_map.json \

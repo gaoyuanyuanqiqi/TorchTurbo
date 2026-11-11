@@ -16,6 +16,7 @@ constraints = "auto"
 [envs.swift]
 python = "3.11"
 requirements = "scripts/ci/envs/swift.txt"
+overrides = ["scripts/ci/envs/swift_overrides.txt"]
 constraints = "auto"
 
 [envs.qwen4_exp_swift]

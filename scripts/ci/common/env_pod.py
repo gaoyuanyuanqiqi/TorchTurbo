@@ -2,7 +2,7 @@
 """Pod environment checks, torch guard, and cleanup.
 
 Commands:
-  probe    capture torch, then verify device nodes and the NPU stack
+  probe    capture torch, then verify the selected CPU or NPU stack
   check    fail if pip replaced the custom NPU torch
   cleanup  remove leftovers after timeout or cancellation
 
@@ -36,8 +36,10 @@ def log(message: str) -> None:
 
 
 # ---------------------------------------------------------------- environment verification
-def _verify_environment() -> int:
-    """Validate device nodes, stack versions, and NPU availability."""
+def _verify_environment(device: str) -> int:
+    """Validate the selected device and its stack."""
+    if device == "cpu":
+        return _verify_cpu_environment()
     nodes = list(Path("/dev").glob("davinci*"))
     if not nodes:
         error("no /dev/davinci*, NPUs not mapped into the pod")
@@ -64,6 +66,19 @@ def _verify_environment() -> int:
     count = torch.npu.device_count()
     assert count > 0, "torch.npu.device_count() == 0: no NPU assigned"
     print("npu   : True | devices:", count)
+    return 0
+
+
+def _verify_cpu_environment() -> int:
+    """Validate the portable CPU stack without touching NPU APIs."""
+    try:
+        import torch
+    except Exception as exc:  # noqa: BLE001 - CPU install must provide torch
+        error(f"torch is not importable: {type(exc).__name__}: {exc}")
+        return 1
+    print("python:", sys.version.split()[0], "| machine:", platform.machine())
+    print("torch :", torch.__version__)
+    print("cpu   : True | threads:", torch.get_num_threads())
     return 0
 
 
@@ -101,7 +116,7 @@ def _capture_torch(path: str) -> int:
     return 0
 
 
-def cmd_check(path: str) -> int:
+def cmd_check(path: str, device: str) -> int:
     """Install guard, after pip: fail if torch or torch_npu changed."""
     saved = Path(path)
     if not saved.is_file():
@@ -119,19 +134,19 @@ def cmd_check(path: str) -> int:
     new = (after.get("torch_version"), after.get("torch_file"))
     if old != new:
         error(f"torch was replaced: {old[0]} ({old[1]}) -> {new[0]} ({new[1]})")
-        error("the NPU build is gone; pin the dependency or add an explicit torch constraint")
+        error("pin the dependency or add an explicit torch constraint")
         return 1
-    if before.get("npu_version") and not after.get("npu_version"):
+    if device == "npu" and before.get("npu_version") and not after.get("npu_version"):
         error(f"torch_npu disappeared after install (was {before['npu_version']})")
         return 1
     log(f"ok: torch {after.get('torch_version')}; torch_npu {after.get('npu_version', 'n/a')}")
     return 0
 
 
-def cmd_probe(capture_file: str) -> int:
+def cmd_probe(capture_file: str, device: str) -> int:
     """Capture the torch baseline, then verify devices and stack."""
     _capture_torch(capture_file)
-    return _verify_environment()
+    return _verify_environment(device)
 
 
 # ---------------------------------------------------------------- cleanup
@@ -197,17 +212,19 @@ def main(argv: list[str]) -> int:
 
     prb = sub.add_parser("probe", help="capture torch and verify devices and stack")
     prb.add_argument("--file", default="/tmp/torch-before.json")
+    prb.add_argument("--device", choices=("cpu", "npu"), default="npu")
 
     chk = sub.add_parser("check", help="fail if torch was replaced")
     chk.add_argument("--file", required=True)
+    chk.add_argument("--device", choices=("cpu", "npu"), default="npu")
     cln = sub.add_parser("cleanup", help="remove leftovers after timeout or cancellation")
     cln.add_argument("--output-dir", default="/tmp/tblf-sft")
 
     args = ap.parse_args(argv)
     if args.cmd == "probe":
-        return cmd_probe(args.file)
+        return cmd_probe(args.file, args.device)
     if args.cmd == "check":
-        return cmd_check(args.file)
+        return cmd_check(args.file, args.device)
     return cmd_cleanup(args.output_dir)
 
 

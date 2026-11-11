@@ -29,6 +29,7 @@ class EnvSpec:
     name: str
     python: str
     requirements: str = ""
+    overrides: tuple[str, ...] = ()
     extends: str = ""
     constraints: str = "auto"
 
@@ -177,10 +178,18 @@ def _load_envs(path: Path, errors: list[str]) -> dict[str, EnvSpec]:
         if not isinstance(row, dict):
             errors.append(f"{path}: env {name!r} must be a table")
             continue
+        overrides = row.get("overrides") or []
+        if isinstance(overrides, str):
+            overrides = [overrides]
+        if not isinstance(overrides, list) or not all(
+                isinstance(item, str) for item in overrides):
+            errors.append(f"{path}: env {name!r} overrides must be strings")
+            overrides = []
         envs[str(name)] = EnvSpec(
             name=str(name),
             python=str(row.get("python") or ""),
             requirements=str(row.get("requirements") or ""),
+            overrides=tuple(overrides),
             extends=str(row.get("extends") or ""),
             constraints=str(row.get("constraints") or "auto"),
         )
@@ -192,6 +201,10 @@ def _load_envs(path: Path, errors: list[str]) -> dict[str, EnvSpec]:
         if env.requirements and not (path.parents[2] / env.requirements).is_file():
             errors.append(f"{path}: env {env.name!r} requirement file is missing: "
                           f"{env.requirements}")
+        for override in env.overrides:
+            if not (path.parents[2] / override).is_file():
+                errors.append(f"{path}: env {env.name!r} override file is missing: "
+                              f"{override}")
     return envs
 
 
