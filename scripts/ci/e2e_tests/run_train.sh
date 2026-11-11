@@ -303,6 +303,8 @@ PY
 cmd_train() {
   [ -n "$PREP_MODEL" ] || { echo "::error::缺少预处理结果，无法训练"; return 1; }
   prefer_cached_dataset
+  export TT_LOSS_DIAG=1
+  export PYTHONPATH="$CI_SCRIPTS/e2e_tests/diag${PYTHONPATH:+:$PYTHONPATH}"
   export MODEL="$PREP_MODEL" NPUS_PER_NODE="$PREP_NPUS_PER_NODE" DATASET="$DATASET_IN" \
     SEQ_LEN FINETUNING_TYPE TT_CONFIG="$PREP_TT_CONFIG"
   # A smoke run must not fill the pod's overlay with checkpoints or tb events.
