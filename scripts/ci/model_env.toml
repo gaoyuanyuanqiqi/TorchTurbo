@@ -1,0 +1,10 @@
+# Unit/integration tests only. E2E dependencies are declared per case.
+
+[models.qwen4_exp]
+env = "qwen4_exp"
+image = "default"
+
+# LF/Swift parity tests need both frameworks but may skip without the optional
+# reference asset. Run them in LF; the Swift baseline skips when unavailable.
+[tests."tests/models/bailing_moe_v3_vl/test_lf_image_parity.py"]
+env = "lf"

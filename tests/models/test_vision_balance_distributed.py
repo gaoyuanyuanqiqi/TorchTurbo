@@ -22,7 +22,7 @@ from torchturbo.models.modules.vision import (
 from torchturbo.parallel import VisionBalanceMode, VisionBalanceSpec
 
 
-pytestmark = pytest.mark.cpu
+pytestmark = [pytest.mark.cpu, pytest.mark.rank_2]
 
 
 

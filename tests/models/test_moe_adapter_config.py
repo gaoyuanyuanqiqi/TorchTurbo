@@ -33,6 +33,9 @@ from torchturbo.runtime.cpu import CpuRuntime
 import torchturbo.runtime.runtime as runtime_module
 
 
+pytestmark = [pytest.mark.cpu, pytest.mark.rank_2]
+
+
 def _adapter_cases():
     common = SimpleNamespace(
         hidden_size=4, moe_intermediate_size=4, num_experts=4,

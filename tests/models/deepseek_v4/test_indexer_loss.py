@@ -17,7 +17,7 @@ from .test_packed_inputs import (
 )
 
 
-pytestmark = pytest.mark.cpu
+pytestmark = [pytest.mark.cpu, pytest.mark.rank_2]
 
 
 

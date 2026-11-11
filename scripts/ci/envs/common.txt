@@ -1,0 +1,5 @@
+pytest>=7.0
+dill
+einops
+huggingface_hub
+pillow

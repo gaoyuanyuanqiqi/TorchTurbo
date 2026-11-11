@@ -28,6 +28,9 @@ from torchturbo.runtime.cpu import CpuRuntime
 import torchturbo.runtime.runtime as runtime_module
 
 
+pytestmark = [pytest.mark.cpu, pytest.mark.rank_4]
+
+
 def _check_moe(
     rank: int, ep_size: int, empty_source: str,
     boundary: str, use_reentrant: bool, on_input: bool,

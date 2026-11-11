@@ -22,6 +22,9 @@ from torchturbo.models.qwen3_5.vision_balance import Qwen3_5VisionBalanceIO
 from torchturbo.parallel import VisionBalanceMode, VisionBalanceSpec
 
 
+pytestmark = [pytest.mark.cpu, pytest.mark.rank_4]
+
+
 def _model():
     config = Qwen3_5Config(
         image_token_id=30,

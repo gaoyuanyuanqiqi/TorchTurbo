@@ -163,6 +163,7 @@ def _run_qsa(rank: int, init_file: str, ratio12: bool) -> None:
 
 
 @pytest.mark.cpu
+@pytest.mark.rank_4
 @pytest.mark.skipif(
     not (dist.is_available() and dist.is_gloo_available()),
     reason="requires torch.distributed with Gloo support",
@@ -269,7 +270,7 @@ def _check_native_qsa_varlen(
 
 
 @pytest.mark.npu
-@pytest.mark.multi_npu
+@pytest.mark.rank_2
 @pytest.mark.skipif(
     os.environ.get("TORCH_TURBO_TEST_QSA_VARLEN_NPU") != "1",
     reason="opt-in native NPU varlen attention with HCCL sequence parallelism",

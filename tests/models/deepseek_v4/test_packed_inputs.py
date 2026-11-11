@@ -11,7 +11,7 @@ from torchturbo.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Co
 from torchturbo.models.deepseek_v4.model import TurboDeepseekV4ForCausalLM
 
 
-pytestmark = pytest.mark.cpu
+pytestmark = [pytest.mark.cpu, pytest.mark.rank_2]
 
 
 

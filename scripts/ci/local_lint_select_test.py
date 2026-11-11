@@ -39,7 +39,7 @@ MODEL_MAP = WORKFLOWS / "model_map.json"
 
 # Marker contract: the lane a file lands in must match the marker it declares.
 CPU_MARK = re.compile(r"pytest\.mark\.cpu\b")
-NPU_MARK = re.compile(r"pytest\.mark\.(?:npu|multi_npu|npu_\d+)\b")
+NPU_MARK = re.compile(r"pytest\.mark\.npu\b")
 
 LANE_KEYS = ("cpu_unit", "npu_unit", "npu_e2e")
 
@@ -110,10 +110,9 @@ def cases(got: dict) -> list[dict]:
         return []
 
 
-def families_with_case() -> int:
+def cases_with_case() -> int:
     rows = json.loads(MODEL_MAP.read_text(encoding="utf-8")).get("models", {})
-    return sum(1 for row in rows.values()
-               if str((row.get("download") or {}).get("e2e", "-")) != "-")
+    return sum(len(row.get("cases") or []) for row in rows.values())
 
 
 # ---------------------------------------------------------------- stages
@@ -162,12 +161,21 @@ SCENARIOS = [
     dict(name="moe family dir", files=["src/torchturbo/models/qwen3_5_moe/__init__.py"],
          expect="precise", cpu=True, npu=True, e2e=True,
          e2e_cases=[{"model_type": "qwen3_5_moe", "layers": 6}]),
+    dict(name="run config", files=["scripts/runs/qwen3_5_dense/lf_text_sft.yaml"],
+         expect="precise", cpu=False, npu=False, e2e=True, e2e_models=["qwen3_5"]),
     dict(name="shared model layer", files=["src/torchturbo/models/modules/attention/__init__.py"],
-         expect="precise", cpu=True, npu=True, e2e=True,
+         expect="all", cpu=True, npu=True, e2e=True,
+         full_reason="too-many-tests",
          e2e_cases=[{"model_type": "qwen3_5", "layers": 0}]),
     # CI scripts are the decision layer itself: CPU goes wide, NPU stays idle.
     dict(name="ci script", files=["scripts/ci/lint_select/select_tests.py"], expect="all",
          cpu=True, npu=False, e2e=False, full_reason="ci-config-changed"),
+    dict(name="shared env deps", files=["scripts/ci/envs/common.txt"], expect="all",
+         cpu=True, npu=False, e2e=True, e2e_models=["bailing_hybrid"],
+         full_reason="ci-config-changed"),
+    dict(name="E2E map", files=[".github/workflows/model_map.json"], expect="all",
+         cpu=True, npu=False, e2e=True, e2e_models=["bailing_hybrid"],
+         full_reason="ci-config-changed"),
     # Dependency change: nothing can be trusted to install.
     dict(name="pyproject", files=["pyproject.toml"], expect="all",
          cpu=True, npu=True, e2e=True, full_reason="deps-changed"),
@@ -224,8 +232,8 @@ def assert_scenario(case: dict) -> None:
 
     picked = cases(got)
     if case.get("e2e_all"):
-        check(f"{name}: every family with a case ({families_with_case()})",
-              len(picked) == families_with_case(), f"got {len(picked)}")
+        check(f"{name}: every declared case ({cases_with_case()})",
+              len(picked) == cases_with_case(), f"got {len(picked)}")
     elif "e2e_count" in case:
         check(f"{name}: e2e count={case['e2e_count']}", len(picked) == case["e2e_count"],
               f"got {[c['model_type'] for c in picked]}")

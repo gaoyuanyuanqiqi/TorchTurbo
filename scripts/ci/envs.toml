@@ -1,0 +1,25 @@
+[envs.default]
+python = "3.11"
+requirements = "scripts/ci/envs/default.txt"
+constraints = "auto"
+
+[envs.qwen4_exp]
+python = "3.11"
+requirements = "scripts/ci/envs/qwen4_exp.txt"
+constraints = "auto"
+
+[envs.lf]
+python = "3.11"
+requirements = "scripts/ci/envs/lf.txt"
+constraints = "auto"
+
+[envs.swift]
+python = "3.11"
+requirements = "scripts/ci/envs/swift.txt"
+constraints = "auto"
+
+[envs.qwen4_exp_swift]
+python = "3.11"
+extends = "swift"
+requirements = "scripts/ci/envs/qwen4_exp_swift.txt"
+constraints = "auto"

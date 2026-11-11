@@ -6,7 +6,7 @@ transformer layers so an 8-card (at most 16-card) job can run them.
 
 Subcommands, in call order from run_train.sh:
 
-    plan   model_map.json -> scripts, cards, sp/ep
+    plan   E2E case -> scripts, env, cards, sp/ep
     fetch  a validated model directory, downloaded or trimmed as needed
     probe  manual diagnostics for one directory
     cases  E2E_CASES JSON -> TSV lines
@@ -54,55 +54,86 @@ def lock_trim_target(target: Path) -> Iterator[None]:
         yield
 
 
-def read_model_plan(map_path: str, model_type: str, framework: str) -> dict[str, object]:
-    """Read and validate one model row from model_map.json."""
+def read_model_case_plan(map_path: str, model_type: str, framework: str,
+                         case_id: str = "") -> dict[str, object]:
+    """Resolve one declared E2E case into launcher and resource facts."""
     try:
         row = json.loads(Path(map_path).read_text(encoding="utf-8"))["models"][model_type]
     except (OSError, ValueError, KeyError) as exc:
         raise SystemExit(f"cannot resolve {model_type} from {map_path}: {exc}") from exc
     if framework not in {"lf", "swift"} or not isinstance(row, dict):
         raise SystemExit(f"invalid framework or map row for {model_type}")
+    cases = row.get("cases") or []
+    if not isinstance(cases, list):
+        raise SystemExit(f"{model_type}: cases must be a list")
+    candidates = [case for case in cases if isinstance(case, dict)
+                  and (not case_id or case.get("id") == case_id)
+                  and (case_id or case.get("framework") == framework)]
+    candidates.sort(key=lambda case: (case.get("tier") != "pr", str(case.get("id"))))
+    if not candidates:
+        suffix = f" case={case_id}" if case_id else f" framework={framework}"
+        raise SystemExit(f"{model_type}: no E2E case for{suffix}")
+    case = candidates[0]
 
     run_dir = str(row.get("run_dir") or "-")
     run_path = Path("scripts/runs") / run_dir
     if run_dir == "-" or not run_path.is_dir():
         raise SystemExit(f"missing run_dir for {model_type}: {run_path}")
-    install = find_framework_script(run_path, row.get("install"), framework)
-    train = find_framework_script(run_path, row.get("train"), framework)
-    if install is None or train is None:
-        raise SystemExit(f"{model_type}: no {framework} script under {run_path} ({map_path})")
+    install_name = str(case.get("install") or "")
+    train_name = str(case.get("train") or "")
+    install = run_path / install_name
+    train = run_path / train_name
+    if not install_name or not install.is_file() or not train_name or not train.is_file():
+        raise SystemExit(f"{model_type}: E2E scripts are missing under {run_path}")
 
-    download = row.get("download") or {}
+    download = case.get("download") or {}
     if not isinstance(download, dict):
         raise SystemExit(f"{model_type}: 'download' must be a mapping")
-
-    params = row.get("params")
-    cards = sp = ep = None
-    if params is not None:
-        try:
-            cards, sp, ep = (int(params[key]) for key in ("cards", "sp", "ep"))
-        except (KeyError, TypeError, ValueError) as exc:
-            raise SystemExit(f"{model_type}: bad params {params!r}: {exc}") from exc
-        if not 1 <= cards <= MAX_CARDS:
-            raise SystemExit(f"{model_type}: cards={cards} is outside 1..{MAX_CARDS}")
-        if min(sp, ep) < 1 or cards % sp or (cards // sp) % ep:
-            raise SystemExit(f"{model_type}: cards={cards} sp={sp} ep={ep} is not a valid plan")
+    try:
+        cards, sp, ep = (int(case[key]) for key in ("cards", "sp", "ep"))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise SystemExit(f"{model_type}: bad cards/sp/ep in {case.get('id')!r}: {exc}") from exc
+    if not 1 <= cards <= MAX_CARDS:
+        raise SystemExit(f"{model_type}: cards={cards} is outside 1..{MAX_CARDS}")
+    if min(sp, ep) < 1 or cards % sp or (cards // sp) % ep:
+        raise SystemExit(f"{model_type}: cards={cards} sp={sp} ep={ep} is not a valid plan")
 
     return {
+        "CASE_ID": str(case["id"]),
+        "FRAMEWORK": str(case["framework"]),
+        "ENV": str(case["env"]),
+        "MODEL_TYPE": model_type,
         "RUN_DIR": run_dir,
-        "INSTALL_SCRIPT": install,
-        "TRAIN_SCRIPT": train,
+        "INSTALL_SCRIPT": str(install),
+        "TRAIN_SCRIPT": str(train),
         "HF_REPO": str(download.get("hf_repo") or "-"),
-        "CARDS": "-" if cards is None else cards,
-        "SP": "-" if sp is None else sp,
-        "EP": "-" if ep is None else ep,
+        "LAYERS": int(download.get("layers", 0)),
+        "DATASET": str(case.get("dataset") or "gsm8k"),
+        "CARDS": cards,
+        "SP": sp,
+        "EP": ep,
     }
 
 
-def find_framework_script(run_path: Path, section: object, framework: str) -> Path | None:
-    """Return the first declared script that exists for this framework."""
-    names = str((section or {}).get(framework, "-")).split(",")
-    return next((run_path / name for name in names if (run_path / name).is_file()), None)
+def resolve_cases(map_path: str, framework: str, payload: str) -> list[dict[str, object]]:
+    """Resolve compact selector records into complete E2E case records."""
+    try:
+        items = json.loads(payload or "[]")
+    except ValueError as exc:
+        raise SystemExit(f"invalid E2E_CASES JSON: {exc}") from exc
+    if not isinstance(items, list) or any(
+            not isinstance(item, dict) or "model_type" not in item for item in items):
+        raise SystemExit("E2E_CASES must be a list of objects with model_type")
+    resolved = []
+    for item in items:
+        plan = read_model_case_plan(
+            map_path, str(item["model_type"]),
+            str(item.get("framework") or framework), str(item.get("case_id") or ""),
+        )
+        if "layers" in item:
+            plan["LAYERS"] = int(item["layers"])
+        resolved.append(plan)
+    return resolved
 
 
 def read_json_object(path: Path) -> dict:
@@ -375,7 +406,9 @@ def emit_key_values(destination: str, **values: object) -> None:
 def run_command(args: argparse.Namespace) -> int:
     """Dispatch one CLI command; each branch is a thin adapter only."""
     if args.command == "plan":
-        emit_key_values("", **read_model_plan(args.map, args.model_type, args.framework))
+        emit_key_values("", **read_model_case_plan(
+            args.map, args.model_type, args.framework, args.case_id,
+        ))
         return 0
     if args.command == "fetch":
         model = prepare_model_dir(args.repo, args.hint, args.layers,
@@ -390,15 +423,10 @@ def run_command(args: argparse.Namespace) -> int:
         print(*result)
         return 0
 
-    try:
-        items = json.loads(args.json or "[]")
-    except ValueError as exc:
-        raise SystemExit(f"invalid E2E_CASES JSON: {exc}") from exc
-    if not isinstance(items, list) or any(
-            not isinstance(item, dict) or "model_type" not in item for item in items):
-        raise SystemExit("E2E_CASES must be a list of objects with model_type")
-    for item in items:
-        print(f"{item['model_type']}\t{item.get('layers', 0)}")
+    for case in resolve_cases(args.map, args.framework, args.json):
+        print("\t".join(str(case[key]) for key in (
+            "CASE_ID", "FRAMEWORK", "ENV", "MODEL_TYPE", "LAYERS", "DATASET",
+        )))
     return 0
 
 
@@ -406,10 +434,11 @@ def build_parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description=__doc__)
     sub = root.add_subparsers(dest="command", required=True)
 
-    plan = sub.add_parser("plan", help="model_map.json row -> scripts and cards")
+    plan = sub.add_parser("plan", help="E2E case -> scripts, env, and cards")
     plan.add_argument("--map", required=True)
     plan.add_argument("--model-type", required=True)
     plan.add_argument("--framework", required=True)
+    plan.add_argument("--case-id", default="")
 
     fetch = sub.add_parser("fetch", help="obtain a validated model directory")
     fetch.add_argument("--repo", required=True)
@@ -426,6 +455,8 @@ def build_parser() -> argparse.ArgumentParser:
     probe.add_argument("--layers", type=int, default=0)
 
     cases = sub.add_parser("cases", help="E2E_CASES JSON -> TSV lines")
+    cases.add_argument("--map", required=True)
+    cases.add_argument("--framework", default="lf")
     cases.add_argument("json", nargs="?", default="[]")
     return root
 

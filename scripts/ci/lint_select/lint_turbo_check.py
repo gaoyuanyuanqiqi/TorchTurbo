@@ -5,15 +5,12 @@ from __future__ import annotations
 
 import ast
 import configparser
-import json
 import re
 import sys
 from pathlib import Path
 
 from lint_common_check import CI, ROOT, WORKFLOWS, Check, Problem, relative, run, text
 
-MODEL_MAP_SECTIONS = ("download", "install", "train", "params")
-MODEL_FRAMEWORKS = ("lf", "swift")
 BUILTIN_MARKERS = frozenset({
     "filterwarnings",
     "parametrize",
@@ -181,89 +178,25 @@ def check_selector() -> list[Problem]:
     return [Problem(relative(selector), f"selector self-test failed: {detail}")]
 
 
-def _registered_models() -> set[str]:
-    """Collect model names from real @register_model decorators."""
-    registered: set[str] = set()
-    for path in sorted((ROOT / "src" / "torchturbo" / "models").rglob("*.py")):
-        try:
-            tree = ast.parse(text(path))
-        except SyntaxError:
-            continue
-        for node in ast.walk(tree):
-            if not isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            for decorator in node.decorator_list:
-                if not isinstance(decorator, ast.Call):
-                    continue
-                name = decorator.func
-                if not ((isinstance(name, ast.Name) and name.id == "register_model")
-                        or (isinstance(name, ast.Attribute) and name.attr == "register_model")):
-                    continue
-                values = decorator.args[:1] + [
-                    keyword.value for keyword in decorator.keywords if keyword.arg == "name"
-                ]
-                for value in values:
-                    if isinstance(value, ast.Constant) and isinstance(value.value, str):
-                        registered.add(value.value)
-    return registered
-
-
 def check_model_map() -> list[Problem]:
-    """Every registered model must be represented in model_map.json."""
-    registered = _registered_models()
+    """Validate model, env, lane, and E2E case facts together."""
+    sys.path.insert(0, str(CI))
+    from facts import load_catalog
 
-    path = WORKFLOWS / "model_map.json"
-    if not path.exists():
-        return [Problem(relative(path), "model map is missing")]
-    try:
-        doc = json.loads(text(path))
-    except ValueError as exc:
-        return [Problem(relative(path), f"invalid JSON: {exc}")]
-    models = doc.get("models") if isinstance(doc, dict) else None
-    if not isinstance(models, dict):
-        return [Problem(relative(path), "missing top-level models mapping")]
+    catalog = load_catalog(ROOT)
+    return [Problem(message.split(":", 1)[0], message.split(":", 1)[-1].strip())
+            for message in catalog.errors]
 
-    problems = []
-    for name in sorted(registered - set(models)):
-        problems.append(Problem(relative(path), f"registered model {name!r} is not in the map"))
-    for name in sorted(set(models) - registered):
-        problems.append(Problem(relative(path), f"model {name!r} is not registered"))
-    for name, row in sorted(models.items()):
-        if not isinstance(row, dict):
-            problems.append(Problem(relative(path), f"{name}: row is not a mapping"))
-            continue
-        if not isinstance(row.get("run_dir"), str):
-            problems.append(Problem(relative(path), f"{name}: missing 'run_dir'"))
-        for section in MODEL_MAP_SECTIONS:
-            if section in row and not isinstance(row[section], dict):
-                problems.append(Problem(relative(path),
-                                        f"{name}: {section!r} must be a mapping"))
-        # Script names are declared per framework, so a typo has to be caught
-        # here rather than on an 8-card pod.
-        for section in ("install", "train"):
-            for framework in MODEL_FRAMEWORKS:
-                if framework not in (row.get(section) or {}):
-                    continue
-                run_dir = Path("scripts") / "runs" / str(row.get("run_dir", "-"))
-                for script in str(row[section][framework]).split(","):
-                    if script != "-" and not (ROOT / run_dir / script).is_file():
-                        problems.append(Problem(
-                            relative(path),
-                            f"{name}: {section}.{framework} names a missing script: "
-                            f"{run_dir / script}"))
-        # cards/sp/ep are the torchrun size, declared rather than inferred from
-        # the runner label, so a runnable model without a valid plan cannot run.
-        if str((row.get("download") or {}).get("e2e", "-")) != "-":
-            params = row.get("params") or {}
-            cards, sp, ep = (params.get(k) for k in ("cards", "sp", "ep"))
-            if not all(isinstance(v, int) and v >= 1 for v in (cards, sp, ep)):
-                problems.append(Problem(
-                    relative(path), f"{name}: e2e model needs integer params.cards/sp/ep, "
-                    f"got cards={cards!r} sp={sp!r} ep={ep!r}"))
-            elif cards % sp or (cards // sp) % ep:
-                problems.append(Problem(
-                    relative(path), f"{name}: cards={cards} cannot host sp={sp} ep={ep}"))
-    return problems
+
+def check_plan() -> list[Problem]:
+    """Run the planner's fact and sample-job assertions."""
+    planner = CI / "plan.py"
+    proc = run([sys.executable, str(planner), "--verify"], timeout=180)
+    if proc.returncode == 0:
+        return []
+    output = (proc.stdout + proc.stderr).strip().splitlines()
+    detail = output[-1] if output else f"exit {proc.returncode}"
+    return [Problem(relative(planner), f"plan self-test failed: {detail}")]
 
 
 def _module_marker_names(path: Path) -> set[str]:
@@ -331,15 +264,21 @@ def check_markers() -> list[Problem]:
         if ":" in line:
             configured.add(line.split(":", 1)[0].strip())
 
+    sys.path.insert(0, str(CI))
+    from facts import REQUIRED_MARKERS
+
     markers = _module_marker_names(selector) | _test_marker_names()
     for name in sorted(markers - configured):
         problems.append(Problem("pytest.ini", f"marker {name!r} is used but not registered"))
+    for name in sorted(configured - set(REQUIRED_MARKERS)):
+        problems.append(Problem("pytest.ini", f"obsolete marker {name!r}"))
     return problems
 
 
 CHECKS = (
     Check("contract", "planner/lint/lane topology and output contracts", check_contract),
     Check("selector", "selector self-test and precision guards", check_selector),
-    Check("model_map", "registered models match model_map.json", check_model_map),
+    Check("model_map", "model, env, lane, and E2E case facts", check_model_map),
+    Check("plan", "env, lane, and process plan", check_plan),
     Check("markers", "registered pytest marker contract", check_markers),
 )

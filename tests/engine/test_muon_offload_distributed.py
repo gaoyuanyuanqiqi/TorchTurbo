@@ -19,7 +19,7 @@ from torchturbo.engine.optimizers import MuonPlan, MuonRecipe, OptimizersContain
 from torchturbo.runtime import get_device_runtime
 from torchturbo.utils.torch_utils import torch_version
 
-pytestmark = [pytest.mark.npu, pytest.mark.multi_npu]
+pytestmark = [pytest.mark.npu, pytest.mark.rank_2]
 
 
 def _device_count():

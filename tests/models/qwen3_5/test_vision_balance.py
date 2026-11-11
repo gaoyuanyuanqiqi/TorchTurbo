@@ -23,6 +23,9 @@ from torchturbo.models.qwen3_5.vision_balance import Qwen3_5VisionBalanceIO
 from torchturbo.parallel import VisionBalanceMode, VisionBalanceSpec
 
 
+pytestmark = [pytest.mark.cpu, pytest.mark.rank_8]
+
+
 def _tower():
     config = Qwen3_5VisionConfig(
         depth=1,

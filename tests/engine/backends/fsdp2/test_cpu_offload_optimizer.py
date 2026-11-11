@@ -29,7 +29,7 @@ from torchturbo.runtime import TurboDevice
 from torchturbo.runtime.cpu import CpuRuntime
 
 
-pytestmark = pytest.mark.cpu
+pytestmark = pytest.mark.npu
 
 
 

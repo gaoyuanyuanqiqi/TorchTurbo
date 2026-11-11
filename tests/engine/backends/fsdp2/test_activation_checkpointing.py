@@ -28,6 +28,9 @@ from torchturbo.runtime.cpu import CpuRuntime
 from torchturbo.utils.torch_utils import torch_version
 
 
+pytestmark = pytest.mark.cpu
+
+
 @pytest.fixture
 def cpu_mesh(tmp_path, monkeypatch):
     if not dist.is_gloo_available():

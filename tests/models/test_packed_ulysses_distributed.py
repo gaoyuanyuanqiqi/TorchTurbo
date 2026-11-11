@@ -27,7 +27,7 @@ from torchturbo.runtime.cpu import CpuRuntime
 from .flash_attention_fakes import lazy_flash_attention_kernels, process_flash_kwargs
 
 
-pytestmark = pytest.mark.cpu
+pytestmark = [pytest.mark.cpu, pytest.mark.rank_2]
 
 
 

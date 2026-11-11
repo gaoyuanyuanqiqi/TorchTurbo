@@ -24,7 +24,7 @@ from torchturbo.models.modules.cpu_resident import (
 )
 
 
-pytestmark = pytest.mark.cpu
+pytestmark = [pytest.mark.cpu, pytest.mark.rank_4]
 
 
 

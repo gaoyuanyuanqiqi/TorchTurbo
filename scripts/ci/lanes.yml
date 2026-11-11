@@ -1,0 +1,37 @@
+lanes:
+  default/cpu-1:
+    image: default
+    device: cpu
+    slots: 1
+    runner_variable: CI_CPU_RUNNER
+    runner: ubuntu-22.04-arm
+  default/cpu-2:
+    image: default
+    device: cpu
+    slots: 2
+    runner_variable: CI_CPU_RUNNER
+    runner: ubuntu-22.04-arm
+  default/cpu-4:
+    image: default
+    device: cpu
+    slots: 4
+    runner_variable: CI_CPU_RUNNER
+    runner: ubuntu-22.04-arm
+  default/cpu-8:
+    image: default
+    device: cpu
+    slots: 8
+    runner_variable: CI_CPU_RUNNER
+    runner: ubuntu-22.04-arm
+  default/npu-2:
+    image: default
+    device: npu
+    slots: 2
+    runner_variable: CI_NPU_RUNNER
+    runner: linux-aarch64-a3-800i-2
+  default/npu-8:
+    image: default
+    device: npu
+    slots: 8
+    runner_variable: CI_E2E_RUNNER
+    runner: linux-aarch64-a3-800i-8

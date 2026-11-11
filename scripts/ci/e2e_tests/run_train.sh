@@ -22,7 +22,7 @@ RESULT_JSON="${RESULT_JSON:-/tmp/ci-result.json}"
 GITHUB_OUTPUT="${GITHUB_OUTPUT:-/dev/null}"
 MAP="${MAP:-.github/workflows/model_map.json}"
 
-: "${MODEL_TYPE:=}"; : "${FRAMEWORK:=lf}"; : "${RUNNER_LABEL:=}"
+: "${MODEL_TYPE:=}"; : "${CASE_ID:=}"; : "${FRAMEWORK:=lf}"; : "${ENV_NAME:=}"; : "${RUNNER_LABEL:=}"
 : "${IMAGE:=}"; : "${LAYERS:=0}"; : "${MODEL_HINT:=}"; : "${REPO_IN:=}"
 : "${SEQ_LEN:=1024}"; : "${FINETUNING_TYPE:=full}"; : "${DATASET_IN:=gsm8k}"; : "${DATASET:=${DATASET_IN}}"
 : "${FETCH_TIMEOUT:=600}"; : "${STRICT:=false}"; : "${E2E_CASES:=[]}"
@@ -48,27 +48,30 @@ parse_kv() {  # parse_kv <KEY=value lines>
 # Map model_type to its scripts, repo, and the declared card/parallel plan.
 cmd_plan() {
   result init --file "$RESULT_JSON" \
-    kind=train model_type="$MODEL_TYPE" framework="$FRAMEWORK" \
+    kind=train model_type="$MODEL_TYPE" case_id="$CASE_ID" framework="$FRAMEWORK" env="$ENV_NAME" \
     runner_label="$RUNNER_LABEL" image="$IMAGE" layers="$LAYERS" dataset="$DATASET"
 
   local resolved
   if ! resolved=$(python3 "$MODEL_HELPER" plan \
-      --map "$MAP" --model-type "$MODEL_TYPE" --framework "$FRAMEWORK"); then
+      --map "$MAP" --model-type "$MODEL_TYPE" --framework "$FRAMEWORK" \
+      --case-id "$CASE_ID"); then
     return 1
   fi
   parse_kv "$resolved"
+  ENV_NAME="${ENV:-$ENV_NAME}"
   [ -n "${TRAIN_SCRIPT:-}" ] && [ -n "${INSTALL_SCRIPT:-}" ] \
     || { echo "::error::模型脚本解析结果为空"; return 1; }
   # Declared per model in model_map.json. Kept in PLAN_* so the stage-3 parse
   # cannot be confused with the values patch_run_scripts.py echoes back.
   PLAN_CARDS=$CARDS; PLAN_SP=$SP; PLAN_EP=$EP
 
-  echo "model_type=$MODEL_TYPE framework=$FRAMEWORK run_dir=$RUN_DIR train=$TRAIN_SCRIPT repo=$HF_REPO"
+  echo "case=$CASE_ID model_type=$MODEL_TYPE framework=$FRAMEWORK env=$ENV_NAME run_dir=$RUN_DIR train=$TRAIN_SCRIPT repo=$HF_REPO"
   echo "plan: cards=$PLAN_CARDS sp=$PLAN_SP ep=$PLAN_EP"
   result set --file "$RESULT_JSON" \
-    run_dir="$RUN_DIR" install_script="$INSTALL_SCRIPT" train_script="$TRAIN_SCRIPT"
-  printf 'run_dir=%s\ninstall_script=%s\ntrain_script=%s\nhf_repo=%s\n' \
-    "$RUN_DIR" "$INSTALL_SCRIPT" "$TRAIN_SCRIPT" "$HF_REPO" >> "$GITHUB_OUTPUT"
+    env="$ENV_NAME" run_dir="$RUN_DIR" install_script="$INSTALL_SCRIPT" \
+    train_script="$TRAIN_SCRIPT"
+  printf 'case_id=%s\nenv=%s\nrun_dir=%s\ninstall_script=%s\ntrain_script=%s\nhf_repo=%s\n' \
+    "$CASE_ID" "$ENV_NAME" "$RUN_DIR" "$INSTALL_SCRIPT" "$TRAIN_SCRIPT" "$HF_REPO" >> "$GITHUB_OUTPUT"
   python3 "$CI_SCRIPTS/lint_select/lint_check.py" --only map
 }
 
@@ -160,7 +163,7 @@ cmd_prepare() {
   # launcher keeps its own TT_CONFIG default.
   case "$PLAN_CARDS" in
     ''|-|*[!0-9]*)
-      echo "::error::model_map.json 里 ${MODEL_TYPE} 没有 params.cards/sp/ep，无法确定卡数与并行策略"
+      echo "::error::model_map.json 里 ${CASE_ID} 没有 cards/sp/ep，无法确定卡数与并行策略"
       return 1 ;;
   esac
   if ! configured=$(python3 "$CI_SCRIPTS/e2e_tests/patch_run_scripts.py" config \
@@ -343,14 +346,17 @@ cmd_run() {
 # Training orchestration, not a stage: run stages 1-5 for every selected E2E case.
 cmd_lane() {
   local rc=0 total=0 skipped=0 case_rc mt layers case_list reasons
+  local resolved_case_id resolved_framework resolved_env resolved_dataset
   export DATASET="${DATASET_IN:-${DATASET:-gsm8k}}"
   SKIP_FILE=$(mktemp); export SKIP_FILE
-  case_list=$(python3 "$MODEL_HELPER" cases "${E2E_CASES:-[]}") || return 1
-  while IFS=$'\t' read -r mt layers; do
+  case_list=$(python3 "$MODEL_HELPER" cases --map "$MAP" --framework "$FRAMEWORK" \
+    "${E2E_CASES:-[]}") || return 1
+  while IFS=$'\t' read -r resolved_case_id resolved_framework resolved_env mt layers resolved_dataset; do
     [ -n "$mt" ] || continue
     total=$((total + 1))
-    echo "::group::training case $total: $mt (layers=${layers:-0})"
-    export MODEL_TYPE="$mt" LAYERS="${layers:-0}"
+    echo "::group::training case $total: $resolved_case_id (layers=${layers:-0})"
+    export CASE_ID="$resolved_case_id" FRAMEWORK="$resolved_framework" ENV_NAME="$resolved_env"
+    export MODEL_TYPE="$mt" LAYERS="${layers:-0}" DATASET_IN="${resolved_dataset:-$DATASET_IN}"
     if ! GITHUB_OUTPUT=/dev/null cmd_plan; then
       rc=1
     elif ! cmd_install; then

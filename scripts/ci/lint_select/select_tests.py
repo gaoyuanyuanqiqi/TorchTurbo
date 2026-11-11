@@ -22,7 +22,8 @@ change, unknown blast radius, or `ci:full`.
 No "name looks like test name" rule on purpose: at 260 modules it added 24
 tests, none unique, and mapped `packed.py` to four unrelated `test_packed_*`.
 
-Stdlib only, ~0.6 s per call (0.5 s is graph build), so no mapping table rots.
+The import graph is stdlib-only; E2E facts reuse `scripts/ci/facts.py` and the
+lint-time PyYAML dependency. A call stays around 0.6 s, so no mapping table rots.
 
     lint_select/select_tests.py --changed-file a.py [--changed-file b.py] [--explain]
     git diff --name-only base...HEAD | lint_select/select_tests.py --changed-from -
@@ -40,7 +41,6 @@ import subprocess
 import sys
 import tokenize
 from dataclasses import dataclass
-from functools import lru_cache
 from pathlib import Path
 
 PKG = "torchturbo"
@@ -313,113 +313,19 @@ class Index:
 # --------------------------------------------------------------------------
 # E2E case mapping
 # --------------------------------------------------------------------------
-@lru_cache(maxsize=None)
-def load_model_map(root: Path) -> dict[str, dict[str, str]]:
-    """model_map.json -> {model_type: {run_dir, e2e}}.
+def pick_e2e(changed: list[str], root: Path, *, all_cases: bool = False,
+             force: bool = False) -> list[dict]:
+    """Changed paths -> self-describing E2E cases."""
+    ci_root = Path(__file__).resolve().parents[1]
+    if str(ci_root) not in sys.path:
+        sys.path.insert(0, str(ci_root))
+    from facts import load_catalog, select_e2e_cases
 
-    The map groups a model into download / install / train / params sections;
-    selection only needs where the launcher lives and whether the model takes
-    part in E2E, so the other sections are not flattened here. Missing values
-    become "-"; an unreadable file yields {} rather than silently changing the
-    selection.
-    """
-    path = root / ".github" / "workflows" / "model_map.json"
-    if not path.exists():
-        return {}
-    try:
-        doc = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        print(f"::warning::cannot read {path}: {exc}; using an empty table",
+    catalog = load_catalog(root)
+    if catalog.errors:
+        print("::warning::CI facts contain errors; E2E selection may be incomplete",
               file=sys.stderr)
-        return {}
-    raw = doc.get("models") if isinstance(doc, dict) else None
-    if not isinstance(raw, dict):
-        return {}
-    out: dict[str, dict[str, str]] = {}
-    for name, row in raw.items():
-        if not isinstance(row, dict):
-            continue
-        download = row.get("download")
-        download = download if isinstance(download, dict) else {}
-        out[name] = {
-            "run_dir": str(row.get("run_dir") or "-"),
-            "e2e": str(download.get("e2e") or "-"),
-        }
-    return out
-
-
-def pick_e2e(changed: list[str], models: dict[str, dict[str, str]]) -> list[dict]:
-    """Changed paths -> E2E cases, deduped and priority-sorted.
-
-    A family directory beats the cheapest profile: editing qwen3_5_moe must run
-    qwen3_5_moe, not the 2B qwen3_5 stand-in.
-    """
-    picks: list[tuple[int, str, str]] = []   # (priority, model_type, reason)
-
-    def add(priority: int, model: str | None, reason: str) -> None:
-        if not model or model not in models:
-            return
-        if models[model]["e2e"] == "-":
-            return
-        picks.append((priority, model, reason))
-
-    for p in changed:
-        # Non-code paths rarely affect startup; an `ops/README.md` once burned an
-        # 8-card E2E run through a prefix match. Recipes, launchers and the
-        # dependency file are the exceptions.
-        if not (p.endswith(".py") or p.startswith(("docker/npu/", "scripts/runs/"))
-                or p == "pyproject.toml"):
-            continue
-        if p.startswith("src/torchturbo/models/"):
-            seg = p[len("src/torchturbo/models/"):].split("/")[0]
-            if seg.endswith(".py") or seg == "modules":
-                add(1, CHEAPEST_MODEL, f"{p} (shared model layer)")
-            else:
-                add(0, seg, f"{p} (family directory)")
-
-        elif p.startswith("src/torchturbo/adapters/"):
-            # Only MoE ships swift launchers; lf falls back to the cheapest dense.
-            add(1, "qwen3_5_moe" if "swift" in p else "bailing_hybrid", p)
-
-        elif p.startswith("src/torchturbo/"):
-            pkg = p[len("src/torchturbo/"):].split("/")[0]
-            if pkg in ("ops", "engine", "parallel"):
-                add(1, CHEAPEST_MODEL, f"{p} ({pkg} change)")
-            elif pkg.endswith(".py"):
-                # Package facade or a root module: imported during startup.
-                add(1, CHEAPEST_MODEL, f"{p} (package root)")
-            # runtime / utils / registry: cannot break startup, no E2E.
-
-        elif p.startswith("scripts/runs/"):
-            run_dir = p[len("scripts/runs/"):].split("/")[0]
-            for name, row in models.items():
-                if row["run_dir"] == run_dir:
-                    add(0, name, f"{p} (run_dir={run_dir})")
-                    break
-
-        elif p.startswith("docker/npu/"):
-            add(1, CHEAPEST_MODEL, f"{p} (image recipe)")
-
-        elif p == "pyproject.toml":
-            # Dependencies changed: startup can break at any moment.
-            add(1, CHEAPEST_MODEL, "pyproject.toml (dependencies)")
-
-        # CI internals: no NPU. Tests: cannot break training. Docs: ignored.
-
-    picks.sort(key=lambda x: x[0])
-    out: list[dict] = []
-    seen: set[str] = set()
-    for _, model, reason in picks:
-        if model in seen:
-            continue
-        seen.add(model)
-        spec = models[model]["e2e"]
-        layers = 0
-        if spec.startswith("trim:"):
-            layers = int(spec.split(":", 1)[1])
-        out.append({"model_type": model, "layers": layers,
-                    "profile": spec, "reason": reason})
-    return out
+    return select_e2e_cases(catalog, changed, all_cases=all_cases, force=force)
 
 
 # Removed `wants_npu(changed)`: a second path-prefix guess that could start NPU
@@ -458,14 +364,11 @@ def _iter_statements(tree: ast.AST):
                 stack.append(child)
 
 
-# Marker names are the only lane-selection contract. CPU and NPU lanes are
-# explicit; reserved device markers must gain a lane before use.
-_CARD_MARKERS = {"npu": 1, "multi_npu": 2, "npu_4": 4, "npu_8": 8, "npu_16": 16}
-NPU_MARKERS = frozenset(_CARD_MARKERS)
-# Public: `lint_check markers` compares this with pytest.ini so a marker cannot
-# be added to one file only.
-RESERVED_MARKERS = frozenset({"cuda", "xpu", "mps"})
-DEVICE_MARKERS = frozenset({"cpu"}) | NPU_MARKERS | RESERVED_MARKERS
+# Device and rank are separate facts: `npu` selects the runner class, `rank_N`
+# selects how many slots that runner must provide.
+NPU_MARKERS = frozenset({"npu"})
+DEVICE_MARKERS = frozenset({"cpu", "npu"})
+KNOWN_MARKERS = DEVICE_MARKERS | {"rank_2", "rank_4", "rank_8", "integration"}
 
 
 @dataclass(frozen=True)
@@ -512,7 +415,7 @@ def _marker_names(node: ast.AST) -> set[str]:
         return out
     if isinstance(node, ast.Call):
         node = node.func
-    if isinstance(node, ast.Attribute) and node.attr in DEVICE_MARKERS:
+    if isinstance(node, ast.Attribute) and node.attr in KNOWN_MARKERS:
         base = node.value
         if (isinstance(base, ast.Attribute) and base.attr == "mark"
                 and isinstance(base.value, ast.Name) and base.value.id == "pytest"):
@@ -561,8 +464,7 @@ def test_requirement(path: Path) -> TestRequirement:
         hit = TestRequirement(
             marker_names=frozenset(names),
             module_markers=frozenset(module),
-            min_npus=max((_CARD_MARKERS[name] for name in names
-                          if name in _CARD_MARKERS), default=0),
+            min_npus=1 if "npu" in names else 0,
             npu_tests=sum(bool(markers & NPU_MARKERS) for markers in test_sets),
             test_count=len(tests),
             unclassified_tests=tuple(
@@ -813,18 +715,13 @@ def select(index: Index, changed: list[str], force_all: bool = False,
     npu_targets = [t for t in targets if requirements[t].npu]
     cpu_targets = [t for t in targets if requirements[t].cpu]
 
-    models = load_model_map(index.root)
-    e2e_cases = pick_e2e(changed, models)
+    e2e_cases = pick_e2e(changed, index.root)
     if e2e_force and not e2e_cases:
         # ci:e2e: run at least the cheapest profile, whatever the paths say.
-        e2e_cases = pick_e2e(["pyproject.toml"], models)
+        e2e_cases = pick_e2e(changed, index.root, force=True)
     if e2e_all:
-        # ci:full / main: every family with a profile; the caller serializes.
-        e2e_cases = [{"model_type": name,
-                      "layers": int(row["e2e"].split(":", 1)[1])
-                      if row["e2e"].startswith("trim:") else 0,
-                      "profile": row["e2e"], "reason": "all cases (ci:full)"}
-                     for name, row in models.items() if row["e2e"] != "-"]
+        # ci:full / main: every declared case; the caller serializes them.
+        e2e_cases = pick_e2e(changed, index.root, all_cases=True)
 
     # ---- lanes: the single decision output ------------------------------
     # Every lane carries a `why`, and a missing one fails the gate: "nobody knows
@@ -1212,7 +1109,8 @@ def main(argv: list[str]) -> int:
             hit = " ".join(f"{k}={v}" for k, v in r.items() if v) or "-"
             print(f"  {p}  {hit}")
         for e in result["e2e_cases"]:
-            print(f"  E2E case {e['model_type']} ({e['profile']}, {e['layers']} layers)"
+            print(f"  E2E case {e['case_id']} ({e['framework']}/{e['env']}, "
+                  f"{e['layers']} layers)"
                   f" <- {e['reason']}")
 
     payload = json.dumps(result, ensure_ascii=False, indent=2)
