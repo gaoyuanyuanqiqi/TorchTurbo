@@ -274,6 +274,38 @@ if _ENABLED:
         wrapper._tt_diag = True
         module.rms_norm_gated = wrapper
 
+    def _install_chunk_kda(module):
+        original = getattr(module, "chunk_kda_fwd", None)
+        if original is None or getattr(original, "_tt_diag", False):
+            return
+
+        names = (
+            "attn_out",
+            "final_state",
+            "gk",
+            "Aqk",
+            "Akk",
+            "w",
+            "u",
+            "qg",
+            "kg",
+            "v_new",
+            "h",
+            "initial_state",
+        )
+
+        @functools.wraps(original)
+        def wrapper(*args, **kwargs):
+            layer = _state["active_layer"]
+            out = original(*args, **kwargs)
+            if layer == 0:
+                for name, value in zip(names, out):
+                    _record(f"L0.raw_kda.{name}", value)
+            return out
+
+        wrapper._tt_diag = True
+        module.chunk_kda_fwd = wrapper
+
     def _dump(name, value):
         try:
             local = _local(value).detach().reshape(-1)
@@ -331,6 +363,7 @@ if _ENABLED:
         "torchturbo.models.modules.attention.ulysses.ulysses": _install_ulysses,
         "torchturbo.ops.dispatcher": _install_ops_dispatcher,
         "torchturbo.ops.packed_params": _install_packed_params,
+        "fla_npu.ops.ascendc": _install_chunk_kda,
         "fla.modules.fused_norm_gate": _install_fused_norm,
         "torchturbo.engine.distributed": _install_assert,
         "torchturbo.adapters.llamafactory_v0.trainer": _install_trainer,
