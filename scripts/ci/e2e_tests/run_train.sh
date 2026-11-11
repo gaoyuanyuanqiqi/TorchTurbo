@@ -29,6 +29,11 @@ MAP="${MAP:-.github/workflows/model_map.json}"
 : "${INSTALL_SCRIPT:=}"; : "${TRAIN_SCRIPT:=}"; : "${HF_REPO:=}"
 
 export HF_MODULES_CACHE="${HF_MODULES_CACHE:-/tmp/hf-modules}"
+export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
+export HF_HOME="${HF_HOME:-/root/.cache/huggingface}"
+export HF_HUB_ETAG_TIMEOUT="${HF_HUB_ETAG_TIMEOUT:-30}"
+export HF_HUB_DOWNLOAD_TIMEOUT="${HF_HUB_DOWNLOAD_TIMEOUT:-120}"
+export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
 
 result() { python3 "$CI_SCRIPTS/report/report_result.py" "$@"; }
 
