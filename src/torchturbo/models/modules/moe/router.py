@@ -23,6 +23,42 @@ from .moe_utils import (
 from .utils import RoutingResult, topk_softmax_with_capacity
 
 
+class RouterGatingLinearFunction(torch.autograd.Function):
+    """Compute router logits in the router dtype.
+
+    Only the original input and weight are saved; backward recreates the casts,
+    so autograd does not keep router-dtype copies of the activations.
+    """
+
+    @staticmethod
+    def forward(
+        ctx, input: torch.Tensor, weight: torch.Tensor, router_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        ctx.save_for_backward(input, weight)
+        ctx.router_dtype = router_dtype
+        # Autocast must not override the router's compute dtype.
+        with torch.autocast(device_type=input.device.type, enabled=False):
+            return torch.nn.functional.linear(
+                input.to(router_dtype), weight.to(router_dtype)
+            )
+
+    @staticmethod
+    def backward(
+        ctx, grad_output: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, None]:
+        input, weight = ctx.saved_tensors
+        grad_output = grad_output.reshape(-1, grad_output.shape[-1])
+        grad_input = None
+        grad_weight = None
+        if ctx.needs_input_grad[0]:
+            grad_input = grad_output.mm(weight.to(ctx.router_dtype))
+            grad_input = grad_input.view(input.shape).to(input.dtype)
+        if ctx.needs_input_grad[1]:
+            flat_input = input.reshape(-1, input.shape[-1]).to(ctx.router_dtype)
+            grad_weight = grad_output.t().mm(flat_input).to(weight.dtype)
+        return grad_input, grad_weight, None
+
+
 class Router(ABC, torch.nn.Module):
     """Base Router class"""
 
@@ -63,11 +99,7 @@ class Router(ABC, torch.nn.Module):
             router_dtype = torch.float32
         elif self.config.moe_router_dtype == "fp64":
             router_dtype = torch.float64
-        # HACK: avoid unexpected dtype conversion
-        logits = torch.nn.functional.linear(
-            input.to(router_dtype), self.weight.to(router_dtype)
-        ).to(router_dtype)
-        return logits
+        return RouterGatingLinearFunction.apply(input, self.weight, router_dtype)
 
 
 class TopKRouter(Router):
@@ -248,6 +280,7 @@ class TopKRouter(Router):
         logits: torch.Tensor,
         input_ids: Optional[torch.Tensor] = None,
         padding_mask: torch.Tensor | None = None,
+        accumulate_tokens_per_expert: bool = True,
     ) -> RoutingResult:
         """Top-k routing function
 
@@ -283,9 +316,11 @@ class TopKRouter(Router):
         else:
             raise ValueError(f"Unsupported MoE routing type: {self.routing_type}")
 
+        # Hash assignments are fixed, so learned-routing AUX does not apply.
         if (
             self.training
             and torch.is_grad_enabled()
+            and not self.use_hash_routing
             and self.config.moe_aux_loss_coeff > 0.0
         ):
             aux_routing_map, aux_scores = compute_routing_scores_for_aux_loss(
@@ -299,8 +334,13 @@ class TopKRouter(Router):
                 probs=self._apply_aux_loss(routing.probs, aux_scores, aux_routing_map),
             )
 
-        # Prevent extra local tokens accumulation on evaluation or activation recomputation
-        if self.enable_expert_bias and torch.is_grad_enabled():
+        # Count each training forward once. Evaluation and the reentrant first
+        # pass run without grad; non-reentrant recomputation disables counting.
+        if (
+            self.enable_expert_bias
+            and accumulate_tokens_per_expert
+            and torch.is_grad_enabled()
+        ):
             with torch.no_grad():
                 bias_routing_map = mask_padding_tokens(
                     routing.routing_map, padding_mask
@@ -321,6 +361,7 @@ class TopKRouter(Router):
         input: torch.Tensor,
         input_ids: Optional[torch.Tensor] = None,
         padding_mask: torch.Tensor | None = None,
+        accumulate_tokens_per_expert: bool = True,
     ) -> tuple[RoutingResult, torch.Tensor]:
         """
         Forward pass of the router.
@@ -332,6 +373,8 @@ class TopKRouter(Router):
 
         logits = self.gating(input)
 
-        routing = self.routing(logits, input_ids, padding_mask)
+        routing = self.routing(
+            logits, input_ids, padding_mask, accumulate_tokens_per_expert
+        )
 
         return routing, logits

@@ -12,7 +12,8 @@ from torchturbo.logging import get_logger
 from torchturbo.runtime import DeviceRuntime, TurboDevice
 
 from .base import OpImpl, OpImplKind, OpPolicy, OpSpec
-from .packed_params import PackedParams, get_packed_params
+from .moe import MoEPermutation, get_expert_indices
+from .packed_params import get_packed_params
 from .providers import iter_provider_modules
 from .registry import OpRegistry
 
@@ -422,17 +423,14 @@ class OpDispatcher:
         initial_state: torch.Tensor | None = None,
         output_final_state: bool = False,
         use_qk_l2norm_in_kernel: bool = False,
+        use_beta_sigmoid_in_kernel: bool = True,
         use_gate_in_kernel: bool = False,
         safe_gate: bool = False,
         lower_bound: float | None = None,
         cu_seqlens: torch.Tensor | None = None,
-        packed_params: PackedParams | None = None,
         impl: str | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        if cu_seqlens is not None:
-            if packed_params is not None:
-                raise ValueError("pass either cu_seqlens or packed_params, not both")
-            packed_params = get_packed_params(cu_seqlens, q.size(1), device=q.device)
+        """Run KDA on [B,T,C] Q/K/V inputs and return [B,T,H,Dv]."""
         return self._dispatch(
             "kda",
             q,
@@ -446,10 +444,11 @@ class OpDispatcher:
             initial_state=initial_state,
             output_final_state=output_final_state,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
             use_gate_in_kernel=use_gate_in_kernel,
             safe_gate=safe_gate,
             lower_bound=lower_bound,
-            packed_params=packed_params,
+            cu_seqlens=cu_seqlens,
             impl=impl,
         )
 
@@ -526,6 +525,138 @@ class OpDispatcher:
     ):
         return self._dispatch(
             "lightning_indexer_metadata", *args, impl=impl, **kwargs
+        )
+
+    def moe_permutation(
+        self,
+        tokens: torch.Tensor,
+        routing_map: torch.Tensor,
+        probs: torch.Tensor | None = None,
+        num_out_tokens: int | None = None,
+        expert_indices: torch.Tensor | None = None,
+        *,
+        impl: str | None = None,
+    ) -> MoEPermutation:
+        """Duplicate and group token assignments by expert without weighting.
+
+        Every source token selects the same number of distinct experts. Each
+        assignment produces one output row, ordered by expert ID, then source
+        token ID. Selected routes are retained even when their weight is zero.
+
+        Args:
+            tokens: Source features of shape [num_tokens, hidden_size].
+            routing_map: Boolean assignment mask of shape
+                [num_tokens, num_experts] on the token device. Each row must
+                contain exactly topk selected experts; token dropping is
+                unsupported.
+            probs: Optional dense routing weights of shape
+                [num_tokens, num_experts] on the token device. Selected weights
+                are gathered into packed row order, retaining their dtype.
+                They are not multiplied into token features by this operator.
+            num_out_tokens: Optional output row count. Must equal
+                num_tokens * topk; when omitted, derive it from the assignments.
+            expert_indices: Optional int64 tensor of shape [num_tokens, topk]
+                on the token device. Each row must contain the selected expert
+                IDs in ascending order and match routing_map. Providing it
+                avoids deriving the IDs from the mask. For empty inputs,
+                pass shape [0, topk] to retain the known topk; otherwise the
+                inferred index shape is [0, 0].
+            impl: Optional explicit implementation name. When omitted, use
+                the configured operator override or dispatch policy.
+
+        Returns:
+            MoEPermutation containing packed features, optional packed weights,
+            and provider-independent row/expert indices for unpermutation.
+
+        Raises:
+            ValueError: If deriving indices reveals nonuniform topk, or
+                num_out_tokens differs from the number of assignments.
+        """
+        if expert_indices is None:
+            expert_indices = get_expert_indices(routing_map)
+        expected_tokens = expert_indices.numel()
+        if num_out_tokens is not None and num_out_tokens != expected_tokens:
+            raise ValueError(
+                "num_out_tokens must equal num_tokens * topk; token dropping is unsupported."
+            )
+        return self._dispatch(
+            "moe_permutation",
+            tokens,
+            routing_map,
+            probs=probs,
+            num_out_tokens=expected_tokens,
+            expert_indices=expert_indices,
+            impl=impl,
+        )
+
+    def moe_unpermutation(
+        self,
+        permutation: MoEPermutation,
+        restore_shape: torch.Size,
+        probs: torch.Tensor | None = None,
+        *,
+        impl: str | None = None,
+    ) -> torch.Tensor:
+        """Sum expert output rows back into source-token order.
+
+        Source token i receives the sum of
+        ``permutation.tokens[permutation.row_indices[i, j]]`` over all slots j.
+        If probs is supplied, multiply each contribution by
+        ``probs[i, permutation.expert_indices[i, j]]`` before summing.
+        Permuting and immediately unpermuting without weighting therefore
+        returns topk times the source features.
+
+        Args:
+            permutation: Shared operator data containing expert output features
+                in the original packed row order and the corresponding inverse
+                indices. It may originate from any compatible provider.
+                The permutation.probs field is not used for merging.
+            restore_shape: Output shape [num_tokens, hidden_size], matching
+                the source-token count in row_indices and feature width in
+                permutation.tokens. The caller restores any batch/sequence
+                dimensions separately.
+            probs: Optional dense merging weights of shape
+                [num_tokens, num_experts] on the feature device. Expert IDs
+                select the weight for each contribution. Omit when expert
+                computation has already applied routing weights; None means
+                sum the contributions without additional weighting.
+            impl: Optional explicit implementation name, selected independently
+                of the permutation implementation. When omitted, use the
+                configured operator override or dispatch policy.
+
+        Returns:
+            Combined features with restore_shape and the dtype and device of
+            permutation.tokens.
+        """
+        return self._dispatch(
+            "moe_unpermutation",
+            permutation,
+            restore_shape,
+            probs=probs,
+            impl=impl,
+        )
+
+    def moe_sort_chunks(
+        self,
+        input: torch.Tensor,
+        split_sizes: torch.Tensor,
+        sorted_idxs: torch.Tensor,
+        probs: torch.Tensor | None = None,
+        *,
+        impl: str | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Reorder chunks using metadata on the input device."""
+        if split_sizes.device != input.device or sorted_idxs.device != input.device:
+            raise ValueError(
+                "Chunk sorting requires split_sizes and sorted_idxs on the input device."
+            )
+        return self._dispatch(
+            "moe_sort_chunks",
+            input,
+            split_sizes,
+            sorted_idxs,
+            probs=probs,
+            impl=impl,
         )
 
     def __getattr__(self, name: str):

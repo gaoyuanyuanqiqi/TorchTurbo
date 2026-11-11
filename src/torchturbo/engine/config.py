@@ -22,16 +22,13 @@ import os
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Literal, get_args, get_type_hints
+from typing import Any, Literal, get_args, get_type_hints
 
 from omegaconf import OmegaConf
 
 from ..logging import get_logger
 from ..ops.base import OpPolicy
 from .args import TorchTurboArgs, get_arg_specs, string_to_bool
-
-if TYPE_CHECKING:
-    from ..parallel import FSDPParallelPlan
 
 logger = get_logger(__name__)
 
@@ -476,6 +473,12 @@ class MoEConfig:
 
     aux_loss_coeff: float = 0.0
     z_loss_coeff: float = 0.0
+    token_dispatcher: str = "alltoall"
+    """Expert token dispatcher type."""
+
+    def __post_init__(self) -> None:
+        if self.token_dispatcher != "alltoall":
+            raise ValueError("moe.token_dispatcher must be 'alltoall'.")
 
 
 @dataclass
@@ -524,38 +527,61 @@ class MfuConfig:
 
 @dataclass(frozen=True)
 class FreezePolicy:
-    """Engine config for freezing semantic model parameter groups."""
+    """Freeze parameters by semantic group and/or FQN wildcard pattern
+    ('*' within one segment, '**' across segments; matched on base-model
+    FQNs, so LoRA adapters stay trainable unless a pattern selects them)."""
 
     parameter_groups: tuple[ParameterGroup, ...] = ()
+    patterns: tuple[str, ...] = ()
 
     @property
     def enabled(self) -> bool:
-        return bool(self.parameter_groups)
+        return bool(self.parameter_groups or self.patterns)
 
     @classmethod
     def from_list(
         cls,
-        groups: Iterable[ParameterGroup | str] | ParameterGroup | str | None,
+        entries: Iterable[ParameterGroup | str] | ParameterGroup | str | None,
     ) -> FreezePolicy:
-        if groups is None:
+        """Build a policy from mixed group names and FQN patterns."""
+        if entries is None:
             return cls()
-        if isinstance(groups, (ParameterGroup, str)):
-            groups = (groups,)
-        normalized = []
-        seen = set()
-        for group in groups:
-            parameter_group = cls._coerce_group(group)
-            if parameter_group in seen:
+        if isinstance(entries, (ParameterGroup, str)):
+            entries = (entries,)
+        groups: list[ParameterGroup] = []
+        patterns: list[str] = []
+        for entry in entries:
+            group = cls._try_coerce_group(entry)
+            if group is not None:
+                if group not in groups:
+                    groups.append(group)
                 continue
-            normalized.append(parameter_group)
-            seen.add(parameter_group)
-        return cls(tuple(normalized))
+            pattern = cls._coerce_pattern(entry)
+            if pattern not in patterns:
+                patterns.append(pattern)
+        return cls(tuple(groups), tuple(patterns))
 
     @staticmethod
-    def _coerce_group(group: ParameterGroup | str) -> ParameterGroup:
-        if isinstance(group, ParameterGroup):
-            return group
-        return ParameterGroup(group)
+    def _try_coerce_group(entry: Any) -> ParameterGroup | None:
+        if isinstance(entry, ParameterGroup):
+            return entry
+        if isinstance(entry, str):
+            try:
+                return ParameterGroup(entry)
+            except ValueError:
+                return None
+        raise TypeError(
+            "FreezePolicy entries must be ParameterGroup members or strings, "
+            f"got {type(entry).__name__}."
+        )
+
+    @staticmethod
+    def _coerce_pattern(entry: Any) -> str:
+        if not isinstance(entry, str) or not entry.strip():
+            raise ValueError(
+                f"FreezePolicy patterns must be non-empty strings, got {entry!r}."
+            )
+        return entry.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -715,8 +741,7 @@ class EngineConfig:
         elif parallel_d is not None:
             if not isinstance(parallel_d, Mapping):
                 raise ValueError("parallel_plan must be a mapping or FSDPParallelPlan.")
-            _validate_config_file({"parallel_plan": parallel_d})
-            parallel_plan = _parse_parallel_plan({**parallel_sizes, **parallel_d})
+            parallel_plan = FSDPParallelPlan.from_dict({**parallel_sizes, **parallel_d})
         else:
             parallel_plan = FSDPParallelPlan(**parallel_sizes)
 
@@ -838,10 +863,14 @@ class EngineConfig:
             "enable_chunk_loss",
             "loss_chunk_size",
             "freeze_policy",
+            "diffusion",
             "mfu",
             "gbs",
+            "plugin_paths",
+            "extra",
         }
-        extra = {k: v for k, v in d.items() if k not in known_keys}
+        extra = dict(d.get("extra") or {})
+        extra.update({k: v for k, v in d.items() if k not in known_keys})
 
         return cls(
             backend=backend,
@@ -859,8 +888,10 @@ class EngineConfig:
             moe=moe_config,
             loss_chunk=loss_chunk_config,
             freeze_policy=freeze_policy,
+            diffusion=_build_diffusion_config(d),
             mfu=mfu_config,
             gbs=d.get("gbs"),
+            plugin_paths=list(d.get("plugin_paths") or []),
             extra=extra,
         )
 
@@ -941,26 +972,33 @@ class EngineConfig:
             return value
         if value is None or value == {}:
             return FreezePolicy()
+        if isinstance(value, (list, tuple)):
+            return FreezePolicy.from_list(value)
         if not isinstance(value, dict):
-            raise TypeError("freeze_policy must be a dict or FreezePolicy.")
+            raise TypeError(
+                "freeze_policy must be a dict, a list, or a FreezePolicy."
+            )
 
-        allowed_keys = {"parameter_groups"}
+        allowed_keys = {"parameter_groups", "patterns"}
         unknown_keys = set(value) - allowed_keys
         if unknown_keys:
             keys = ", ".join(sorted(unknown_keys))
             raise ValueError(f"Unknown freeze_policy field(s): {keys}.")
-        if "parameter_groups" not in value:
-            raise ValueError("freeze_policy requires 'parameter_groups'.")
 
-        return FreezePolicy.from_list(value["parameter_groups"])
+        entries = [*_as_entry_list(value.get("parameter_groups"))]
+        entries.extend(_as_entry_list(value.get("patterns")))
+        return FreezePolicy.from_list(entries)
 
     def to_dict(self) -> dict[str, Any]:
-        """Serialize back to a dict (for logging, etc.)."""
+        """Serialize configuration fields for logging or reconstruction."""
+        from torchturbo.parallel import FSDPParallelPlan
 
         data = {}
         for field_info in dataclasses.fields(self):
             value = getattr(self, field_info.name)
-            if dataclasses.is_dataclass(value):
+            if isinstance(value, FSDPParallelPlan):
+                value = value.to_dict()
+            elif dataclasses.is_dataclass(value):
                 value = dataclasses.asdict(value)
             data[field_info.name] = value
         return data
@@ -995,6 +1033,8 @@ def build_from_args(
         Parsed ``--tt_*`` args (the single source of truth for turbo flags).
         ``None`` is treated as all-defaults.
     """
+    from torchturbo.parallel import FSDPParallelPlan
+
     tt = torchturbo_args or TorchTurboArgs()
     arg_specs = get_arg_specs()
 
@@ -1077,7 +1117,7 @@ def build_from_args(
         OmegaConf.merge(fields, config_from_file, config_from_cli), resolve=True
     )
 
-    parallel_plan = _parse_parallel_plan(fields.get("parallel_plan") or {})
+    parallel_plan = FSDPParallelPlan.from_dict(fields.get("parallel_plan") or {})
 
     ac_d = dict(fields.get("activation_checkpointing") or {})
     if "enabled" in ac_d:
@@ -1123,33 +1163,6 @@ def build_from_args(
     return config
 
 
-def _parse_parallel_plan(parallel_d: Mapping[str, Any]) -> FSDPParallelPlan:
-    """Parse a validated plan mapping shared by file and dict configuration."""
-    from torchturbo.parallel import (
-        FSDPParallelPlan,
-        FSDPPlanSpec,
-        VisionBalanceMode,
-        VisionBalanceSpec,
-    )
-
-    spec_fields = [f.name for f in dataclasses.fields(FSDPPlanSpec)]
-    plan_entries = {}
-    for fqn, spec_d in (parallel_d.get("plan") or {}).items():
-        spec_kwargs = {f: spec_d.get(f) for f in spec_fields}
-        vision_d = spec_kwargs["vision_balance"]
-        if vision_d is not None:
-            mode = vision_d.get("mode")
-            spec_kwargs["vision_balance"] = VisionBalanceSpec(
-                mode=VisionBalanceMode(mode) if mode is not None else None,
-            )
-        plan_entries[fqn] = FSDPPlanSpec(**spec_kwargs)
-    return FSDPParallelPlan(
-        plan=plan_entries,
-        sp_size=parallel_d.get("sp_size", 1),
-        ep_size=parallel_d.get("ep_size", 1),
-    )
-
-
 def _dataclass_config_paths(
     config_type: type[Any],
     parents: tuple[str, ...],
@@ -1180,6 +1193,7 @@ def _validate_config_file(data: Mapping[str, Any], parents: tuple[str, ...] = ()
             "backend_config.cpu_offload.enabled",
             "backend_config.cpu_offload.mode",
             "backend_config.cpu_offload.optimizer_memory_fraction",
+            "freeze_policy.patterns",
         }
     )
     allowed.update(_dataclass_config_paths(OptimizerConfig, ("optimizer",)))
@@ -1301,7 +1315,17 @@ def _build_moe_config(fields: Mapping[str, Any]) -> MoEConfig:
     return MoEConfig(
         aux_loss_coeff=float(moe_d.get("aux_loss_coeff", 0.0)),
         z_loss_coeff=float(moe_d.get("z_loss_coeff", 0.0)),
+        token_dispatcher=moe_d.get("token_dispatcher", "alltoall"),
     )
+
+
+def _as_entry_list(value: Any) -> list[Any]:
+    """Normalize an absent/scalar/list config value into an entry list."""
+    if value is None:
+        return []
+    if isinstance(value, (str, ParameterGroup)):
+        return [value]
+    return list(value)
 
 
 def _build_freeze_policy(fields: Mapping[str, Any]) -> FreezePolicy:
@@ -1319,7 +1343,8 @@ def _build_freeze_policy(fields: Mapping[str, Any]) -> FreezePolicy:
         )
         if enabled
     ]
-    return FreezePolicy.from_list(groups)
+    patterns = _as_entry_list(freeze_d.get("patterns"))
+    return FreezePolicy.from_list([*groups, *patterns])
 
 
 def _build_mfu_config(fields: Mapping[str, Any]) -> MfuConfig:
