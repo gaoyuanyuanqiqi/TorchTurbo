@@ -31,7 +31,6 @@ from .test_ple_distributed import _init_process_group
 pytestmark = [
     pytest.mark.cpu,
     pytest.mark.rank_2,
-    pytest.mark.skip(reason="Qwen4 tests temporarily skipped"),
 ]
 
 

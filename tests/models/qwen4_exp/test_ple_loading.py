@@ -20,7 +20,6 @@ from .test_ple import adapted, new_reference
 
 pytestmark = [
     pytest.mark.cpu,
-    pytest.mark.skip(reason="Qwen4 tests temporarily skipped"),
 ]
 
 

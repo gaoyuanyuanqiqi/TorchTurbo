@@ -475,8 +475,8 @@ def test_packed_compress_metadata():
         ),
         (
             5,
-            [[1, 2, 0], [3, 0, 0]],
-            [[0, 7, 0], [2, 0, 0]],
+            [[1, 2], [3, 0]],
+            [[0, 7], [2, 0]],
         ),
     ):
         actual_ids, actual_positions = packing_utils.packed_compress_kv_ids_and_positions(

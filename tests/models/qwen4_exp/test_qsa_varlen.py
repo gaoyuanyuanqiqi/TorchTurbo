@@ -19,9 +19,6 @@ from .test_model import _token_ids_to_mask
 from .test_qsa_attention import _cpu_varlen_kernel, _flash_kwargs
 
 
-pytestmark = pytest.mark.skip(reason="Qwen4 tests temporarily skipped")
-
-
 def _reference_attention(inputs, token_ids, scale=None, target_dtype=None):
     dtype = (
         target_dtype

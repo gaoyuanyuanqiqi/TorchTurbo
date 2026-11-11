@@ -21,7 +21,7 @@
 TorchTurbo 的情况不同：
 
 - 11 个模型族，当前测试集中在 `tests/models/<family>/`；
-- 同时存在 default 5.5.4、Swift 5.9.0、qwen4_exp 5.22 三套 Python 依赖；
+- 同时存在 default 5.5.4、Swift/qwen4_exp 5.9.0 两套 transformers pin；
 - LF / Swift 是两套真实训练框架，不能简单共用一个全局环境；
 - 8 卡 NPU runner 稀缺，按 env 拆 job 会让同一批 e2e 排队多次。
 
@@ -181,8 +181,8 @@ image = "default"      # 只有 ABI 不同才覆盖
 
 未声明的模型使用 `env = "default"`、`image = "default"`，不需要重复登记。
 
-E2E 不使用这张表选 env：同一个模型可能同时有 LF 和 Swift，qwen4_exp+Swift 的
-transformers pin 也可能与普通 Swift 不同，因此 e2e 的 env 必须写在 case 上。
+E2E 不使用这张表选 env：同一个模型可能同时有 LF 和 Swift，qwen4_exp+Swift
+也可能有独立依赖，因此 e2e 的 env 必须写在 case 上。
 
 env 判定看**显式 import 闭包**，不看目录名：
 

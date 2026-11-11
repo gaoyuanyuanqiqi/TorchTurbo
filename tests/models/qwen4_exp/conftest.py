@@ -7,6 +7,14 @@ import pytest
 import torch.distributed as dist
 
 from torchturbo.models.modules.cpu_resident import NodeSharedCPUResidentParameter
+from torchturbo.ops import get_or_create_ops
+from torchturbo.runtime.cpu import CpuRuntime
+
+
+@pytest.fixture(autouse=True)
+def configure_cpu_ops(request):
+    if request.node.get_closest_marker("cpu") is not None:
+        get_or_create_ops(device_runtime=CpuRuntime())
 
 
 @pytest.fixture

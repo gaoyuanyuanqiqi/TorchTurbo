@@ -19,7 +19,6 @@ from torchturbo.utils.flash_attn_utils import cu_seqlens_to_segment_ids
 
 pytestmark = [
     pytest.mark.cpu,
-    pytest.mark.skip(reason="Qwen4 tests temporarily skipped"),
 ]
 
 

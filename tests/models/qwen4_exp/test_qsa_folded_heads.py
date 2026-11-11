@@ -17,7 +17,6 @@ from .test_qsa_attention import _cpu_varlen_kernel, _flash_kwargs
 
 pytestmark = [
     pytest.mark.cpu,
-    pytest.mark.skip(reason="Qwen4 tests temporarily skipped"),
 ]
 
 

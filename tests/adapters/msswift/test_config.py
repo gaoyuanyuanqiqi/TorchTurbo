@@ -151,6 +151,7 @@ def test_native_derived_eval_settings_are_checked_during_config_build(tmp_path, 
         val_dataset=["validation-data"] if validation_dataset else [],
         output_dir=str(tmp_path / "output"), add_version=False,
         tuner_type="full", report_to=[], use_cpu=True, check_model=False,
+        bf16=True, fp16=False,
     )
     _set_tt()
     expected_strategy = "steps" if validation_dataset else "no"
@@ -176,7 +177,7 @@ def test_native_dpo_args_build_config(tmp_path, padding_free):
         router_aux_loss_coef=0.02,
         attn_impl="flash_attn", output_dir=str(tmp_path / "output"),
         add_version=False, tuner_type="full", report_to=[], use_cpu=True,
-        check_model=False,
+        check_model=False, bf16=True, fp16=False,
     )
     # The layout stays the user's choice; the collator flattens either one.
     assert args.padding_free is padding_free
