@@ -1,4 +1,5 @@
-name: Ascend CI
+name: Ascend-PR-CI
+run-name: Ascend-PR-CI ${{ github.event.pull_request.number && format('#{0}', github.event.pull_request.number) || github.ref_name }}
 
 # Sole entry point: mode=pr (gate a PR on the diff) or mode=full.
 # Lanes are inlined -- a `uses:` job renders as "caller / callee" on the graph.
@@ -70,7 +71,7 @@ env:
 
 jobs:
   select:
-    name: Ascend lint-select
+    name: Ascend-PR-Lint-Select
     # Lint and selection are strictly serial and together take seconds, so they
     # share one runner and one full checkout. Keep them in separate steps: a lint
     # failure then naturally prevents a plan, without another `needs` edge.
@@ -173,7 +174,7 @@ jobs:
   # One matrix entry per CPU image from the plan. Dependencies are
   # isolated inside the job by venv, so model and framework count do not add boxes.
   l1_cpu_unit:
-    name: Ascend CPU unit (${{ matrix.id }})
+    name: Ascend-PR-CPU-Unit (${{ matrix.id }})
     needs: select
     if: |
       always() && needs.select.result == 'success' &&
@@ -228,7 +229,7 @@ jobs:
   # NPU unit and E2E are separate matrix entries. Each entry selects the
   # smallest lane that can hold its own process/card requirement.
   l2_npu:
-    name: Ascend NPU tests (${{ matrix.id }})
+    name: Ascend-PR-NPU-Unit (${{ matrix.id }})
     needs: select
     # Fork PRs get no secrets, and handing secrets to fork code is RCE.
     if: |
@@ -314,7 +315,7 @@ jobs:
   # Sole required check; the rules live in report_gate.py so pr/full cannot drift.
   # select is a direct dep: a failed plan skips the lanes in seconds.
   gate:
-    name: Ascend gate
+    name: Ascend-PR-Gate
     needs: [select, l1_cpu_unit, l2_npu]
     # always() so lanes' results are judged even when select failed; the label
     # guard mirrors select, or a manual-label run would judge an empty plan.

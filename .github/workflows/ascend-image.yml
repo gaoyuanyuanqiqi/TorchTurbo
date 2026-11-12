@@ -1,4 +1,5 @@
-name: Ascend Image
+name: Ascend-Image-CI
+run-name: Ascend-Image-CI ${{ inputs.runner || 'ubuntu-22.04-arm' }}
 
 # Build the L1 base image and publish it to SWR.
 # Manual dispatch only: one build can take 4-5 hours and many GB of bandwidth.
@@ -58,7 +59,7 @@ env:
 
 jobs:
   build-base:
-    name: Ascend build base (${{ inputs.runner || 'ubuntu-22.04-arm' }})
+    name: Ascend-Image-Build (${{ inputs.runner || 'ubuntu-22.04-arm' }})
     runs-on: ${{ inputs.runner || 'ubuntu-22.04-arm' }}
     # Hosted runners stop at 6 hours; leave time for cleanup and summary.
     timeout-minutes: 350
