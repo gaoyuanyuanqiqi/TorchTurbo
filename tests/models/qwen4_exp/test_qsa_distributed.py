@@ -20,6 +20,7 @@ from torchturbo.models.modules.attention.ulysses import all_gather_sp_with_grad_
 from torchturbo.models.qwen4_exp import qsa
 from torchturbo.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpTextAttention
 from torchturbo.runtime.npu import NpuRuntime
+from tests.support.distributed import destroy_process_group
 
 from ..flash_attention_fakes import lazy_flash_attention_kernels
 from .test_model import _small_config
@@ -156,7 +157,7 @@ def _run_qsa(rank: int, init_file: str, ratio12: bool) -> None:
                         checkpoint_mode=checkpoint_mode,
                     )
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 @pytest.mark.cpu
@@ -198,7 +199,7 @@ def _run_native_qsa_varlen(rank: int, init_file: str, dtype: torch.dtype) -> Non
             dist.barrier()
             torch.npu.synchronize()
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 def _check_native_qsa_varlen(

@@ -9,6 +9,7 @@ import torch.distributed as dist
 from torchturbo.models.modules.cpu_resident import NodeSharedCPUResidentParameter
 from torchturbo.ops import get_or_create_ops
 from torchturbo.runtime.cpu import CpuRuntime
+from tests.support.distributed import destroy_process_group
 
 
 @pytest.fixture(autouse=True)
@@ -27,5 +28,5 @@ def node_group(tmp_path_factory, monkeypatch):
     try:
         yield
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
         NodeSharedCPUResidentParameter._node_group = None

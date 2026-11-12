@@ -29,6 +29,7 @@ from torchturbo.engine.optimizers import (
 )
 from torchturbo.runtime.cpu import CpuRuntime
 from torchturbo.utils.torch_utils import torch_version
+from tests.support.distributed import destroy_process_group
 
 
 pytestmark = pytest.mark.cpu
@@ -515,7 +516,7 @@ def _run_distributed_muon_test(
 
         step_and_check()
     finally:
-        dist.destroy_process_group()
+        destroy_process_group()
 
 
 @pytest.mark.skipif(

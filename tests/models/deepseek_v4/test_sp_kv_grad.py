@@ -17,6 +17,7 @@ for path in (SRC_ROOT, REPO_ROOT):
 from torchturbo.models.modules.attention.ulysses import (  # noqa: E402
     all_gather_sp_with_grad_reduce,
 )
+from tests.support.distributed import destroy_process_group  # noqa: E402
 
 pytestmark = pytest.mark.cpu
 
@@ -87,7 +88,7 @@ def _worker(rank, world_size, init_file, device_kind):
     assert rel_err < 1e-4, f"sp=2 grads differ from sp=1, rel_err={rel_err}"
 
     dist.barrier()
-    dist.destroy_process_group()
+    destroy_process_group()
 
 
 def _npu_available():
