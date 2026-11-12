@@ -295,7 +295,7 @@ jobs:
           SEQ_LEN: '4096'
           DATASET_IN: 'gsm8k'
           FINETUNING_TYPE: 'full'
-          FETCH_TIMEOUT: '600'
+          FETCH_TIMEOUT: '1800'
           RESULT_JSON: /tmp/ci-result.json
         run: bash scripts/ci/e2e_tests/run_train.sh lane
 

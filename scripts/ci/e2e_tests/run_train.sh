@@ -25,7 +25,7 @@ MAP="${MAP:-.github/workflows/model_map.json}"
 : "${MODEL_TYPE:=}"; : "${CASE_ID:=}"; : "${FRAMEWORK:=lf}"; : "${ENV_NAME:=}"; : "${RUNNER_LABEL:=}"
 : "${IMAGE:=}"; : "${LAYERS:=0}"; : "${MODEL_HINT:=}"; : "${REPO_IN:=}"
 : "${SEQ_LEN:=1024}"; : "${FINETUNING_TYPE:=full}"; : "${DATASET_IN:=gsm8k}"; : "${DATASET:=${DATASET_IN}}"
-: "${FETCH_TIMEOUT:=3600}"; : "${CASE_TIMEOUT:=7200}"; : "${STRICT:=false}"; : "${E2E_CASES:=[]}"
+: "${FETCH_TIMEOUT:=1800}"; : "${CASE_TIMEOUT:=7200}"; : "${E2E_CASES:=[]}"
 : "${INSTALL_SCRIPT:=}"; : "${TRAIN_SCRIPT:=}"; : "${HF_REPO:=}"
 
 export HF_MODULES_CACHE="${HF_MODULES_CACHE:-/tmp/hf-modules}"
@@ -69,7 +69,7 @@ cmd_plan() {
   # case state before that boundary, otherwise the child sees empty scripts.
   export CASE_ID FRAMEWORK ENV_NAME MODEL_TYPE LAYERS DATASET_IN \
     RUN_DIR INSTALL_SCRIPT TRAIN_SCRIPT HF_REPO REPO_IN MODEL_HINT \
-    PLAN_CARDS PLAN_SP PLAN_EP RESULT_JSON STRICT
+    PLAN_CARDS PLAN_SP PLAN_EP RESULT_JSON
 
   echo "case=$CASE_ID model_type=$MODEL_TYPE framework=$FRAMEWORK env=$ENV_NAME run_dir=$RUN_DIR train=$TRAIN_SCRIPT repo=$HF_REPO"
   echo "plan: cards=$PLAN_CARDS sp=$PLAN_SP ep=$PLAN_EP"
@@ -149,15 +149,14 @@ cmd_prepare() {
     return 1
   fi
 
-  skip_out() {  # skip_out <reason> <seconds>
-    echo "::warning::$1"
+  fail_fetch() {  # fail_fetch <reason> <seconds>
+    echo "::error::$1"
     echo "skip_reason=$1" >> "$GITHUB_OUTPUT"
     # Cases run in a subshell, so the reason leaves through a file as well.
     [ -n "${SKIP_FILE:-}" ] && printf '%s\n' "$1" >> "$SKIP_FILE"
     result set --file "$RESULT_JSON" skip_reason="$1"
-    result phase --file "$RESULT_JSON" --name '模型获取' --seconds "$2" --rc 0
-    [ "${STRICT:-false}" = "true" ] && return 1
-    return 3
+    result phase --file "$RESULT_JSON" --name '模型获取' --seconds "$2" --rc 1
+    return 1
   }
 
   local MODEL="" BYTES=0 SHARDS=0 HIT=no CARDS="" SP="" EP="" TT_CONFIG=""
@@ -187,7 +186,7 @@ cmd_prepare() {
   prepared=$(timeout "$FETCH_TIMEOUT" python3 "$MODEL_HELPER" "${args[@]}")
   trc=$?
   if [ "$trc" -eq 124 ]; then
-    skip_out "model-fetch-timeout(${FETCH_TIMEOUT}s)" "$(( $(date +%s) - start ))"
+    fail_fetch "model-fetch-timeout(${FETCH_TIMEOUT}s)" "$(( $(date +%s) - start ))"
     return $?
   fi
   if [ "$trc" -ne 0 ]; then
@@ -395,7 +394,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   case "${1:-}" in
     plan) cmd_plan ;;
     install) cmd_install ;;
-    run) cmd_run; rc=$?; [ "$rc" -eq 3 ] && exit 0; exit "$rc" ;;
+    run) cmd_run ;;
     report) cmd_report ;;
     lane) cmd_lane ;;
     *) echo "用法：$0 {plan|install|run|report|lane}" >&2; exit 2 ;;

@@ -239,8 +239,8 @@ def judge_pr() -> int:
                     why=_lane_why(key, why, sel_bad),
                 )
 
-    # 跑起来了但自己宣告跳过（模型获取超时）：记 skipped-reason，
-    # 默认判绿，只有 ci:e2e:strict 才判红。
+    # 跑起来了但自己宣告跳过（显式白名单原因）：记 skipped-reason，
+    # 默认判绿，只有 ci:e2e:strict 才判红。模型获取超时不属于此列。
     skip_reason = _env("SKIP_REASON")
     if skip_reason and results[TRAINING_LANE] == "success":
         rep.note("NPU 训练跳过原因", f"⚠️ {skip_reason}")

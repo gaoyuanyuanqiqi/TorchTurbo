@@ -116,10 +116,7 @@ def _job(catalog: CiCatalog, image: str, device: str, stage: str,
         "e2e": defaultdict(list),
     }
     if stage == "e2e":
-        job["e2e_defaults"] = {
-            "fetch_timeout": catalog.e2e_defaults.fetch_timeout,
-            "case_timeout": catalog.e2e_defaults.case_timeout,
-        }
+        job["e2e_defaults"] = dict(catalog.e2e_defaults)
     return job
 
 
@@ -313,10 +310,7 @@ def verify(catalog: CiCatalog, test_facts: dict[str, TestFacts],
         ))
     if len({job["id"] for job in sample_npu_jobs}) != len(sample_npu_jobs):
         failures.append(PlanError("verify", "NPU jobs must have unique ids"))
-    expected_e2e_defaults = {
-        "fetch_timeout": catalog.e2e_defaults.fetch_timeout,
-        "case_timeout": catalog.e2e_defaults.case_timeout,
-    }
+    expected_e2e_defaults = dict(catalog.e2e_defaults)
     for job in sample_npu_jobs:
         if job["stage"] == "e2e" and job.get("e2e_defaults") != expected_e2e_defaults:
             failures.append(PlanError(

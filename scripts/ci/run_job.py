@@ -80,10 +80,10 @@ def _e2e_environment(venv: Venv, step: dict[str, Any], result_json: Path,
         "DATASET_IN": os.environ.get("DATASET_IN", "gsm8k"),
         "FINETUNING_TYPE": os.environ.get("FINETUNING_TYPE", "full"),
         "FETCH_TIMEOUT": os.environ.get(
-            "FETCH_TIMEOUT", str(defaults.get("fetch_timeout", 3600))
+            "FETCH_TIMEOUT", str(defaults["fetch_timeout"])
         ),
         "CASE_TIMEOUT": os.environ.get(
-            "CASE_TIMEOUT", str(defaults.get("case_timeout", 7200))
+            "CASE_TIMEOUT", str(defaults["case_timeout"])
         ),
     })
     return environment

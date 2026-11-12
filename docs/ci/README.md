@@ -351,7 +351,7 @@ PR / 全量的 `select` 用 `--repo "$GITHUB_REPOSITORY"` 读最近一份。解�
 |---|---|
 | `ci:full` | 三条泳道全量，E2E 跑全部用例 |
 | `ci:e2e` | 路径没命中时也强制跑 NPU 泳道（起 NPU + 最便宜的用例） |
-| `ci:e2e:strict` | E2E 因模型超时跳过时**判红**；默认是「跳过但绿」 |
+| `ci:e2e:strict` | E2E 显式跳过时**判红**；模型获取超时始终判红 |
 | `ci:skip-npu` | 强制关掉所有 NPU 泳道（含 E2E），hotfix 用；将来是 `ci:skip-<device>` |
 
 标签的语义在 `scripts/ci/lint_select/select_tests.py` 的 `flags_from_event()` 里，**不在 yaml**
@@ -454,7 +454,7 @@ timeout-minutes: ${{ fromJSON(inputs.timeout_minutes || 60) }}
 
 端到端用几张卡、sp/ep 各是多少，写在 `model_map.json` 每个 case 的
 `cards` / `sp` / `ep` 里。E2E 的 `fetch_timeout` / `case_timeout` 是执行策略，
-统一写在 `scripts/ci/lanes.yml` 的 `e2e_defaults` 中，默认分别是 3600s / 7200s；
+统一写在 `scripts/ci/lanes.yml` 的 `e2e_defaults` 中，默认分别是 1800s / 7200s；
 需要手工排查时可用同名环境变量覆盖。
 
 **不从 runner 标签推断**：真实标签带位置后缀（`...-8-cn12-001`），取末段会得到
@@ -495,7 +495,7 @@ python3 scripts/ci/common/env_pod.py check   --file /tmp/t.json
 
 ```bash
 run() { env R_SEL=$1 SEL_FAILED_STEP=$2 R_CPU_UNIT=$3 R_NPU_UNIT=$4 R_NPU_E2E=$5 \
-  CPU_UNIT_RUN=$6 NPU_UNIT_RUN=$7 NPU_E2E_RUN=$8 STRICT=false SUMMARY=t \
+  CPU_UNIT_RUN=$6 NPU_UNIT_RUN=$7 NPU_E2E_RUN=$8 SUMMARY=t \
   python3 scripts/ci/report/report_gate.py judge --mode pr; }
 
 run success none     skipped skipped skipped false false false  # 改文档：什么都不跑

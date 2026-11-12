@@ -365,7 +365,8 @@ plan 阶段 fail：
 2. torch / torch_npu / numpy 被替换；
 3. 任一 pytest group 或 e2e case 失败；
 4. job 超时或 NPU 子进程未清理；
-5. skip 原因不在 lane 白名单。
+5. 模型获取超时；
+6. skip 原因不在 lane 白名单。
 
 gate 只读每个 device job 的结果，不再分别判断 NPU unit 和 E2E。fork PR 的
 NPU job 不执行是设计内跳过；`ci:e2e:strict` 仍由统一 NPU job 的 skip reason 判定。

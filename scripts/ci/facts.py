@@ -54,12 +54,6 @@ class LaneSpec:
 
 
 @dataclass(frozen=True)
-class E2eDefaults:
-    fetch_timeout: int = 3600
-    case_timeout: int = 7200
-
-
-@dataclass(frozen=True)
 class E2eCase:
     model: str
     run_dir: str
@@ -123,7 +117,7 @@ class CiCatalog:
     cases: tuple[E2eCase, ...]
     model_envs: dict[str, ModelEnv]
     test_envs: dict[str, str]
-    e2e_defaults: E2eDefaults = field(default_factory=E2eDefaults)
+    e2e_defaults: dict[str, int] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
 
     @property
@@ -270,24 +264,26 @@ def _load_lanes(path: Path, errors: list[str]) -> dict[str, LaneSpec]:
     return lanes
 
 
-def _load_e2e_defaults(path: Path, errors: list[str]) -> E2eDefaults:
-    raw = _read_yaml(path, errors).get("e2e_defaults") or {}
+def _load_e2e_defaults(path: Path, errors: list[str]) -> dict[str, int]:
+    raw = _read_yaml(path, errors).get("e2e_defaults")
     if not isinstance(raw, dict):
         errors.append(f"{path}: e2e_defaults must be a mapping")
-        return E2eDefaults()
+        return {}
+    missing = [key for key in ("fetch_timeout", "case_timeout") if key not in raw]
+    if missing:
+        errors.append(f"{path}: e2e_defaults missing {', '.join(missing)}")
+        return {}
     try:
-        defaults = E2eDefaults(
-            fetch_timeout=int(raw.get("fetch_timeout", 3600)),
-            case_timeout=int(raw.get("case_timeout", 7200)),
-        )
+        fetch_timeout = int(raw["fetch_timeout"])
+        case_timeout = int(raw["case_timeout"])
     except (TypeError, ValueError):
         errors.append(f"{path}: e2e_defaults values must be integers")
-        return E2eDefaults()
-    if defaults.fetch_timeout < 1 or defaults.case_timeout <= defaults.fetch_timeout:
+        return {}
+    if fetch_timeout < 1 or case_timeout <= fetch_timeout:
         errors.append(
             f"{path}: e2e_defaults requires 0 < fetch_timeout < case_timeout"
         )
-    return defaults
+    return {"fetch_timeout": fetch_timeout, "case_timeout": case_timeout}
 
 
 def _load_model_envs(path: Path, envs: dict[str, EnvSpec],
