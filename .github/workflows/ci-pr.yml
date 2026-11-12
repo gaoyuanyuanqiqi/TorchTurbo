@@ -287,8 +287,6 @@ jobs:
           SEQ_LEN: '4096'
           DATASET_IN: 'gsm8k'
           FINETUNING_TYPE: 'full'
-          FETCH_TIMEOUT: '600'
-          CASE_TIMEOUT: '1500'
         run: python3 scripts/ci/run_job.py --job-json "$JOB"
 
       - name: summary
