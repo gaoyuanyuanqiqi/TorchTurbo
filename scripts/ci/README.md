@@ -108,15 +108,17 @@ python3 scripts/ci/local_lint_select_test.py --only docker
 被下面这些 workflow 调用，`.github/workflows` 里的入口只负责声明输入：
 
 ```
-ci-pr.yml          唯一入口  select{lint,plan} -> {cpu, npu, gpu matrix} -> gate
-                    mode=pr（PR 门禁） / mode=full（全量，不选测）
-ci-image.yml        构建基础镜像（**只手动 dispatch**）
-model_map.json      模型 -> 启动脚本 / 权重 / 端到端用例（被上面两个读）
+ascend-pr.yml       唯一入口  select{lint,plan} -> {cpu, npu, gpu matrix} -> gate
+                    mode=pr（PR 门禁） / mode=full（全量，不选测）；可被 nightly 复用
+ascend-manual.yml   手动单泳道（dispatch 或 ci:manual:<lane> 标签）
+ascend-image.yml    构建基础镜像（**只手动 dispatch**）
+ascend-nightly.yml  全量 nightly 入口（schedule 暂注释，只支持手动 dispatch）
+model_map.json      模型 -> 启动脚本 / 权重 / 端到端用例（被主 CI 读取）
 pytest.ini          测试根 / 导入路径 / marker 契约（与 select_tests.py 交叉校验）
 ```
 
-三条泳道**内联**在 `ci-pr.yml` 里，不是可复用 workflow：`uses:` 的 job 一律
-显示成 `调用方名 / 被调方名`，图上的泳道名就只能是两段。
+三条泳道**内联**在 `ascend-pr.yml` 里。`ascend-nightly.yml` 只调用这个入口，
+不复制 job：`uses:` 的 job 会显示成 `调用方名 / 被调方名`。
 
 yaml 里只留「输什么、调哪个脚本」，超过 10 行的 bash 一律下沉到这里。
 除语法高亮之外的好处是 **shellcheck / actionlint 能看**，而且改一行能在本机验。

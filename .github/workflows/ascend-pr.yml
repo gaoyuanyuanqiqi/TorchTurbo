@@ -1,4 +1,4 @@
-name: CI
+name: Ascend CI
 
 # Sole entry point: mode=pr (gate a PR on the diff) or mode=full.
 # Lanes are inlined -- a `uses:` job renders as "caller / callee" on the graph.
@@ -7,6 +7,24 @@ name: CI
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+  workflow_call:
+    inputs:
+      mode:
+        required: false
+        default: 'pr'
+        type: string
+      force_all:
+        required: false
+        default: false
+        type: boolean
+      with_e2e:
+        required: false
+        default: false
+        type: boolean
+      test_path:
+        required: false
+        default: '-'
+        type: string
   workflow_dispatch:
     inputs:
       mode:
@@ -35,7 +53,7 @@ on:
 
 # A shared group with cancel-in-progress: false still cancels *pending* jobs and
 # once wedged this queue. So: PRs cancel per PR, full runs never queue.
-# ci:manual:* labels are ci-manual.yml's triggers; a separate group keeps the
+# ci:manual:* labels are ascend-manual.yml's triggers; a separate group keeps the
 # resulting no-op run from cancelling a real CI run.
 concurrency:
   group: ci-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || format('full-{0}', github.run_id) }}${{ startsWith(github.event.label.name || '', 'ci:manual:') && '-manual-label' || '' }}
@@ -52,11 +70,11 @@ env:
 
 jobs:
   select:
-    name: lint-select
+    name: Ascend lint-select
     # Lint and selection are strictly serial and together take seconds, so they
     # share one runner and one full checkout. Keep them in separate steps: a lint
     # failure then naturally prevents a plan, without another `needs` edge.
-    # ci:manual:* exists to run one lane via ci-manual.yml. Without this guard a
+    # ci:manual:* exists to run one lane via ascend-manual.yml. Without this guard a
     # manual label also starts a full CI run, which is both slow and confusing.
     if: ${{ !startsWith(github.event.label.name || '', 'ci:manual:') }}
     runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
@@ -99,7 +117,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # --repo enables the artifact lookup published by ci-image.yml.
+          # --repo enables the artifact lookup published by ascend-image.yml.
           REF=$(python3 scripts/ci/image/build_image.py resolve --override "$OVERRIDE" \
             --repo "$GITHUB_REPOSITORY" \
             --fallback 'swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:base-latest')
@@ -113,8 +131,8 @@ jobs:
         id: select
         env:
           LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
-          WITH_E2E: ${{ github.event_name == 'workflow_dispatch' && inputs.with_e2e }}
-          FORCE_INPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.force_all }}
+          WITH_E2E: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && inputs.with_e2e }}
+          FORCE_INPUT: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && inputs.force_all }}
           BASE_REF: origin/${{ github.base_ref || 'main' }}
         run: |
           set -uo pipefail
@@ -155,7 +173,7 @@ jobs:
   # One matrix entry per CPU image from the plan. Dependencies are
   # isolated inside the job by venv, so model and framework count do not add boxes.
   l1_cpu_unit:
-    name: cpu-unit-tests (${{ matrix.id }})
+    name: Ascend CPU unit (${{ matrix.id }})
     needs: select
     if: |
       always() && needs.select.result == 'success' &&
@@ -210,7 +228,7 @@ jobs:
   # NPU unit and E2E are separate matrix entries. Each entry selects the
   # smallest lane that can hold its own process/card requirement.
   l2_npu:
-    name: npu-tests (${{ matrix.id }})
+    name: Ascend NPU tests (${{ matrix.id }})
     needs: select
     # Fork PRs get no secrets, and handing secrets to fork code is RCE.
     if: |
@@ -296,7 +314,7 @@ jobs:
   # Sole required check; the rules live in report_gate.py so pr/full cannot drift.
   # select is a direct dep: a failed plan skips the lanes in seconds.
   gate:
-    name: gate
+    name: Ascend gate
     needs: [select, l1_cpu_unit, l2_npu]
     # always() so lanes' results are judged even when select failed; the label
     # guard mirrors select, or a manual-label run would judge an empty plan.

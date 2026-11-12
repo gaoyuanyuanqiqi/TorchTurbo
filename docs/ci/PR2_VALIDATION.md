@@ -3,7 +3,7 @@
 ## 范围
 
 - `plan.py` 输出 CPU `cpu_jobs` matrix。
-- `ci-pr.yml` 的 `cpu-unit-tests` 改为 matrix，每个 entry 执行一个 plan job。
+- `ascend-pr.yml` 的 `cpu-unit-tests` 改为 matrix，每个 entry 执行一个 plan job。
 - `run_job.py` 按 step 顺序创建 / 复用 venv，逐进程运行 pytest 并汇总 JUnit。
 - `venv_manager.py` 以依赖内容和 Python 版本生成 cache key；不删除共享 cache。
 - `env_pod.py` 增加 `--device cpu`，CPU 分支不访问 davinci 或 torch_npu。

@@ -1315,7 +1315,7 @@ def verify(root: Path) -> int:
           and not r["lanes"]["npu_unit"]["run"]
           and [e["case_id"] for e in r["e2e_cases"]] == ["bailing_hybrid-lf-sft"],
           f"{r['mode']} {lane_runs(r)}")
-    r = sel(".github/workflows/ci-pr.yml")
+    r = sel(".github/workflows/ascend-pr.yml")
     check("workflow edit -> tiny E2E fallback",
           [e["case_id"] for e in r["e2e_cases"]] == ["bailing_hybrid-lf-sft"],
           str(r["e2e_cases"]))

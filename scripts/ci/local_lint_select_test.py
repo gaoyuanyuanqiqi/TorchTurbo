@@ -64,7 +64,7 @@ def check(name: str, ok: bool, detail: str = "") -> bool:
 
 def select(files: list[str], labels: str = "", mode: str | None = None,
            image: str = "-") -> dict:
-    """Run the selector the way ci-pr.yml does and return its GITHUB_OUTPUT."""
+    """Run the selector the way ascend-pr.yml does and return its GITHUB_OUTPUT."""
     out, summary = Path(tempfile.mktemp()), Path(tempfile.mktemp())
     cmd = [sys.executable, str(SELECTOR), "--github-output", str(out),
            "--summary-file", str(summary), "--image-ref", image,
@@ -176,7 +176,7 @@ SCENARIOS = [
     dict(name="ci script", files=["scripts/ci/lint_select/select_tests.py"], expect="all",
          cpu=True, npu=False, e2e=True, e2e_models=["bailing_hybrid"],
          full_reason="ci-config-changed"),
-    dict(name="workflow config", files=[".github/workflows/ci-pr.yml"], expect="all",
+    dict(name="workflow config", files=[".github/workflows/ascend-pr.yml"], expect="all",
          cpu=True, npu=False, e2e=True, e2e_models=["bailing_hybrid"],
          full_reason="ci-config-changed"),
     dict(name="shared env deps", files=["scripts/ci/envs/common.txt"], expect="all",
@@ -290,7 +290,7 @@ def step_scenarios(only: str) -> None:
 
 def step_contract() -> None:
     print("\n[4/5] selector <-> workflow contract")
-    text = (WORKFLOWS / "ci-pr.yml").read_text(encoding="utf-8")
+    text = (WORKFLOWS / "ascend-pr.yml").read_text(encoding="utf-8")
     block = job_block(text, "select")
     declared = set(re.findall(r"^      ([a-z0-9_]+): \$\{\{ steps\.", block, re.M))
     # Outputs the selector itself must fill; `image` and `failed_step` come from

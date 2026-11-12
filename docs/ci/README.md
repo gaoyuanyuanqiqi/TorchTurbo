@@ -1,16 +1,17 @@
 # CI 体系
 
-**三个 workflow，一个必过检查（`gate`）。** 改动的路径决定跑哪几条泳道，其余一律跳过——
+**四个 workflow，一个必过检查（`gate`）。** 改动的路径决定跑哪几条泳道，其余一律跳过——
 但**跳过必须带原因**，否则门禁判红。
 
 ```
 .github/workflows/
-  ci-pr.yml          唯一入口：mode=pr 选测门禁 / mode=full 全量
-  ci-manual.yml      手动单泳道（无 lint / 无 select / 无 gate，排查用）
-  ci-image.yml        构建基础镜像（只手动）
+  ascend-pr.yml      唯一入口：mode=pr 选测门禁 / mode=full 全量
+  ascend-manual.yml  手动单泳道（无 lint / 无 select / 无 gate，排查用）
+  ascend-image.yml   构建基础镜像（只手动）
+  ascend-nightly.yml 全量 nightly 包装入口（schedule 暂注释）
   model_map.json      模型 -> 下载 / 安装 / 启动 / 训练参数
 
-pull_request ──► ci-pr.yml
+pull_request ──► ascend-pr.yml
                    ├─ select   静态检查（Ruff / shellcheck / actionlint / hadolint
                    │           / 映射表 / job 图契约 / 选择器防篡改）
                    │           然后算改动 → 出计划（泳道开关 + 文件清单）
@@ -20,8 +21,9 @@ pull_request ──► ci-pr.yml
                    ├─ npu-e2e-tests     E2E：按模型训练用例逐个跑一步
                    └─ gate     唯一 required check
 
-手动 ─────────────► ci-pr.yml（mode 选 pr / full） / ci-image.yml
-单泳道排查 ───────► ci-manual.yml（dispatch 或 ci:manual:<lane> 标签）
+手动 ─────────────► ascend-pr.yml（mode 选 pr / full） / ascend-image.yml
+单泳道排查 ───────► ascend-manual.yml（dispatch 或 ci:manual:<lane> 标签）
+全量 nightly ─────► ascend-nightly.yml（自动 schedule 暂注释）
 ```
 
 测试配置在仓库根的 `pytest.ini`：测试根、导入路径、marker 契约。**不放进
@@ -137,10 +139,10 @@ NPU unit 可能占用其中一个槽位，但模型之间不会共享 pod，训�
 写在哪里、怎么恢复都留在原处。恢复后应该是：
 
 ```
-PR ──────────────► ci-pr.yml（select[静态+计划] -> {三条测试泳道} -> gate）
-每晚 ─────────────► ci-pr.yml mode=full（全量，不选测）
-每晚 ─────────────► ci-image.yml（基础镜像，内容没变就跳过）
-手动排查 ─────────► ci-pr.yml mode=pr + force_all（跑全部 CPU/NPU 单测）
+PR ──────────────► ascend-pr.yml（select[静态+计划] -> {三条测试泳道} -> gate）
+每晚 ─────────────► ascend-nightly.yml -> ascend-pr.yml mode=full（全量）
+每晚 ─────────────► ascend-image.yml（基础镜像，内容没变就跳过）
+手动排查 ─────────► ascend-pr.yml mode=pr + force_all（跑全部 CPU/NPU 单测）
 ```
 
 
@@ -314,7 +316,7 @@ PR / 全量的 `select` 用 `--repo "$GITHUB_REPOSITORY"` 读最近一份。解�
 **整条链路不需要任何长期凭据** —— `gh variable set` 对 `GITHUB_TOKEN` 是 403，
 所以才走 artifact。
 
-需要立刻重建（比如怀疑基础镜像坏了）：dispatch `ci-image.yml` 并勾 **force_rebuild**。
+需要立刻重建（比如怀疑基础镜像坏了）：dispatch `ascend-image.yml` 并勾 **force_rebuild**。
 想临时切镜像排查：设仓库变量 `BASE_IMAGE_TAG`，它优先于 artifact。
 
 ## 全量闸门（`full_reasons`）
@@ -370,10 +372,10 @@ fork PR 拿不到 secrets，而两条 NPU 泳道都需要 SWR 凭据。更关键
 ```bash
 git fetch origin pull/123/head:ci/pr-123
 git push origin ci/pr-123
-gh workflow run ci-pr.yml -F ref=ci/pr-123
+gh workflow run ascend-pr.yml -F ref=ci/pr-123
 ```
 
-或者直接 dispatch `ci-pr.yml`：`mode=pr` + `force_all` 跑全部单测，
+或者直接 dispatch `ascend-pr.yml`：`mode=pr` + `force_all` 跑全部单测，
 `mode=full` 连 E2E 一起跑。
 
 ## 时间预算
@@ -411,7 +413,7 @@ gh workflow run ci-pr.yml -F ref=ci/pr-123
 限制上界；实际并发仍由 runner 数量决定，self-hosted runner 忙着的时候，下一个 job
 天然停在 `queued`。要给某个池进一步限流，应该去 ARC / runner group 那一层做。
 
-workflow 级 `concurrency` 现在只留在一个入口文件里（`ci-pr.yml`），并且按
+workflow 级 `concurrency` 现在只留在一个入口文件里（`ascend-pr.yml`），并且按
 模式分 group：PR 用 `pr-<number>`（新 push 顶掉旧 run），全量用 `full-<run_id>`
 （每次唯一，永远排不到队）。
 

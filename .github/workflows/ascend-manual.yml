@@ -1,7 +1,7 @@
-name: Manual lane test
+name: Ascend Manual Lane
 
 # Run ONE lane by hand: no selection, no gate, no sibling lanes, so a red run
-# points at the lane instead of the diff. ci-pr.yml stays the only PR entry.
+# points at the lane instead of the diff. ascend-pr.yml stays the only PR entry.
 #
 # No lint / select here on purpose: this workflow answers "does this lane work",
 # which the PR gate already proves for correct code. Running the selector would
@@ -24,11 +24,11 @@ name: Manual lane test
 # at collection and aborts the whole session in seconds).
 #
 # Unit lanes reuse plan.py and run_job.py, so a manual run installs the same
-# per-test venv profiles as ci-pr.yml. The old unpinned `pip install -e .[test]`
+# per-test venv profiles as ascend-pr.yml. The old unpinned `pip install -e .[test]`
 # path silently moved transformers to 5.22.2 and broke tests written for 5.5.4.
 
 # Without this every run in the list is just "Manual lane test".
-run-name: manual / ${{ inputs.lane || github.event.label.name }} / ${{ github.ref_name }}
+run-name: Ascend manual / ${{ inputs.lane || github.event.label.name }} / ${{ github.ref_name }}
 
 on:
   pull_request:
@@ -93,7 +93,7 @@ env:
 
 jobs:
   cpu_unit:
-    name: cpu-unit-tests
+    name: Ascend CPU unit
     if: >-
       (github.event_name == 'pull_request' && github.event.label.name == 'ci:manual:cpu-unit')
       || (github.event_name == 'workflow_dispatch' && inputs.lane == 'cpu-unit')
@@ -164,7 +164,7 @@ jobs:
             --model-type pytest-cpu-unit || true
 
   npu_unit:
-    name: npu-unit-tests
+    name: Ascend NPU unit
     # Fork PRs get no secrets, and a container pull without them fails opaquely.
     if: |
       ((github.event_name == 'pull_request' && github.event.label.name == 'ci:manual:npu-unit')
@@ -253,7 +253,7 @@ jobs:
         run: python3 scripts/ci/common/env_pod.py cleanup
 
   npu_e2e:
-    name: npu-e2e-tests
+    name: Ascend NPU E2E
     if: |
       ((github.event_name == 'pull_request' && github.event.label.name == 'ci:manual:npu-e2e')
        || (github.event_name == 'workflow_dispatch' && inputs.lane == 'npu-e2e'))

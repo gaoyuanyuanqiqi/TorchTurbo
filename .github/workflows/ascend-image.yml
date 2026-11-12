@@ -1,42 +1,29 @@
-name: CI · 基础镜像
+name: Ascend Image
 
-# 构建 L1 基础镜像（docker/npu/Dockerfile_aarch64）并推到 SWR。
-#
-# **只手动触发**：不挂 schedule、不挂 workflow_call。
-#   一次构建 4~5 h、几十 GB 带宽，而且镜像一旦变，「PR 悄悄换了个基础镜像」
-#   是最难排查的一类问题。所以在基础镜像稳定之前，宁可不自动建，
-#   什么时候建、建完用哪个 tag，由人决定。
-#   需要定时重建时，把下面注释掉的 schedule 打开即可。
-#
-# tag = `base-<年周>-c<8位内容哈希>`：同一份 Dockerfile 永远算出同一个 tag，
-# 所以「建过没有」是问 registry 就能答的无状态查询。年周用来兜住上游漂移
-# （cann 基础镜像、pip 里的 torch 都是同一份 Dockerfile、不同产物）。
-#
-# 全部逻辑在 scripts/ci/image/（env / tag / build / verify / publish /
-# resolve / summary / cleanup）。为什么不在 yaml 里：那段判断有实测依据，
-# 写在 `run: |` 里不能本地跑、过不了 shellcheck，改一行只能推上去才知道对不对。
-# 实测数据见 docs/ci/README.md「镜像」一节。
+# Build the L1 base image and publish it to SWR.
+# Manual dispatch only: one build can take 4-5 hours and many GB of bandwidth.
+# Image tags are content-addressed: base-<year-week>-c<content-hash>.
+# All logic lives in scripts/ci/image/ so it can run locally and pass shellcheck.
 
 on:
-  # 暂不启用。要恢复每晚构建时把这段解开：UTC 13:00 = 北京 21:00，
-  # 4~5 h 的构建在 18:00 UTC 前结束，正好赶上 19:00 UTC 的全量。
+  # Disabled for now. Uncomment to restore the nightly build.
   # schedule:
   #   - cron: '0 13 * * *'
 
   workflow_dispatch:
     inputs:
       force_rebuild:
-        description: '强制重建（默认：同内容已存在则跳过）'
+        description: 'Rebuild even when the content tag already exists'
         required: true
         default: false
         type: boolean
       should_push:
-        description: 'false = 只验证 Dockerfile 能跑通，不产出镜像、不推送'
+        description: 'false = validate the build without publishing'
         required: true
         default: true
         type: boolean
       runner:
-        description: '构建机（GH 托管有真 docker + buildx；自托管池可能没有 docker）'
+        description: 'Runner for the image build'
         required: true
         default: 'ubuntu-22.04-arm'
         type: choice
@@ -45,16 +32,16 @@ on:
           - linux-aarch64-cpu-24
           - linux-aarch64-cpu-4
       max_jobs:
-        description: 'MAX_JOBS；auto = min(nproc, 内存GB/3)。一般不用手填'
+        description: 'MAX_JOBS; auto = min(nproc, memory-GB / 3)'
         required: true
         default: 'auto'
       use_cache:
-        description: '是否用 GHA 构建缓存（type=gha, mode=min）'
+        description: 'Enable the GitHub Actions build cache'
         required: true
         default: true
         type: boolean
 
-# 同一镜像不并发构建：两次 4~5 h 会互相抢带宽且可能互相覆盖 tag。
+# Do not run two image builds concurrently.
 concurrency:
   group: image-ci-base
   cancel-in-progress: false
@@ -71,10 +58,9 @@ env:
 
 jobs:
   build-base:
-    name: build base (${{ inputs.runner || 'ubuntu-22.04-arm' }})
+    name: Ascend build base (${{ inputs.runner || 'ubuntu-22.04-arm' }})
     runs-on: ${{ inputs.runner || 'ubuntu-22.04-arm' }}
-    # GH 托管硬上限 6 h。4 核编译 torch 实测 3~5 h，留 10 min 收尾，
-    # 否则超时后连 Summary 都写不出来。
+    # Hosted runners stop at 6 hours; leave time for cleanup and summary.
     timeout-minutes: 350
     outputs:
       image: ${{ steps.tag.outputs.ref || steps.tag.outputs.full_tag }}
@@ -84,19 +70,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: ② 环境自检
+      - name: Check runner
         env:
           RUNNER_LABEL: ${{ inputs.runner || 'ubuntu-22.04-arm' }}
         run: python3 scripts/ci/image/build_image.py env
 
-      - name: ③ 内容 tag + 判断是否需要构建
+      - name: Resolve content tag
         id: tag
         env:
           FORCE: ${{ inputs.force_rebuild }}
           SHOULD_PUSH: ${{ inputs.should_push }}
         run: python3 scripts/ci/image/build_image.py tag
 
-      - name: ④ 登录 SWR
+      - name: Log in to SWR
         if: steps.tag.outputs.build == 'true' && steps.tag.outputs.should_push == 'true'
         env:
           SWR_USER: ${{ secrets.SWR_USERNAME }}
@@ -104,38 +90,38 @@ jobs:
         run: |
           set -uo pipefail
           if [ -z "${SWR_USER:-}" ] || [ -z "${SWR_PASS:-}" ]; then
-            echo "::error::SWR_USERNAME / SWR_PASSWORD 为空 —— 请在 Settings → Secrets 里配置"
+            echo "::error::SWR_USERNAME / SWR_PASSWORD are not configured"
             exit 1
           fi
           if ! printf '%s' "$SWR_PASS" | docker login "$REGISTRY" -u "$SWR_USER" \
                  --password-stdin >/tmp/login.log 2>&1; then
-            echo "::error::docker login 失败"
+            echo "::error::docker login failed"
             tail -10 /tmp/login.log || true
             exit 1
           fi
-          echo "::notice::docker login 成功（${REGISTRY}）"
+          echo "::notice::docker login succeeded (${REGISTRY})"
 
-      - name: ⑤ 建立 buildx builder（缓存导出需要 docker-container 驱动）
+      - name: Create buildx builder
         id: builder
         if: steps.tag.outputs.build == 'true'
         run: |
           set -uo pipefail
           NAME="imageci-$$"
-          # docker 默认的 docker 驱动不支持 --cache-to type=gha 导出。
+          # The default docker driver cannot export GHA build cache.
           if docker buildx create --name "$NAME" --driver docker-container --use \
                  >/dev/null 2>&1; then
             docker buildx inspect --bootstrap >/dev/null 2>&1 || true
             echo "name=$NAME" >> "$GITHUB_OUTPUT"
-            echo "builder 就绪：$NAME（docker-container）"
+            echo "builder ready: $NAME (docker-container)"
           else
-            echo "::warning::建 docker-container builder 失败，退回默认 builder；GHA 缓存不可用"
+            echo "::warning::docker-container builder failed; GHA build cache disabled"
             echo "name=" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: ⑥ 构建并推送
+      - name: Build and push
         id: build
         if: steps.tag.outputs.build == 'true'
-        # job 级 timeout 是兜底；这里更早失败，避免某层 pip 网络 hang 住白占数小时。
+        # Fail earlier than the job timeout when a network-bound layer hangs.
         timeout-minutes: 320
         env:
           TAG_IMM: ${{ steps.tag.outputs.immutable }}
@@ -145,7 +131,7 @@ jobs:
           BUILDER: ${{ steps.builder.outputs.name }}
         run: python3 scripts/ci/image/build_image.py build
 
-      - name: ⑥b 上传构建日志（失败时唯一线索）
+      - name: Upload build log
         if: always() && steps.tag.outputs.build == 'true'
         continue-on-error: true
         uses: actions/upload-artifact@v4
@@ -155,34 +141,34 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
-      - name: ⑦ 校验产物格式（只回读，不改任何东西）
+      - name: Verify image
         id: verify
         if: steps.tag.outputs.build == 'true' && steps.tag.outputs.should_push == 'true'
         env:
           TAG_IMM: ${{ steps.tag.outputs.immutable }}
         run: python3 scripts/ci/image/build_image.py verify
 
-      # 发布「当前该用哪个镜像」给 PR 侧。跳过构建时也发布：那份信息同样有效。
-      - name: ⑧ 发布镜像引用（artifact）
+      # Publish the current image reference for PR jobs.
+      - name: Publish image reference
         if: always() && steps.tag.outputs.should_push == 'true'
         env:
           TAG_IMM: ${{ steps.tag.outputs.immutable }}
           DIGEST: ${{ steps.build.outputs.digest }}
         run: python3 scripts/ci/image/build_image.py publish
 
-      - name: ⑧b 上传引用
+      - name: Upload image reference
         if: always() && steps.tag.outputs.should_push == 'true'
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
-          # 名字固定：解析侧靠它找「最近一次」的那份，不要加 run 号。
+          # Keep this name stable; consumers select the latest artifact.
           name: base-image-ref
           path: /tmp/image-ref/image-ref.txt
-          # 90 天覆盖一个季度假期；过期后 PR 退到 base-latest 并打 warning。
+          # Keep long enough to cover holidays; PR falls back to base-latest.
           retention-days: 90
           overwrite: true
 
-      - name: ⑨ 汇总
+      - name: Summary
         if: always()
         env:
           TAG_IMM: ${{ steps.tag.outputs.immutable }}
@@ -195,7 +181,7 @@ jobs:
           ELAPSED: ${{ steps.build.outputs.elapsed }}
         run: python3 scripts/ci/image/build_image.py summary
 
-      - name: ⑩ 清理 builder + 悬空镜像
+      - name: Cleanup
         if: always()
         continue-on-error: true
         env:
