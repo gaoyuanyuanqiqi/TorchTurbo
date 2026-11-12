@@ -65,6 +65,12 @@ cmd_plan() {
   # cannot be confused with the values patch_run_scripts.py echoes back.
   PLAN_CARDS=$CARDS; PLAN_SP=$SP; PLAN_EP=$EP
 
+  # cmd_lane re-enters this script for process isolation. Export the resolved
+  # case state before that boundary, otherwise the child sees empty scripts.
+  export CASE_ID FRAMEWORK ENV_NAME MODEL_TYPE LAYERS DATASET_IN \
+    RUN_DIR INSTALL_SCRIPT TRAIN_SCRIPT HF_REPO REPO_IN MODEL_HINT \
+    PLAN_CARDS PLAN_SP PLAN_EP RESULT_JSON STRICT
+
   echo "case=$CASE_ID model_type=$MODEL_TYPE framework=$FRAMEWORK env=$ENV_NAME run_dir=$RUN_DIR train=$TRAIN_SCRIPT repo=$HF_REPO"
   echo "plan: cards=$PLAN_CARDS sp=$PLAN_SP ep=$PLAN_EP"
   result set --file "$RESULT_JSON" \

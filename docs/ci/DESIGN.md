@@ -1,8 +1,8 @@
 # CI 设计：事实决定资源，设备工作集决定 job
 
 **一句话**：测试的设备事实决定 lane，本次选中工作的最大资源需求决定 lane 容量；
-同一 `(image, device)` 的 unit 和 e2e 合并成一个 job。marker 只做 pytest 选测和
-事实一致性校验，不作为调度事实的唯一来源。
+unit 和每个 E2E case 都使用独立 job。marker 只做 pytest 选测和事实一致性校验，
+不作为调度事实的唯一来源。
 
 ---
 
@@ -18,7 +18,7 @@ cpu / npu / multi-npu / gpu / multi-gpu
 进程数。TorchTurbo 沿用这个方向，但增加两项约束：
 
 - 代码事实先于 marker：不能只靠人工标签判断设备；
-- 同一设备的工作先聚合，再选择容量 lane，不能按 `rank_N` 拆多个 job。
+- 同一设备、同一阶段的工作先聚合，再选择容量 lane，不能按 `rank_N` 拆多个 job。
 
 TorchTurbo 需要在同一 job 内隔离多套 Python 依赖，因此保留 venv：
 
@@ -105,11 +105,12 @@ runner，因此不生成 GPU lane 或 GPU job。
 
 按当前代码事实：
 
-- CPU unit 共 152 个测试文件，按一个 `cpu` job 聚合；最大的进程事实为 8。
-- NPU unit 共 16 个测试文件，最大需要 2 卡。
+- CPU unit 共 150 个测试文件，按一个 `cpu` job 聚合；最大的进程事实为 8。
+- NPU unit 共 18 个测试文件，最大需要 2 卡。
 - GPU unit 当前有 1 个测试文件，仅保留事实，暂不进入 CI 调度。
 - `tests/engine/backends/fsdp2/test_adamw_swap_checkpoint.py` 和
-  `test_cpu_offload_optimizer.py` 的 27 个测试使用 `CpuRuntime`，应归 CPU。
+  `test_cpu_offload_optimizer.py` 使用 `pin_memory=True`，需要 NPU 提供 pinned
+  allocator，应归 NPU。
 - e2e case 的卡数来自 `.github/workflows/model_map.json`；当前声明的 case 均为
   `cards=8`，某次 CI 可能只选中其中一部分。
 - 没有 NPU unit 用例需要 4 卡或 8 卡；4/8 卡只来自 E2E `cards`。
@@ -174,40 +175,43 @@ lanes:
 
 ### 2.2 工作集聚合
 
-plan 不使用单条测试的 rank 直接选 job，而是先按 `(image, device)` 聚合：
+plan 不使用单条测试的 rank 直接选 job，而是按 `(image, device, stage, work_id)`
+聚合。unit 的 `work_id` 为空；E2E 的 `work_id` 是 case id：
 
 ```text
-work[image, device] = {
-    pytest groups: key=(env, process isolation unit),
-    e2e cases:     key=env
+work[image, device, unit, ""] = {
+    pytest groups: key=(env, process isolation unit)
+}
+work[image, device, e2e, case_id] = {
+    e2e cases: key=env
 }
 ```
 
-然后计算本次工作集容量：
+每个工作集独立计算容量并选择能容纳它的最小 lane：
 
 ```text
-required_slots =
-    max(所有 unit 的 processes,
-        所有 e2e 的 cards)
-```
+unit required_slots = max(所有 unit 的 processes)
+e2e  required_slots = max(所有 e2e 的 cards)
 
-选择能容纳它的最小 lane：
-
-```text
 required_slots <= 2  -> default/npu-2
 required_slots <= 8  -> default/npu-8
 required_slots > 8   -> plan fail
 ```
 
-工作集中同时出现 `processes=2` 和 `processes=8` 时：
+因此 PR 同时选中 NPU unit 和两个 `cards=8` 的 e2e 时，会输出三个 matrix job：
 
 ```text
-错误做法：生成 npu-2 和 npu-8 两个 job
-正确做法：聚合成一个工作集，required_slots=8，生成一个 npu-8 job
+default/npu-2                              stage=unit
+default/npu-8/qwen3_5-lf-text-sft         stage=e2e
+default/npu-8/qwen3_5_moe-lf-text-sft     stage=e2e
 ```
 
-每个 `(image, device)` 最终最多生成一个 job。不同 image 仍可生成不同 job，因为
-镜像是 ABI 边界。
+所有 job 都只依赖 `select`，由 workflow matrix 启动。每个 E2E case 是独立的
+matrix job，也就是独立的 pod；NPU matrix 使用 `max-parallel: 2`，最多同时占用
+两个 NPU job。NPU unit 可能占用其中一个槽位，但模型之间不会串行进入同一个 pod，
+模型训练状态也不会跨 case 泄漏。
+
+不同 image 仍可生成不同 job，因为镜像是 ABI 边界。
 
 ---
 
@@ -223,11 +227,11 @@ required_slots > 8   -> plan fail
 ### 3.2 NPU
 
 - `npu` / `multi_npu` 统一进入 NPU 工作集；
-- unit 和 e2e 先聚合，再按最大需求选 `npu-2` 或 `npu-8`；
+- unit 使用一个 job；每个 E2E case 使用一个独立 job，各自选 `npu-2` 或 `npu-8`；
 - 只选 unit 且最大 `processes=2` 时用 `npu-2`；
 - 选中任意 `cards=8` 的 e2e 时用 `npu-8`；
 - e2e 的 `cards/sp/ep` 来自 `model_map.json`，不从 marker 或 runner 标签推断；
-- job 内先 unit，再 e2e；每个 env 使用独立 venv。
+- NPU matrix 最多并发 2 个 job；每个 E2E job 运行一个 case 并使用独立 pod 状态。
 
 pytest 选测：
 
@@ -253,22 +257,37 @@ plan 只输出工作，不输出“设备 + rank”组合：
 
 ```json
 {
-  "jobs": [{
-    "id": "default/npu-8",
-    "image": "default",
-    "device": "npu",
-    "resource": "npu-8",
-    "slots": 8,
-    "required_slots": 8,
-    "runner": "linux-aarch64-a3-800i-8",
-    "steps": [
-      {"kind": "pytest", "env": "default", "marker": "npu",
-       "process": "layer:tests/ops/npu", "processes": 2,
-       "files": ["tests/ops/npu/test_fused_rms_norm.py"]},
-      {"kind": "e2e", "env": "lf",
-       "cases": [{"case_id": "qwen3_5-lf-text-sft"}]}
-    ]
-  }]
+  "jobs": [
+    {
+      "id": "default/npu-2",
+      "image": "default",
+      "device": "npu",
+      "stage": "unit",
+      "resource": "npu-2",
+      "slots": 2,
+      "required_slots": 2,
+      "runner": "linux-aarch64-a3-800i-2",
+      "steps": [
+        {"kind": "pytest", "env": "default", "marker": "npu",
+         "process": "layer:tests/ops/npu", "processes": 2,
+         "files": ["tests/ops/npu/test_fused_rms_norm.py"]}
+      ]
+    },
+    {
+      "id": "default/npu-8/qwen3_5-lf-text-sft",
+      "image": "default",
+      "device": "npu",
+      "stage": "e2e",
+      "resource": "npu-8",
+      "slots": 8,
+      "required_slots": 8,
+      "runner": "linux-aarch64-a3-800i-8",
+      "steps": [
+        {"kind": "e2e", "env": "lf",
+         "cases": [{"case_id": "qwen3_5-lf-text-sft"}]}
+      ]
+    }
+  ]
 }
 ```
 
@@ -295,14 +314,14 @@ gate          按 CPU/NPU 结果判定
 ```
 
 workflow 不再固定写 `npu-unit-tests` 和 `npu-e2e-tests`。NPU unit/e2e 是同一
-plan job 的不同 step。
+matrix 中的独立 plan job；每个 E2E case 一个 job，`max-parallel: 2`。
 
 ### 5.2 venv
 
 每个 env 在 job 内创建或复用 venv：
 
 ```text
-job = (image, device)
+job = (image, device, stage, work_id)
   └─ step = env
        ├─ create/reuse venv
        ├─ install env requirements + image constraints
@@ -318,8 +337,9 @@ job = (image, device)
 
 ### 5.3 失败与超时
 
-- 同一 job 内 step 失败立即停止；
-- e2e case 必须有单 case 超时，不能共用一个无限窗口；
+- 同一 job 内 step 失败立即停止；unit 失败不会阻塞独立的 e2e job；
+- 每个 e2e case 独占 job，模型训练不会污染下一个模型；
+- 每个 e2e job 使用独立超时和 cleanup；
 - NPU job 超时或取消后必须执行 environment cleanup，释放卡和子进程；
 - 容量不足是 plan fail，不允许静默使用更大/更小 lane。
 
@@ -356,7 +376,7 @@ NPU job 不执行是设计内跳过；`ci:e2e:strict` 仍由统一 NPU job 的 s
 1. **事实扫描 shadow**：生成 device/processes/evidence 和旧 marker 差异报告；
 2. **重新标记**：按事实迁移到 `cpu` / `npu` / `multi_npu` / `gpu` / `multi_gpu`；
 3. **lint**：marker 与事实双向校验，禁止遗留 `rank_N` 继续作为调度依据；
-4. **plan**：按 `(image, device)` 聚合，再按 required_slots 选 lane；
+4. **plan**：按 `(image, device, stage)` 聚合，再按 required_slots 选 lane；
 5. **workflow**：CPU/NPU 改通用 matrix，删除固定 unit/e2e job；
 6. **删除旧语义**：删除遗留 `rank_N` 的 job 语义，只保留进程事实；
 7. **GPU（暂缓）**：接入 runner 后再新增 `gpu_unit`、GPU lane 和 matrix；
@@ -376,6 +396,8 @@ NPU job 不执行是设计内跳过；`ci:e2e:strict` 仍由统一 NPU job 的 s
 | 新增 NPU 规格 | lanes.yml 加容量 lane；plan 自动选最小可容纳 lane |
 | 新增 CANN / torch 镜像 | 加 image 和 lane；workflow 不改 |
 | 新增 GPU runner | 加 gpu lane；复用同一聚合和执行模板 |
+| 新增 / 删除 E2E case | 改 model_map.json；每个选中 case 自动生成独立 job |
 | e2e 卡数变化 | 改 model_map.json；plan 自动重算 NPU 容量 |
 
-CI 的 job 图只随 image 和 device 增长，不随模型、env、框架或 `rank_N` 增长。
+CI 的 job 图随 image、device、stage 和选中的 E2E case 增长，不随模型源码、env、
+框架或 `rank_N` 增长。PR/nightly trigger 控制这些 E2E job 的数量。

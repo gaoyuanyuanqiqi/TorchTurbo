@@ -42,8 +42,8 @@ pull_request ──► ci-pr.yml
 
 - 可复用 workflow 会把被调文件的**所有** job 展开成图上的盒子，而 `uses:` 的
   job 一律显示成 `调用方名 / 被调方名`，两段合不成一段 —— 所以泳道必须**内联**。
-- `strategy.matrix` 会把一个 job 乘以条目数 —— 所以 CPU **不分片**，E2E 的多
-  个用例在 job 内部循环（`run_train.sh lane`）。
+- `strategy.matrix` 会把一个 job 乘以条目数 —— CPU **不分片**；每个选中的 E2E
+  case 是一个独立 matrix entry，最多同时运行 2 个。
 - job key 带 `l1_` / `l2_` / `l3_` 前缀：图上的同级 job 按 key 排序，这是
   cpu → npu-unit → npu-e2e 从上到下的唯一保证。
 
@@ -117,8 +117,10 @@ shellcheck 的版本固定在 `lint_common_check.py` 里，从版本化 release 
 也就是说并行**不增加总卡消耗**，只抬高峰值并发。代价是 CPU 泳道红时 NPU 会白跑——
 这是已知取舍，接受它是因为墙钟收益（~3.5 min/PR）更值钱。
 
-注意 `npu-e2e` 泳道内部按模型训练用例串行（`run_train.sh lane`）：NPU 池显存共享，
-这与泳道间并行无关。整个 job 的宏观流程是环境检查、训练编排、环境清理。
+注意模型 E2E 按 case 拆成独立 job/pod，`max-parallel: 2` 限制 NPU 峰值并发；
+NPU unit 可能占用其中一个槽位，但模型之间不会共享 pod，训练状态也不会跨 case
+泄漏。实际能否同时启动仍由 NPU runner 数量决定。每个 job 的宏观流程都是环境
+检查、训练、环境清理。
 
 ### gate 的判定
 
@@ -231,7 +233,8 @@ CPU 泳道执行 `-m cpu`，NPU 泳道执行 `-m npu`。`cuda` / `xpu` / `mps` �
 | `src/torchturbo/runtime/**` | ✅ | 选中的 CPU 文件 | — | — |
 | `docker/npu/**` | ✅ | 选中的 CPU 文件 | **✅ 全跑** | 最便宜的用例 |
 | `pyproject.toml` | ✅ | **全量** | **✅ 全跑** | 最便宜的用例 |
-| `.github/**`、`scripts/ci/**` | ✅ | **全量** | — | — |
+| `.github/workflows/**`、`scripts/ci/**`（`model_map.json` 除外） | ✅ | **全量** | — | `bailing_hybrid` tiny 兜底 |
+| `.github/workflows/model_map.json` | ✅ | **全量** | — | 所有 PR 用例 |
 | `scripts/runs/<dir>/**` | ✅ | 源码里真引用它的测试 | — | 该 `run_dir` 的模型 |
 | 其它 `scripts/**` | ✅ | 源码里真引用它的测试 | — | — |
 | `tests/**` | ✅ | affected | — | — |
@@ -290,7 +293,8 @@ cpu-unit 只跑选中的文件，所以「一个改文档的 PR」连 CPU 泳道
 `select_tests.py` 的 `pick_e2e()` 里，用例本身写在 `model_map.json` 的 `e2e` 字段。
 
 改 CI 自身为什么跑全量 CPU：这些脚本就是「怎么跑测试」本身，改错了会**静默少跑**，
-只有全量能看出来。但它们不烧 NPU。
+只有全量能看出来。同时只启动 `bailing_hybrid-lf-sft` 这一个 tiny E2E 用例做真实
+训练链路兜底；若同一 PR 还改了具体模型源码，则以具体模型用例为准，不叠加兜底。
 
 ## 镜像：谁生产、谁消费
 
@@ -337,8 +341,9 @@ PR / 全量的 `select` 用 `--repo "$GITHUB_REPOSITORY"` 读最近一份。解�
 经 `torchturbo.engine` 门面的 reverse_deps 会合法地拉出 60+ 个文件，那不是噪声；真正
 该升级的是 `runtime/**`、`logging.py`、`ops/base.py` 这类全局基座。
 
-`ci-config-changed` 只把 **CPU** 扩成全量；NPU 泳道要不要起，看的是「这次选中的文件
-里有没有真卡测试」，与 `mode` 无关。
+`ci-config-changed` 只把 **CPU** 扩成全量；普通 CI 控制文件另起一个
+`bailing_hybrid-lf-sft` E2E 兜底。NPU unit 要不要起，看的是「这次选中的文件里有
+没有真卡测试」，与 `mode` 无关。
 
 ## 标签
 
@@ -389,7 +394,7 @@ gh workflow run ci-pr.yml -F ref=ci/pr-123
 超时之后一定有收尾（`if: always()` → `scripts/ci/common/env_pod.py cleanup`）：被杀掉的训练会
 留下占卡的子进程、没释放的显存和半个 checkpoint，下个 job 会以完全无关的方式失败。
 
-## NPU 池串行：不要用 job 级 `concurrency`
+## NPU 池并发：matrix 上限 + runner 排队，不要用 job 级 `concurrency`
 
 第一版在泳道文件里按 runner 标签分过组
 （`ci-tests-<label>`，`cancel-in-progress: false`），想的是"让手动跑和 PR 排同一个队"。
@@ -402,9 +407,9 @@ gh workflow run ci-pr.yml -F ref=ci/pr-123
 全量第一次 run 就是这么挂的：同时在队的 job 只剩最后一个，其余的都被
 `cancelled`。
 
-所以现在三个泳道文件里**没有任何 `concurrency`**。串行本来就由 runner 提供：
-self-hosted runner 忙着的时候，下一个 job 天然停在 `queued`。要给某个池限并发，
-应该去 ARC / runner group 那一层做，而不是在被调用的 workflow 里。
+所以现在三个泳道文件里**没有任何 `concurrency`**。NPU matrix 用 `max-parallel: 2`
+限制上界；实际并发仍由 runner 数量决定，self-hosted runner 忙着的时候，下一个 job
+天然停在 `queued`。要给某个池进一步限流，应该去 ARC / runner group 那一层做。
 
 workflow 级 `concurrency` 现在只留在一个入口文件里（`ci-pr.yml`），并且按
 模式分 group：PR 用 `pr-<number>`（新 push 顶掉旧 run），全量用 `full-<run_id>`

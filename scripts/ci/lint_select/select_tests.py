@@ -1308,12 +1308,21 @@ def verify(root: Path) -> int:
           and r["lanes"]["npu_unit"]["files"] == ["tests/models/qwen4_exp/test_qsa_distributed.py"],
           str(lane_runs(r)))
 
-    # Regression: CI edits need the full CPU suite but must not burn a card.
+    # Regression: CI edits need the full CPU suite and one tiny E2E smoke.
     r = sel("scripts/ci/lint_select/select_tests.py")
-    check("CI edit -> full CPU, no NPU, no E2E",
+    check("CI edit -> full CPU, tiny E2E fallback",
           r["mode"] == "all" and r["cpu_files"]
-          and not r["lanes"]["npu_unit"]["run"] and not r["e2e_cases"],
+          and not r["lanes"]["npu_unit"]["run"]
+          and [e["case_id"] for e in r["e2e_cases"]] == ["bailing_hybrid-lf-sft"],
           f"{r['mode']} {lane_runs(r)}")
+    r = sel(".github/workflows/ci-pr.yml")
+    check("workflow edit -> tiny E2E fallback",
+          [e["case_id"] for e in r["e2e_cases"]] == ["bailing_hybrid-lf-sft"],
+          str(r["e2e_cases"]))
+    r = sel("scripts/ci/envs/common.txt")
+    check("shared env edit -> one tiny E2E fallback",
+          [e["case_id"] for e in r["e2e_cases"]] == ["bailing_hybrid-lf-sft"],
+          str(r["e2e_cases"]))
 
     # Regression: a non-.py path that merely shares a prefix must not start E2E.
     check("docs under src/ and top-level docs -> no E2E",

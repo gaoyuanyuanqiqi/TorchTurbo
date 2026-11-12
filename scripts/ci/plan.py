@@ -7,7 +7,7 @@ import argparse
 import json
 import sys
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -92,8 +92,9 @@ def _add_test(job: dict[str, Any], facts: TestFacts, device: str) -> None:
     group["files"].append(facts.path)
 
 
-def _job(catalog: CiCatalog, image: str, device: str, required_slots: int,
-         errors: list[PlanError], path: str) -> dict[str, Any] | None:
+def _job(catalog: CiCatalog, image: str, device: str, stage: str,
+         required_slots: int, errors: list[PlanError], path: str,
+         work_id: str = "") -> dict[str, Any] | None:
     lane = catalog.lane_for(image, device, required_slots)
     if lane is None:
         errors.append(PlanError(
@@ -102,9 +103,10 @@ def _job(catalog: CiCatalog, image: str, device: str, required_slots: int,
         ))
         return None
     return {
-        "id": lane.key,
+        "id": f"{lane.key}/{work_id}" if work_id else lane.key,
         "image": image,
         "device": device,
+        "stage": stage,
         "resource": lane.resource,
         "slots": lane.slots,
         "required_slots": required_slots,
@@ -146,7 +148,8 @@ def _lane_test_files(lane: dict[str, Any], test_facts: dict[str, TestFacts],
 def compile_plan(catalog: CiCatalog, test_facts: dict[str, TestFacts],
                  selection: dict[str, Any]) -> tuple[dict[str, Any], list[PlanError]]:
     errors: list[PlanError] = []
-    work: dict[tuple[str, str], dict[str, Any]] = defaultdict(
+    # Unit and each E2E case get independent jobs to isolate pod state.
+    work: dict[tuple[str, str, str, str], dict[str, Any]] = defaultdict(
         lambda: {"tests": [], "cases": []}
     )
     lanes = selection.get("lanes") or {}
@@ -165,7 +168,7 @@ def compile_plan(catalog: CiCatalog, test_facts: dict[str, TestFacts],
                     path, f"selected test does not require {device}"
                 ))
                 continue
-            work[(facts.image, device)]["tests"].append(facts)
+            work[(facts.image, device, "unit", "")]["tests"].append(facts)
 
     for selected in selection.get("e2e_cases") or []:
         case_id = str(selected.get("case_id") or "")
@@ -181,10 +184,10 @@ def compile_plan(catalog: CiCatalog, test_facts: dict[str, TestFacts],
                     case_id, f"selection {field}={selected[field]!r} "
                     f"does not match catalog {canonical[field]!r}"
                 ))
-        work[(case.image, "npu")]["cases"].append(canonical)
+        work[(case.image, "npu", "e2e", case_id)]["cases"].append(canonical)
 
     jobs: list[dict[str, Any]] = []
-    for (image, device), selected_work in sorted(work.items()):
+    for (image, device, stage, work_id), selected_work in sorted(work.items()):
         required_slots = max(
             [facts.processes_for(device) for facts in selected_work["tests"]]
             + [int(case["cards"]) for case in selected_work["cases"]]
@@ -192,7 +195,9 @@ def compile_plan(catalog: CiCatalog, test_facts: dict[str, TestFacts],
         )
         path = (selected_work["tests"][0].path if selected_work["tests"]
                 else selected_work["cases"][0]["case_id"])
-        job = _job(catalog, image, device, required_slots, errors, path)
+        job = _job(
+            catalog, image, device, stage, required_slots, errors, path, work_id
+        )
         if job is None:
             continue
         for facts in selected_work["tests"]:
@@ -201,12 +206,18 @@ def compile_plan(catalog: CiCatalog, test_facts: dict[str, TestFacts],
             job["e2e"][case["env"]].append(case)
         jobs.append(job)
 
+    id_counts = Counter(job["id"] for job in jobs)
+    for job in jobs:
+        if id_counts[job["id"]] > 1:
+            job["id"] = f"{job['id']}-{job['stage']}"
+
     output_jobs = []
     for job in sorted(jobs, key=lambda item: item["id"]):
         output_jobs.append({
             "id": job["id"],
             "image": job["image"],
             "device": job["device"],
+            "stage": job["stage"],
             "resource": job["resource"],
             "slots": job["slots"],
             "required_slots": job["required_slots"],
@@ -285,6 +296,42 @@ def verify(catalog: CiCatalog, test_facts: dict[str, TestFacts],
             failures.append(PlanError("verify", f"host matrix is not JSON serializable: {exc}"))
     else:
         failures.append(PlanError("verify", "sample CPU selection produced no host job"))
+    sample_npu_jobs = device_jobs(sample_plan, "npu")
+    stages = sorted(job["stage"] for job in sample_npu_jobs)
+    if stages != ["e2e", "unit"]:
+        failures.append(PlanError(
+            "verify", f"NPU unit and E2E must produce two jobs, got {stages}"
+        ))
+    if len({job["id"] for job in sample_npu_jobs}) != len(sample_npu_jobs):
+        failures.append(PlanError("verify", "NPU jobs must have unique ids"))
+    if len(catalog.cases) >= 2:
+        cases = [case.as_selection("verify") for case in catalog.cases[:2]]
+        e2e_plan, e2e_errors = compile_plan(
+            catalog, test_facts, {"e2e_cases": cases}
+        )
+        failures.extend(e2e_errors)
+        e2e_jobs = [job for job in device_jobs(e2e_plan, "npu")
+                    if job["stage"] == "e2e"]
+        if len(e2e_jobs) != 2:
+            failures.append(PlanError(
+                "verify", "each E2E case must produce its own job"
+            ))
+        if len({job["id"] for job in e2e_jobs}) != len(e2e_jobs):
+            failures.append(PlanError("verify", "E2E case jobs must have unique ids"))
+        for job in e2e_jobs:
+            cases = sum(len(step.get("cases", [])) for step in job["steps"])
+            if cases != 1:
+                failures.append(PlanError(
+                    "verify", f"E2E job {job['id']} must contain exactly one case, got {cases}"
+                ))
+    mixed_jobs = [
+        job["id"] for job in sample_plan["jobs"]
+        if {step["kind"] for step in job["steps"]} == {"pytest", "e2e"}
+    ]
+    if mixed_jobs:
+        failures.append(PlanError(
+            "verify", f"unit and E2E work must use separate jobs: {mixed_jobs}"
+        ))
     if cpu is not None:
         _, manual_files, manual_errors = _apply_test_path(
             catalog.root, sample, cpu.path, test_facts
@@ -332,7 +379,7 @@ def _verify_rejections(catalog: CiCatalog, test_facts: dict[str, TestFacts],
         )[1], "does not match catalog")
 
     lane_errors: list[PlanError] = []
-    if _job(catalog, cpu.image, "cpu", 99, lane_errors, "verify") is not None:
+    if _job(catalog, cpu.image, "cpu", "unit", 99, lane_errors, "verify") is not None:
         failures.append(PlanError("verify", "negative case accepted an unavailable lane"))
     expect("unavailable lane", lane_errors, "no lane for")
 
@@ -349,10 +396,10 @@ def _verify_rejections(catalog: CiCatalog, test_facts: dict[str, TestFacts],
             failures.append(PlanError("verify", "whole-lane NPU selection produced no tests"))
         else:
             npu_jobs = device_jobs(plan, "npu")
-            images = {job["image"] for job in npu_jobs}
-            if len(npu_jobs) != len(images):
+            stages = [job["stage"] for job in npu_jobs]
+            if len(npu_jobs) != 1 or stages != ["unit"]:
                 failures.append(PlanError(
-                    "verify", "NPU work was split into multiple jobs for one image"
+                    "verify", "whole-lane NPU selection must produce one unit job"
                 ))
     return failures
 

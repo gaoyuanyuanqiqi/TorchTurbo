@@ -24,6 +24,9 @@ KNOWN_MARKERS = frozenset(REQUIRED_MARKERS)
 MODEL_PACKAGES = frozenset({"base", "modules", "registry", "weight_converter"})
 FRAMEWORK_PACKAGES = {"llamafactory": "lf", "swift": "swift"}
 CASE_TRIGGERS = frozenset({"pr", "nightly"})
+CI_FALLBACK_CASE_ID = "bailing_hybrid-lf-sft"
+CI_FALLBACK_PRIORITY = 3
+CI_CONTROL_PREFIXES = (".github/workflows/", ".github/actions/", "scripts/ci/")
 
 
 @dataclass(frozen=True)
@@ -428,6 +431,11 @@ def load_catalog(root: Path) -> CiCatalog:
     )
     models = _load_models(root / ".github" / "workflows" / "model_map.json", errors)
     cases = _load_cases(root, models, envs, images, errors)
+    fallback = next((case for case in cases if case.case_id == CI_FALLBACK_CASE_ID), None)
+    if fallback is None:
+        errors.append(f"model_map.json: CI fallback case {CI_FALLBACK_CASE_ID!r} is missing")
+    elif "pr" not in fallback.triggers:
+        errors.append(f"model_map.json: CI fallback case {CI_FALLBACK_CASE_ID!r} must trigger pr")
     registered = registered_models(root)
     for name in sorted(registered - set(models)):
         errors.append(f"model_map.json: registered model {name!r} is missing")
@@ -565,6 +573,23 @@ def _device_evidence(tree: ast.AST) -> set[str]:
     return devices
 
 
+def _module_device_guards(tree: ast.Module) -> set[str]:
+    """Return devices required by module-level runtime guards."""
+    devices: set[str] = set()
+    for node in tree.body:
+        value = node.value if isinstance(node, (ast.Expr, ast.Assign, ast.AnnAssign)) else None
+        if not isinstance(value, ast.Call):
+            continue
+        name = _dotted_name(value.func).rsplit(".", 1)[-1]
+        if name in {"require_npu", "require_npus"}:
+            devices.add("npu")
+        elif name == "importorskip" and value.args:
+            module = _literal_string(value.args[0]).split(".", 1)[0]
+            if module in {"torch_npu", "fla_npu"}:
+                devices.add("npu")
+    return devices
+
+
 def _parametrized_processes(tree: ast.AST) -> int:
     """Read world-size values from pytest parametrization, if present."""
     required = 1
@@ -666,6 +691,7 @@ def scan_tests(catalog: CiCatalog) -> tuple[dict[str, TestFacts], list[PlanError
         multi_devices: set[str] = set()
         device_processes: dict[str, int] = {}
         integration = "integration" in module_markers
+        module_guards = _module_device_guards(tree)
         for test in tests:
             markers = module_markers | set().union(
                 *(_markers(item) for item in test.decorator_list)
@@ -680,7 +706,7 @@ def scan_tests(catalog: CiCatalog) -> tuple[dict[str, TestFacts], list[PlanError
                 errors.append(PlanError(
                     rel, f"{test.name} mixes cpu with accelerator markers"
                 ))
-            evidence = _device_evidence(test)
+            evidence = _device_evidence(test) | module_guards
             if evidence and test_devices.isdisjoint(evidence):
                 errors.append(PlanError(
                     rel, f"{test.name} markers {sorted(test_devices)} disagree with "
@@ -754,6 +780,21 @@ def pr_cases(cases: list[E2eCase]) -> list[E2eCase]:
     return [case for case in cases if "pr" in case.triggers]
 
 
+def is_ci_control_path(path: str) -> bool:
+    if path.startswith((".github/workflows/", ".github/actions/")):
+        return True
+    return path.startswith("scripts/ci/") and not path.endswith((".md", ".rst"))
+
+
+def ci_fallback_case(catalog: CiCatalog, env: str = "") -> E2eCase | None:
+    case = catalog.case(CI_FALLBACK_CASE_ID)
+    if case is None or "pr" not in case.triggers:
+        return None
+    if env and env not in {"envs", "common"} and case.env != env:
+        return None
+    return case
+
+
 def select_e2e_cases(catalog: CiCatalog, changed: list[str], *, all_cases: bool,
                      force: bool) -> list[dict[str, Any]]:
     by_model = {model: catalog.cases_for(model) for model in catalog.models}
@@ -794,12 +835,14 @@ def select_e2e_cases(catalog: CiCatalog, changed: list[str], *, all_cases: bool,
                     add_pr([case], 1, f"{path} (run_dir)")
         elif path.startswith("scripts/ci/envs/") or path == "scripts/ci/envs.toml":
             env = Path(path).stem
-            affected = (catalog.cases if env in {"envs", "common"} else
-                        [case for case in catalog.cases if case.env == env])
             scope = "all envs" if env in {"envs", "common"} else f"env={env}"
-            add_pr(affected, 1, f"{path} ({scope})")
+            add(ci_fallback_case(catalog, env), CI_FALLBACK_PRIORITY,
+                f"{path} ({scope} CI fallback)")
         elif path == ".github/workflows/model_map.json":
             add_pr(catalog.cases, 1, f"{path} (E2E map)")
+        elif is_ci_control_path(path):
+            add(ci_fallback_case(catalog), CI_FALLBACK_PRIORITY,
+                f"{path} (CI fallback)")
         elif path.startswith("src/torchturbo/adapters/"):
             if not path.endswith(".py"):
                 continue
@@ -820,5 +863,8 @@ def select_e2e_cases(catalog: CiCatalog, changed: list[str], *, all_cases: bool,
             add_pr(by_model.get("qwen3_5", []), 2, f"{path} (startup path)")
         elif path.startswith("docker/npu/") or path == "pyproject.toml":
             add_pr(by_model.get("qwen3_5", []), 2, f"{path} (image/deps)")
+    if picks and min(item[0] for item in picks.values()) < CI_FALLBACK_PRIORITY:
+        picks = {case_id: item for case_id, item in picks.items()
+                 if item[0] < CI_FALLBACK_PRIORITY}
     ordered = sorted(picks.values(), key=lambda item: (item[0], item[1].case_id))
     return [case.as_selection(reason) for _, case, reason in ordered]

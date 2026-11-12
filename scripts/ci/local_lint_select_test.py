@@ -183,11 +183,15 @@ SCENARIOS = [
          expect="all", cpu=True, npu=True, e2e=True,
          full_reason="too-many-tests",
          e2e_cases=[{"model_type": "qwen3_5", "layers": 0}]),
-    # CI scripts are the decision layer itself: CPU goes wide, NPU stays idle.
+    # CI scripts are the decision layer itself: CPU goes wide, with one tiny E2E smoke.
     dict(name="ci script", files=["scripts/ci/lint_select/select_tests.py"], expect="all",
-         cpu=True, npu=False, e2e=False, full_reason="ci-config-changed"),
+         cpu=True, npu=False, e2e=True, e2e_models=["bailing_hybrid"],
+         full_reason="ci-config-changed"),
+    dict(name="workflow config", files=[".github/workflows/ci-pr.yml"], expect="all",
+         cpu=True, npu=False, e2e=True, e2e_models=["bailing_hybrid"],
+         full_reason="ci-config-changed"),
     dict(name="shared env deps", files=["scripts/ci/envs/common.txt"], expect="all",
-         cpu=True, npu=False, e2e=True, e2e_models=models_with_trigger("pr"),
+         cpu=True, npu=False, e2e=True, e2e_models=["bailing_hybrid"],
          full_reason="ci-config-changed"),
     dict(name="E2E map", files=[".github/workflows/model_map.json"], expect="all",
          cpu=True, npu=False, e2e=True, e2e_models=models_with_trigger("pr"),

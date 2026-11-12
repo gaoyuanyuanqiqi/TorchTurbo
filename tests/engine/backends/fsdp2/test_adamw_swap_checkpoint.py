@@ -17,9 +17,11 @@ import torch
 
 from torchturbo.engine.backends.fsdp2.optimizers.adamw import AdamWSwap
 from torchturbo.runtime.cpu import CpuRuntime
+from tests.support.npu import require_npu
 
 
-pytestmark = pytest.mark.cpu
+require_npu()
+pytestmark = pytest.mark.npu
 
 
 

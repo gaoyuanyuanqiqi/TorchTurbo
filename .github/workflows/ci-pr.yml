@@ -221,8 +221,8 @@ jobs:
           path: ${{ runner.temp }}/turbo-ci-venv
           key: turbo-venv-${{ runner.os }}-${{ runner.arch }}-${{ matrix.id }}-${{ hashFiles('scripts/ci/envs.toml', 'scripts/ci/envs/**', 'pyproject.toml') }}
 
-  # NPU unit and E2E steps share one job. The lane already reflects the maximum
-  # process/cards requirement of the selected work set.
+  # NPU unit and E2E are separate matrix entries. Each entry selects the
+  # smallest lane that can hold its own process/card requirement.
   l2_npu:
     name: npu-tests (${{ matrix.id }})
     needs: select
@@ -234,6 +234,9 @@ jobs:
        github.event.pull_request.head.repo.full_name == github.repository)
     strategy:
       fail-fast: false
+      # Each matrix entry is a separate job and pod. Two at most run together;
+      # E2E cases never share a pod, so model state cannot leak across cases.
+      max-parallel: 2
       matrix:
         include: ${{ fromJSON(needs.select.outputs.npu_jobs) }}
     runs-on: ${{ vars[matrix.runner_variable] || matrix.runner }}
