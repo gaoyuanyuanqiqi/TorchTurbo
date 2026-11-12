@@ -17,7 +17,7 @@ from facts import EnvSpec, load_catalog
 
 CPU_TORCH_VERSION = os.environ.get("CI_CPU_TORCH_VERSION", "2.10.0")
 READY_FILE = ".tt-ready.json"
-INSTALL_SCHEMA = "1"
+INSTALL_SCHEMA = "2"
 
 
 @dataclass(frozen=True)
@@ -91,8 +91,19 @@ class VenvManager:
         digest.update(f"python={spec.python}\n".encode())
         if self.device == "cpu":
             digest.update(f"torch={CPU_TORCH_VERSION}\n".encode())
-        digest.update((self.root / "pyproject.toml").read_bytes())
+        # Installer changes must invalidate cached profiles as well as
+        # dependency changes.
+        for relative in (
+            Path("pyproject.toml"),
+            Path("scripts/ci/venv_manager.py"),
+            Path("scripts/ci/common/env_pod.py"),
+        ):
+            path = self.root / relative
+            digest.update(f"file={relative.as_posix()}\n".encode())
+            digest.update(path.read_bytes())
         for item in chain:
+            digest.update(f"env={item.name}\n".encode())
+            digest.update(f"env-python={item.python}\n".encode())
             for requirements in (item.requirements, *item.overrides):
                 if not requirements:
                     continue
