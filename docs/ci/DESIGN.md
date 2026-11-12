@@ -340,7 +340,7 @@ job = (image, device, stage, work_id)
 - 同一 job 内 step 失败立即停止；unit 失败不会阻塞独立的 e2e job；
 - 每个 e2e case 独占 job，模型训练不会污染下一个模型；
 - 每个 e2e job 使用独立超时和 cleanup；
-- e2e 的 `fetch_timeout` / `case_timeout` 按 case 覆盖；冷下载几十 GB 的模型必须显式调大；
+- e2e 的 `fetch_timeout` / `case_timeout` 统一由 `lanes.yml` 的 `e2e_defaults` 提供；
 - NPU job 超时或取消后必须执行 environment cleanup，释放卡和子进程；
 - 容量不足是 plan fail，不允许静默使用更大/更小 lane。
 

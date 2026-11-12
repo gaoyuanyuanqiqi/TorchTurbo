@@ -93,17 +93,8 @@ def read_model_case_plan(map_path: str, model_type: str, framework: str,
         raise SystemExit(f"{model_type}: 'download' must be a mapping")
     try:
         cards, sp, ep = (int(case[key]) for key in ("cards", "sp", "ep"))
-        fetch_timeout = int(case.get("fetch_timeout", 600))
-        case_timeout = int(case.get("case_timeout", 1500))
     except (KeyError, TypeError, ValueError) as exc:
-        raise SystemExit(
-            f"{model_type}: bad cards/sp/ep/timeouts in {case.get('id')!r}: {exc}"
-        ) from exc
-    if fetch_timeout < 1 or case_timeout <= fetch_timeout:
-        raise SystemExit(
-            f"{model_type}: fetch_timeout={fetch_timeout} must be positive and "
-            f"shorter than case_timeout={case_timeout}"
-        )
+        raise SystemExit(f"{model_type}: bad cards/sp/ep in {case.get('id')!r}: {exc}") from exc
     if not 1 <= cards <= MAX_CARDS:
         raise SystemExit(f"{model_type}: cards={cards} is outside 1..{MAX_CARDS}")
     if min(sp, ep) < 1 or cards % sp or (cards // sp) % ep:
@@ -123,8 +114,6 @@ def read_model_case_plan(map_path: str, model_type: str, framework: str,
         "CARDS": cards,
         "SP": sp,
         "EP": ep,
-        "FETCH_TIMEOUT": fetch_timeout,
-        "CASE_TIMEOUT": case_timeout,
     }
 
 

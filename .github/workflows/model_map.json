@@ -32,8 +32,6 @@
           "cards": 8,
           "sp": 2,
           "ep": 4,
-          "fetch_timeout": 3600,
-          "case_timeout": 7200,
           "triggers": ["pr", "nightly"]
         },
         {
@@ -47,8 +45,6 @@
           "cards": 8,
           "sp": 2,
           "ep": 4,
-          "fetch_timeout": 3600,
-          "case_timeout": 7200,
           "triggers": ["nightly"]
         },
         {
@@ -62,8 +58,6 @@
           "cards": 8,
           "sp": 2,
           "ep": 4,
-          "fetch_timeout": 3600,
-          "case_timeout": 7200,
           "triggers": ["nightly"]
         }
       ]
@@ -99,8 +93,6 @@
           "cards": 8,
           "sp": 2,
           "ep": 4,
-          "fetch_timeout": 3600,
-          "case_timeout": 7200,
           "triggers": ["nightly"]
         },
         {

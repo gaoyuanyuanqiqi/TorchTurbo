@@ -66,7 +66,8 @@ def _e2e_command() -> list[str]:
 
 
 def _e2e_environment(venv: Venv, step: dict[str, Any], result_json: Path,
-                     runner_label: str, image: str) -> dict[str, str]:
+                     runner_label: str, image: str,
+                     defaults: dict[str, Any]) -> dict[str, str]:
     cases = step["cases"]
     environment = venv.environment()
     environment.update({
@@ -78,8 +79,12 @@ def _e2e_environment(venv: Venv, step: dict[str, Any], result_json: Path,
         "SEQ_LEN": os.environ.get("SEQ_LEN", "4096"),
         "DATASET_IN": os.environ.get("DATASET_IN", "gsm8k"),
         "FINETUNING_TYPE": os.environ.get("FINETUNING_TYPE", "full"),
-        "FETCH_TIMEOUT": os.environ.get("FETCH_TIMEOUT", "600"),
-        "CASE_TIMEOUT": os.environ.get("CASE_TIMEOUT", "1500"),
+        "FETCH_TIMEOUT": os.environ.get(
+            "FETCH_TIMEOUT", str(defaults.get("fetch_timeout", 3600))
+        ),
+        "CASE_TIMEOUT": os.environ.get(
+            "CASE_TIMEOUT", str(defaults.get("case_timeout", 7200))
+        ),
     })
     return environment
 
@@ -184,7 +189,8 @@ def _execute(job: dict[str, Any], root: Path) -> int:
             step_rc = _stream(
                 _e2e_command(), cwd=root,
                 environment=_e2e_environment(
-                    venv, step, result_json, runner_label, image
+                    venv, step, result_json, runner_label, image,
+                    job.get("e2e_defaults") or {},
                 ),
                 log_path=log_path,
             )

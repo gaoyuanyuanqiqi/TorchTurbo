@@ -25,7 +25,7 @@ MAP="${MAP:-.github/workflows/model_map.json}"
 : "${MODEL_TYPE:=}"; : "${CASE_ID:=}"; : "${FRAMEWORK:=lf}"; : "${ENV_NAME:=}"; : "${RUNNER_LABEL:=}"
 : "${IMAGE:=}"; : "${LAYERS:=0}"; : "${MODEL_HINT:=}"; : "${REPO_IN:=}"
 : "${SEQ_LEN:=1024}"; : "${FINETUNING_TYPE:=full}"; : "${DATASET_IN:=gsm8k}"; : "${DATASET:=${DATASET_IN}}"
-: "${FETCH_TIMEOUT:=600}"; : "${CASE_TIMEOUT:=1500}"; : "${STRICT:=false}"; : "${E2E_CASES:=[]}"
+: "${FETCH_TIMEOUT:=3600}"; : "${CASE_TIMEOUT:=7200}"; : "${STRICT:=false}"; : "${E2E_CASES:=[]}"
 : "${INSTALL_SCRIPT:=}"; : "${TRAIN_SCRIPT:=}"; : "${HF_REPO:=}"
 
 export HF_MODULES_CACHE="${HF_MODULES_CACHE:-/tmp/hf-modules}"
@@ -69,10 +69,10 @@ cmd_plan() {
   # case state before that boundary, otherwise the child sees empty scripts.
   export CASE_ID FRAMEWORK ENV_NAME MODEL_TYPE LAYERS DATASET_IN \
     RUN_DIR INSTALL_SCRIPT TRAIN_SCRIPT HF_REPO REPO_IN MODEL_HINT \
-    PLAN_CARDS PLAN_SP PLAN_EP FETCH_TIMEOUT CASE_TIMEOUT RESULT_JSON STRICT
+    PLAN_CARDS PLAN_SP PLAN_EP RESULT_JSON STRICT
 
   echo "case=$CASE_ID model_type=$MODEL_TYPE framework=$FRAMEWORK env=$ENV_NAME run_dir=$RUN_DIR train=$TRAIN_SCRIPT repo=$HF_REPO"
-  echo "plan: cards=$PLAN_CARDS sp=$PLAN_SP ep=$PLAN_EP fetch_timeout=$FETCH_TIMEOUT case_timeout=$CASE_TIMEOUT"
+  echo "plan: cards=$PLAN_CARDS sp=$PLAN_SP ep=$PLAN_EP"
   result set --file "$RESULT_JSON" \
     env="$ENV_NAME" run_dir="$RUN_DIR" install_script="$INSTALL_SCRIPT" \
     train_script="$TRAIN_SCRIPT"

@@ -102,7 +102,7 @@ def _job(catalog: CiCatalog, image: str, device: str, stage: str,
             f"no lane for image={image} device={device} slots={required_slots}",
         ))
         return None
-    return {
+    job = {
         "id": f"{lane.key}/{work_id}" if work_id else lane.key,
         "image": image,
         "device": device,
@@ -115,6 +115,12 @@ def _job(catalog: CiCatalog, image: str, device: str, stage: str,
         "tests": {},
         "e2e": defaultdict(list),
     }
+    if stage == "e2e":
+        job["e2e_defaults"] = {
+            "fetch_timeout": catalog.e2e_defaults.fetch_timeout,
+            "case_timeout": catalog.e2e_defaults.case_timeout,
+        }
+    return job
 
 
 def _steps(job: dict[str, Any]) -> list[dict[str, Any]]:
@@ -213,7 +219,7 @@ def compile_plan(catalog: CiCatalog, test_facts: dict[str, TestFacts],
 
     output_jobs = []
     for job in sorted(jobs, key=lambda item: item["id"]):
-        output_jobs.append({
+        output = {
             "id": job["id"],
             "image": job["image"],
             "device": job["device"],
@@ -224,7 +230,10 @@ def compile_plan(catalog: CiCatalog, test_facts: dict[str, TestFacts],
             "runner_variable": job["runner_variable"],
             "runner": job["runner"],
             "steps": _steps(job),
-        })
+        }
+        if "e2e_defaults" in job:
+            output["e2e_defaults"] = job["e2e_defaults"]
+        output_jobs.append(output)
     return {"schema": 1, "mode": selection.get("mode", "pr"), "jobs": output_jobs}, errors
 
 
@@ -304,6 +313,15 @@ def verify(catalog: CiCatalog, test_facts: dict[str, TestFacts],
         ))
     if len({job["id"] for job in sample_npu_jobs}) != len(sample_npu_jobs):
         failures.append(PlanError("verify", "NPU jobs must have unique ids"))
+    expected_e2e_defaults = {
+        "fetch_timeout": catalog.e2e_defaults.fetch_timeout,
+        "case_timeout": catalog.e2e_defaults.case_timeout,
+    }
+    for job in sample_npu_jobs:
+        if job["stage"] == "e2e" and job.get("e2e_defaults") != expected_e2e_defaults:
+            failures.append(PlanError(
+                "verify", f"E2E job {job['id']} is missing execution defaults"
+            ))
     if len(catalog.cases) >= 2:
         cases = [case.as_selection("verify") for case in catalog.cases[:2]]
         e2e_plan, e2e_errors = compile_plan(

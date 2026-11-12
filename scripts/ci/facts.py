@@ -54,6 +54,12 @@ class LaneSpec:
 
 
 @dataclass(frozen=True)
+class E2eDefaults:
+    fetch_timeout: int = 3600
+    case_timeout: int = 7200
+
+
+@dataclass(frozen=True)
 class E2eCase:
     model: str
     run_dir: str
@@ -117,6 +123,7 @@ class CiCatalog:
     cases: tuple[E2eCase, ...]
     model_envs: dict[str, ModelEnv]
     test_envs: dict[str, str]
+    e2e_defaults: E2eDefaults = field(default_factory=E2eDefaults)
     errors: list[str] = field(default_factory=list)
 
     @property
@@ -261,6 +268,26 @@ def _load_lanes(path: Path, errors: list[str]) -> dict[str, LaneSpec]:
         if not any(lane.device == device for lane in lanes.values()):
             errors.append(f"{path}: no {device} lane is defined")
     return lanes
+
+
+def _load_e2e_defaults(path: Path, errors: list[str]) -> E2eDefaults:
+    raw = _read_yaml(path, errors).get("e2e_defaults") or {}
+    if not isinstance(raw, dict):
+        errors.append(f"{path}: e2e_defaults must be a mapping")
+        return E2eDefaults()
+    try:
+        defaults = E2eDefaults(
+            fetch_timeout=int(raw.get("fetch_timeout", 3600)),
+            case_timeout=int(raw.get("case_timeout", 7200)),
+        )
+    except (TypeError, ValueError):
+        errors.append(f"{path}: e2e_defaults values must be integers")
+        return E2eDefaults()
+    if defaults.fetch_timeout < 1 or defaults.case_timeout <= defaults.fetch_timeout:
+        errors.append(
+            f"{path}: e2e_defaults requires 0 < fetch_timeout < case_timeout"
+        )
+    return defaults
 
 
 def _load_model_envs(path: Path, envs: dict[str, EnvSpec],
@@ -423,8 +450,10 @@ def _load_models(path: Path, errors: list[str]) -> dict[str, dict[str, Any]]:
 @lru_cache(maxsize=4)
 def load_catalog(root: Path) -> CiCatalog:
     errors: list[str] = []
+    lanes_path = root / "scripts" / "ci" / "lanes.yml"
     envs = _load_envs(root / "scripts" / "ci" / "envs.toml", errors)
-    lanes = _load_lanes(root / "scripts" / "ci" / "lanes.yml", errors)
+    lanes = _load_lanes(lanes_path, errors)
+    e2e_defaults = _load_e2e_defaults(lanes_path, errors)
     images = frozenset(lane.image for lane in lanes.values())
     model_envs, test_envs = _load_model_envs(
         root / "scripts" / "ci" / "model_env.toml", envs, images, errors
@@ -445,7 +474,8 @@ def load_catalog(root: Path) -> CiCatalog:
         if model not in models:
             errors.append(f"model_env.toml: model {model!r} is not in model_map.json")
     return CiCatalog(root=root, envs=envs, lanes=lanes, models=models, cases=cases,
-                     model_envs=model_envs, test_envs=test_envs, errors=errors)
+                     model_envs=model_envs, test_envs=test_envs,
+                     e2e_defaults=e2e_defaults, errors=errors)
 
 
 def _markers(node: ast.AST) -> set[str]:

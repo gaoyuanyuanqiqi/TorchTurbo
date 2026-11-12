@@ -1,3 +1,8 @@
+e2e_defaults:
+  # Timeout caps for every E2E case. Cold model downloads can exceed 47 GiB.
+  fetch_timeout: 3600
+  case_timeout: 7200
+
 lanes:
   # One lane per (image, device, runner capacity). Work aggregates before a lane
   # is chosen, so processes/cards are requirements, not job keys.
