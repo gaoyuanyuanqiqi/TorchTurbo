@@ -16,10 +16,11 @@ try:
 except ImportError:  # pragma: no cover - lint installs PyYAML
     yaml = None
 
-DEVICE_MARKERS = frozenset({"cpu", "npu"})
-RANK_MARKERS = {"rank_2": 2, "rank_4": 4, "rank_8": 8}
-REQUIRED_MARKERS = ("cpu", "npu", *RANK_MARKERS, "integration")
-KNOWN_MARKERS = DEVICE_MARKERS | frozenset(RANK_MARKERS) | {"integration"}
+DEVICE_MARKERS = frozenset({"cpu", "npu", "gpu"})
+MULTI_DEVICE_MARKERS = frozenset({"multi_npu", "multi_gpu"})
+MULTI_DEVICE_TARGETS = {"multi_npu": "npu", "multi_gpu": "gpu"}
+REQUIRED_MARKERS = ("cpu", "npu", "multi_npu", "gpu", "multi_gpu", "integration")
+KNOWN_MARKERS = frozenset(REQUIRED_MARKERS)
 MODEL_PACKAGES = frozenset({"base", "modules", "registry", "weight_converter"})
 FRAMEWORK_PACKAGES = {"llamafactory": "lf", "swift": "swift"}
 
@@ -90,14 +91,17 @@ class ModelEnv:
 @dataclass(frozen=True)
 class TestFacts:
     path: str
-    cpu_ranks: frozenset[int]
-    npu_ranks: frozenset[int]
+    devices: frozenset[str]
+    device_processes: tuple[tuple[str, int], ...]
     families: frozenset[str]
     frameworks: frozenset[str]
     integration: bool
     env: str
     image: str
     process: str
+
+    def processes_for(self, device: str) -> int:
+        return dict(self.device_processes).get(device, 1)
 
 
 @dataclass
@@ -234,7 +238,7 @@ def _load_lanes(path: Path, errors: list[str]) -> dict[str, LaneSpec]:
         )
         if not lane.image:
             errors.append(f"{path}: lane {key!r} has no image")
-        if lane.device not in {"cpu", "npu"}:
+        if lane.device not in {"cpu", "npu", "gpu"}:
             errors.append(f"{path}: lane {key!r} has unknown device {lane.device!r}")
         if slots < 1:
             errors.append(f"{path}: lane {key!r} must have at least one slot")
@@ -485,6 +489,110 @@ def _literal_int(call: ast.Call, name: str) -> int | None:
     return None
 
 
+def _dotted_name(node: ast.AST) -> str:
+    parts: list[str] = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+    return ".".join(reversed(parts))
+
+
+def _literal_string(node: ast.AST) -> str:
+    return node.value.strip().lower() if isinstance(node, ast.Constant) and isinstance(
+        node.value, str
+    ) else ""
+
+
+def _normalized_device(value: str) -> str:
+    return "gpu" if value == "cuda" else value
+
+
+def _device_evidence(tree: ast.AST) -> set[str]:
+    """Return devices with direct tensor/runtime evidence below ``tree``."""
+    # Mocked runtime configuration does not execute device code.
+    configured_devices: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = _dotted_name(node.func).rsplit(".", 1)[-1]
+        if name not in {"SimpleNamespace", "Namespace"}:
+            continue
+        for keyword in node.keywords:
+            if keyword.arg == "device":
+                configured_devices.update(id(child) for child in ast.walk(keyword.value))
+
+    devices: set[str] = set()
+    for node in ast.walk(tree):
+        if id(node) in configured_devices:
+            continue
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            modules = ([alias.name for alias in node.names]
+                       if isinstance(node, ast.Import) else [node.module or ""])
+            for module in modules:
+                root = module.split(".", 1)[0]
+                if root == "fla_npu":
+                    devices.add("npu")
+            continue
+        if isinstance(node, ast.ClassDef):
+            for base in node.bases:
+                if _dotted_name(base).rsplit(".", 1)[-1] == "CpuRuntime":
+                    devices.add("cpu")
+            continue
+        if not isinstance(node, ast.Call):
+            continue
+        dotted = _dotted_name(node.func)
+        name = dotted.rsplit(".", 1)[-1]
+        if name in {"npu", "cuda"} and dotted.count(".") >= 1:
+            devices.add(_normalized_device(name))
+        elif name in {"to", "device", "init_device_mesh"} and node.args:
+            value = _literal_string(node.args[0])
+            device = _normalized_device(value)
+            if device in DEVICE_MARKERS:
+                devices.add(device)
+        elif name in {"require_npu", "require_npus"}:
+            devices.add("npu")
+        elif dotted == "CpuRuntime":
+            devices.add("cpu")
+        for keyword in node.keywords:
+            if keyword.arg == "device":
+                value = _literal_string(keyword.value)
+                device = _normalized_device(value)
+                if device in DEVICE_MARKERS:
+                    devices.add(device)
+    return devices
+
+
+def _parametrized_processes(tree: ast.AST) -> int:
+    """Read world-size values from pytest parametrization, if present."""
+    required = 1
+    names = {"world_size", "nprocs", "num_processes", "rank_size"}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or _dotted_name(node.func).rsplit(
+                ".", 1)[-1] != "parametrize" or len(node.args) < 2:
+            continue
+        try:
+            parameters = ast.literal_eval(node.args[0])
+            values = ast.literal_eval(node.args[1])
+        except (ValueError, SyntaxError):
+            continue
+        if isinstance(parameters, str):
+            parameters = [part.strip() for part in parameters.split(",")]
+        if not isinstance(parameters, (list, tuple)):
+            continue
+        indexes = [index for index, name in enumerate(parameters)
+                   if isinstance(name, str) and name in names]
+        if not indexes or not isinstance(values, (list, tuple)):
+            continue
+        for row in values:
+            row = row if isinstance(row, (list, tuple)) else (row,)
+            for index in indexes:
+                if index < len(row) and isinstance(row[index], int):
+                    required = max(required, row[index])
+    return required
+
+
 def _multiprocess_rank(tree: ast.Module) -> int:
     required = 1
     for node in ast.walk(tree):
@@ -493,12 +601,17 @@ def _multiprocess_rank(tree: ast.Module) -> int:
         func = node.func
         name = func.attr if isinstance(func, ast.Attribute) else (
             func.id if isinstance(func, ast.Name) else "")
-        if name not in {"spawn", "init_process_group"}:
+        if name not in {"spawn", "init_process_group", "require_npus"}:
             continue
-        key = "nprocs" if name == "spawn" else "world_size"
-        size = _literal_int(node, key)
+        if name == "require_npus":
+            size = node.args[0].value if node.args and isinstance(
+                node.args[0], ast.Constant
+            ) and isinstance(node.args[0].value, int) else None
+        else:
+            key = "world_size" if name == "init_process_group" else "nprocs"
+            size = _literal_int(node, key)
         required = max(required, size if size is not None else 2)
-    return required
+    return max(required, _parametrized_processes(tree))
 
 
 def _process_unit(path: str, families: set[str]) -> str:
@@ -548,36 +661,62 @@ def scan_tests(catalog: CiCatalog) -> tuple[dict[str, TestFacts], list[PlanError
         tests = [node for node in ast.walk(tree)
                  if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
                  and node.name.startswith("test")]
-        cpu_ranks: set[int] = set()
-        npu_ranks: set[int] = set()
+        devices: set[str] = set()
+        multi_devices: set[str] = set()
+        device_processes: dict[str, int] = {}
         integration = "integration" in module_markers
         for test in tests:
             markers = module_markers | set().union(
                 *(_markers(item) for item in test.decorator_list)
             )
-            devices = markers & DEVICE_MARKERS
-            rank_names = markers & RANK_MARKERS.keys()
-            if len(rank_names) > 1:
-                errors.append(PlanError(rel, f"{test.name} has multiple rank markers"))
-            ranks = {RANK_MARKERS[name] for name in rank_names}
-            rank = max(ranks, default=1)
+            test_devices = set(markers & DEVICE_MARKERS)
+            test_multi = markers & MULTI_DEVICE_MARKERS
+            test_devices.update(MULTI_DEVICE_TARGETS[name] for name in test_multi)
             integration |= "integration" in markers
-            if not devices:
-                errors.append(PlanError(rel, f"{test.name} has no cpu/npu marker"))
-            elif len(devices) > 1:
-                errors.append(PlanError(rel, f"{test.name} has both cpu and npu markers"))
-            elif "cpu" in devices:
-                cpu_ranks.add(rank)
-            else:
-                npu_ranks.add(rank)
+            if not test_devices:
+                errors.append(PlanError(rel, f"{test.name} has no device marker"))
+            elif "cpu" in test_devices and len(test_devices) > 1:
+                errors.append(PlanError(
+                    rel, f"{test.name} mixes cpu with accelerator markers"
+                ))
+            evidence = _device_evidence(test)
+            if evidence and test_devices.isdisjoint(evidence):
+                errors.append(PlanError(
+                    rel, f"{test.name} markers {sorted(test_devices)} disagree with "
+                    f"code evidence {sorted(evidence)}"
+                ))
+            devices |= test_devices
+            multi_devices |= {MULTI_DEVICE_TARGETS[name] for name in test_multi}
+            test_processes = _multiprocess_rank(test)
+            for device in test_devices:
+                device_processes[device] = max(
+                    device_processes.get(device, 1), test_processes
+                )
         if not tests:
             continue
-        required_rank = _multiprocess_rank(tree)
-        actual_rank = max(cpu_ranks | npu_ranks, default=1)
-        if required_rank > actual_rank:
+        processes = _multiprocess_rank(tree)
+        evidence = _device_evidence(tree)
+        if evidence and devices.isdisjoint(evidence):
             errors.append(PlanError(
-                rel, f"multiprocess world needs rank_{required_rank}, found rank_{actual_rank}"
+                rel, f"device markers {sorted(devices)} disagree with code evidence "
+                f"{sorted(evidence)}"
             ))
+        if len(devices) == 1:
+            only_device = next(iter(devices))
+            device_processes[only_device] = max(
+                device_processes.get(only_device, 1), processes
+            )
+        for device in sorted(multi_devices):
+            if device_processes.get(device, 1) < 2:
+                errors.append(PlanError(
+                    rel, f"multi_{device} marker needs at least two processes"
+                ))
+        for device in sorted(devices - {"cpu"} - multi_devices):
+            if device_processes.get(device, 1) >= 2:
+                errors.append(PlanError(
+                    rel, f"{device} facts need multi_{device}, found "
+                    f"{device_processes[device]} processes"
+                ))
         modules, external = _imports(tree)
         families = {name.split(".")[2] for name in modules
                     if name.startswith("torchturbo.models.")
@@ -598,8 +737,8 @@ def scan_tests(catalog: CiCatalog) -> tuple[dict[str, TestFacts], list[PlanError
             errors.append(PlanError(rel, "test imports model families with different images"))
         facts[rel] = TestFacts(
             path=rel,
-            cpu_ranks=frozenset(cpu_ranks),
-            npu_ranks=frozenset(npu_ranks),
+            devices=frozenset(devices),
+            device_processes=tuple(sorted(device_processes.items())),
             families=frozenset(families),
             frameworks=frozenset(frameworks),
             integration=integration,

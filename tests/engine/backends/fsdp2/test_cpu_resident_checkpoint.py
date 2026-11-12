@@ -35,10 +35,7 @@ from torchturbo.models.qwen4_exp.ple import NGramEmbedding
 from torchturbo.runtime.cpu import CpuRuntime
 
 
-pytestmark = [
-    pytest.mark.cpu,
-    pytest.mark.rank_4,
-]
+pytestmark = pytest.mark.cpu
 
 
 

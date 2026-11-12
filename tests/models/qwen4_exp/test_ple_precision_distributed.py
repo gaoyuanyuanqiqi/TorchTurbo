@@ -18,10 +18,7 @@ from .test_ple import adapted, new_reference
 from .test_ple_distributed import _init_process_group
 
 
-pytestmark = [
-    pytest.mark.cpu,
-    pytest.mark.rank_4,
-]
+pytestmark = pytest.mark.cpu
 
 
 

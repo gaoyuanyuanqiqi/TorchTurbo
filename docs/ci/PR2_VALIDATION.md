@@ -2,7 +2,7 @@
 
 ## 范围
 
-- `plan.py` 输出 CPU `host_jobs` matrix。
+- `plan.py` 输出 CPU `cpu_jobs` matrix。
 - `ci-pr.yml` 的 `cpu-unit-tests` 改为 matrix，每个 entry 执行一个 plan job。
 - `run_job.py` 按 step 顺序创建 / 复用 venv，逐进程运行 pytest 并汇总 JUnit。
 - `venv_manager.py` 以依赖内容和 Python 版本生成 cache key；不删除共享 cache。
@@ -25,7 +25,7 @@ python3 scripts/ci/local_lint_select_test.py
 - `plan facts OK (10 E2E cases / 162 tests)`；
 - selector 的 5 个自检阶段全部通过；
 - 全量 selection 生成 4 个 CPU matrix entry，全部 `device=cpu`；
-- `host_jobs` 序列化后约 14 KB，远低于 step output 上限；
+- `cpu_jobs` 序列化后约 14 KB，远低于 step output 上限；
 - `workflow_dispatch.test_path` 已验证文件、目录和 node id：node id 原样传给
   pytest；NPU-only 路径产生空 CPU matrix，不误跑 CPU lane；
 - `env_pod.py probe/check --device cpu` 在本机 `torch 2.10.0+cpu` 下通过；
@@ -42,7 +42,7 @@ python3 scripts/ci/local_lint_select_test.py
 
 ## 预期 CI 行为
 
-- `select` 先生成 selection 和 plan，再输出 `host_jobs`。
+- `select` 先生成 selection 和 plan，再输出 `cpu_jobs`。
 - `cpu-unit-tests` 只为 plan 中的 `(image, cpu resource)` 生成 box。
 - job 内按 env 建 venv；同一 env 的多个 process-isolated pytest step 复用 venv。
 - 任一 step 失败立即停止，后续 step 不继续占用 runner。

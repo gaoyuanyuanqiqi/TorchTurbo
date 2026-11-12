@@ -27,7 +27,7 @@ from torchturbo.models.weight_converter import BaseWeightConverter
 from torchturbo.runtime.cpu import CpuRuntime
 
 
-pytestmark = [pytest.mark.cpu, pytest.mark.rank_2]
+pytestmark = pytest.mark.cpu
 
 
 _NGRAM_NAMES = (

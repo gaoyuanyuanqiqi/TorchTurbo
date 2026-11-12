@@ -25,7 +25,7 @@ MAP="${MAP:-.github/workflows/model_map.json}"
 : "${MODEL_TYPE:=}"; : "${CASE_ID:=}"; : "${FRAMEWORK:=lf}"; : "${ENV_NAME:=}"; : "${RUNNER_LABEL:=}"
 : "${IMAGE:=}"; : "${LAYERS:=0}"; : "${MODEL_HINT:=}"; : "${REPO_IN:=}"
 : "${SEQ_LEN:=1024}"; : "${FINETUNING_TYPE:=full}"; : "${DATASET_IN:=gsm8k}"; : "${DATASET:=${DATASET_IN}}"
-: "${FETCH_TIMEOUT:=600}"; : "${STRICT:=false}"; : "${E2E_CASES:=[]}"
+: "${FETCH_TIMEOUT:=600}"; : "${CASE_TIMEOUT:=1500}"; : "${STRICT:=false}"; : "${E2E_CASES:=[]}"
 : "${INSTALL_SCRIPT:=}"; : "${TRAIN_SCRIPT:=}"; : "${HF_REPO:=}"
 
 export HF_MODULES_CACHE="${HF_MODULES_CACHE:-/tmp/hf-modules}"
@@ -362,7 +362,8 @@ cmd_lane() {
     elif ! cmd_install; then
       rc=1
     else
-      ( GITHUB_OUTPUT=/dev/null cmd_run )
+      ( GITHUB_OUTPUT=/dev/null timeout --foreground --kill-after=30s \
+          "$CASE_TIMEOUT" bash "$0" run )
       case_rc=$?
       if [ "$case_rc" -eq 3 ]; then skipped=$((skipped + 1))
       elif [ "$case_rc" -ne 0 ]; then rc=1

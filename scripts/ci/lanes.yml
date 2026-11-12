@@ -1,26 +1,11 @@
 lanes:
-  default/cpu-1:
-    image: default
-    device: cpu
-    slots: 1
-    runner_variable: CI_CPU_RUNNER
-    runner: ubuntu-22.04-arm
-  default/cpu-2:
-    image: default
-    device: cpu
-    slots: 2
-    runner_variable: CI_CPU_RUNNER
-    runner: ubuntu-22.04-arm
-  default/cpu-4:
-    image: default
-    device: cpu
-    slots: 4
-    runner_variable: CI_CPU_RUNNER
-    runner: ubuntu-22.04-arm
-  default/cpu-8:
+  # One lane per (image, device, runner capacity). Work aggregates before a lane
+  # is chosen, so processes/cards are requirements, not job keys.
+  default/cpu:
     image: default
     device: cpu
     slots: 8
+    resource: cpu
     runner_variable: CI_CPU_RUNNER
     runner: ubuntu-22.04-arm
   default/npu-2:

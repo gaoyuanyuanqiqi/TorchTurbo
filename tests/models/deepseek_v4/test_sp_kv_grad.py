@@ -18,7 +18,7 @@ from torchturbo.models.modules.attention.ulysses import (  # noqa: E402
     all_gather_sp_with_grad_reduce,
 )
 
-pytestmark = [pytest.mark.cpu, pytest.mark.rank_2]
+pytestmark = pytest.mark.cpu
 
 D, L = 32, 256
 HALF = L // 2

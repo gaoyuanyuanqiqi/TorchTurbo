@@ -62,13 +62,10 @@ jobs:
     runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
     timeout-minutes: 20
     outputs:
-      cpu_unit_run: ${{ steps.select.outputs.cpu_unit_run }}
-      npu_unit_run: ${{ steps.select.outputs.npu_unit_run }}
-      npu_e2e_run: ${{ steps.select.outputs.npu_e2e_run }}
-      npu_unit_files: ${{ steps.select.outputs.npu_unit_files }}
-      e2e_cases: ${{ steps.select.outputs.e2e_cases }}
-      host_jobs: ${{ steps.plan.outputs.host_jobs || '[]' }}
-      host_job_count: ${{ steps.plan.outputs.host_job_count || '0' }}
+      cpu_jobs: ${{ steps.plan.outputs.cpu_jobs || '[]' }}
+      cpu_job_count: ${{ steps.plan.outputs.cpu_job_count || '0' }}
+      npu_jobs: ${{ steps.plan.outputs.npu_jobs || '[]' }}
+      npu_job_count: ${{ steps.plan.outputs.npu_job_count || '0' }}
       image: ${{ steps.image.outputs.image }}
       summary: ${{ steps.select.outputs.summary }}
       failed_step: ${{ steps.failed_step.outputs.failed_step }}
@@ -131,8 +128,8 @@ jobs:
             --summary-file "$GITHUB_STEP_SUMMARY" \
             --image-ref '${{ steps.image.outputs.image }}'
 
-      # The CPU matrix consumes host_jobs. NPU execution remains on the old
-      # jobs until the container runner lands.
+      # The plan aggregates work by (image, device), then chooses one capacity
+      # lane for that device. Matrices therefore grow by image/device, not rank.
       - name: plan
         id: plan
         if: ${{ success() }}
@@ -155,19 +152,19 @@ jobs:
           PLAN_OUTCOME: ${{ steps.plan.outcome }}
         run: python3 scripts/ci/report/report_gate.py failed-step
 
-  # One matrix entry per (image, CPU resource) from the plan. Dependencies are
+  # One matrix entry per CPU image from the plan. Dependencies are
   # isolated inside the job by venv, so model and framework count do not add boxes.
   l1_cpu_unit:
     name: cpu-unit-tests (${{ matrix.id }})
     needs: select
     if: |
       always() && needs.select.result == 'success' &&
-      needs.select.outputs.host_job_count != '0'
+      needs.select.outputs.cpu_job_count != '0'
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(needs.select.outputs.host_jobs) }}
-    runs-on: ${{ vars.CI_CPU_RUNNER || matrix.runner }}
+        include: ${{ fromJSON(needs.select.outputs.cpu_jobs) }}
+    runs-on: ${{ vars[matrix.runner_variable] || matrix.runner }}
     timeout-minutes: 40
 
     defaults:
@@ -196,7 +193,7 @@ jobs:
       - name: execute plan
         env:
           JOB: ${{ toJSON(matrix) }}
-          RUNNER_LABEL: ${{ vars.CI_CPU_RUNNER || matrix.runner }}
+          RUNNER_LABEL: ${{ vars[matrix.runner_variable] || matrix.runner }}
           RESULT_JSON: ${{ runner.temp }}/ci-result.json
           CI_JOB_LOG: ${{ runner.temp }}/turbo-ci.log
           JUNIT_OUT: ${{ runner.temp }}/pytest.xml
@@ -224,19 +221,25 @@ jobs:
           path: ${{ runner.temp }}/turbo-ci-venv
           key: turbo-venv-${{ runner.os }}-${{ runner.arch }}-${{ matrix.id }}-${{ hashFiles('scripts/ci/envs.toml', 'scripts/ci/envs/**', 'pyproject.toml') }}
 
-  # Containerised. Empty TEST_FILES means the whole lane: image and repo-wide
-  # changes use that; targeted changes pass the selected NPU files.
-  l2_npu_unit:
-    name: npu-unit-tests
+  # NPU unit and E2E steps share one job. The lane already reflects the maximum
+  # process/cards requirement of the selected work set.
+  l2_npu:
+    name: npu-tests (${{ matrix.id }})
     needs: select
     # Fork PRs get no secrets, and handing secrets to fork code is RCE.
     if: |
       always() && needs.select.result == 'success' &&
-      needs.select.outputs.npu_unit_run == 'true' &&
+      needs.select.outputs.npu_job_count != '0' &&
       (github.event_name != 'pull_request' ||
        github.event.pull_request.head.repo.full_name == github.repository)
-    runs-on: ${{ vars.CI_NPU_RUNNER || 'linux-aarch64-a3-800i-2' }}
-    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.select.outputs.npu_jobs) }}
+    runs-on: ${{ vars[matrix.runner_variable] || matrix.runner }}
+    timeout-minutes: 360
+    outputs:
+      skip_reason: ${{ steps.execute.outputs.skip_reason }}
 
     container:
       image: ${{ needs.select.outputs.image }}
@@ -258,8 +261,8 @@ jobs:
         run: |
           set -uo pipefail
           python3 scripts/ci/report/report_result.py init --file "$RESULT_JSON" \
-            kind=pytest model_type=pytest-npu-unit mode=npu \
-            runner_label="${{ vars.CI_NPU_RUNNER || 'linux-aarch64-a3-800i-2' }}" \
+            kind=pytest model_type=pytest-npu-unit mode=npu job_id="${{ matrix.id }}" \
+            runner_label="${{ vars[matrix.runner_variable] || matrix.runner }}" \
             image="${{ needs.select.outputs.image }}"
 
           uname -m; nproc; free -h | head -2; df -h / | tail -1; python -V
@@ -267,19 +270,23 @@ jobs:
       - name: environment check
         run: python3 scripts/ci/common/env_pod.py probe --file /tmp/torch-before.json
 
-      - name: install
+      - name: execute plan
+        id: execute
         env:
-          MODE: npu
+          JOB: ${{ toJSON(matrix) }}
+          RUNNER_LABEL: ${{ vars[matrix.runner_variable] || matrix.runner }}
+          IMAGE: ${{ needs.select.outputs.image }}
           RESULT_JSON: /tmp/ci-result.json
-        run: bash scripts/ci/unit_tests/run_tests.sh install
-
-      - name: pytest
-        env:
-          MODE: npu
-          TEST_FILES: ${{ needs.select.outputs.npu_unit_files }}
-          TEST_PATH: ${{ inputs.test_path }}
-          RESULT_JSON: /tmp/ci-result.json
-        run: bash scripts/ci/unit_tests/run_tests.sh
+          CI_JOB_LOG: /tmp/turbo-ci.log
+          JUNIT_OUT: /tmp/pytest.xml
+          VERSIONS_OUT: /tmp/versions.txt
+          CI_VENV_ROOT: /tmp/turbo-ci-venv
+          SEQ_LEN: '4096'
+          DATASET_IN: 'gsm8k'
+          FINETUNING_TYPE: 'full'
+          FETCH_TIMEOUT: '600'
+          CASE_TIMEOUT: '1500'
+        run: python3 scripts/ci/run_job.py --job-json "$JOB"
 
       - name: summary
         if: always()
@@ -288,58 +295,10 @@ jobs:
         run: |
           set -uo pipefail
           python3 scripts/ci/report/report_result.py report --file "$RESULT_JSON" \
-            --train-log /tmp/pytest.log --junit /tmp/pytest.xml >> "$GITHUB_STEP_SUMMARY" || true
+            --train-log /tmp/turbo-ci.log --versions /tmp/versions.txt \
+            --junit /tmp/pytest.xml >> "$GITHUB_STEP_SUMMARY" || true
           python3 scripts/ci/report/report_result.py notice --file "$RESULT_JSON" \
             --model-type pytest-npu-unit || true
-
-  # Training cases loop inside the job (run_train.sh lane): a matrix would put one
-  # box per case on the graph.
-  l3_npu_e2e:
-    name: npu-e2e-tests
-    needs: select
-    if: |
-      always() && needs.select.result == 'success' &&
-      needs.select.outputs.npu_e2e_run == 'true' &&
-      (github.event_name != 'pull_request' ||
-       github.event.pull_request.head.repo.full_name == github.repository)
-    runs-on: ${{ vars.CI_E2E_RUNNER || 'linux-aarch64-a3-800i-8' }}
-    timeout-minutes: 45
-    outputs:
-      skip_reason: ${{ steps.lane.outputs.skip_reason }}
-
-    container:
-      image: ${{ needs.select.outputs.image }}
-      credentials:
-        username: ${{ secrets.SWR_USERNAME }}
-        password: ${{ secrets.SWR_PASSWORD }}
-      options: --user root
-
-    defaults:
-      run:
-        shell: bash
-
-    steps:
-      - uses: actions/checkout@v4
-
-      # 20 s to find "no NPU" beats discovering it after installing deps.
-      - name: environment check
-        id: environment
-        run: python3 scripts/ci/common/env_pod.py probe --file /tmp/torch-before.json
-
-      - name: training orchestration
-        id: lane
-        timeout-minutes: 25
-        env:
-          E2E_CASES: ${{ needs.select.outputs.e2e_cases }}
-          FRAMEWORK: lf
-          RUNNER_LABEL: ${{ vars.CI_E2E_RUNNER || 'linux-aarch64-a3-800i-8' }}
-          IMAGE: ${{ needs.select.outputs.image }}
-          SEQ_LEN: '4096'
-          DATASET_IN: 'gsm8k'
-          FINETUNING_TYPE: 'full'
-          FETCH_TIMEOUT: '600'
-          RESULT_JSON: /tmp/ci-result.json
-        run: bash scripts/ci/e2e_tests/run_train.sh lane
 
       # timeout-minutes only kills the process; children would keep the cards.
       - name: environment cleanup
@@ -351,7 +310,7 @@ jobs:
   # select is a direct dep: a failed plan skips the lanes in seconds.
   gate:
     name: gate
-    needs: [select, l1_cpu_unit, l2_npu_unit, l3_npu_e2e]
+    needs: [select, l1_cpu_unit, l2_npu]
     # always() so lanes' results are judged even when select failed; the label
     # guard mirrors select, or a manual-label run would judge an empty plan.
     if: ${{ always() && !startsWith(github.event.label.name || '', 'ci:manual:') }}
@@ -369,13 +328,11 @@ jobs:
         env:
           R_SEL: ${{ needs.select.result }}
           SEL_FAILED_STEP: ${{ needs.select.outputs.failed_step }}
-          R_CPU_UNIT: ${{ needs.l1_cpu_unit.result }}
-          R_NPU_UNIT: ${{ needs.l2_npu_unit.result }}
-          R_NPU_E2E: ${{ needs.l3_npu_e2e.result }}
-          CPU_UNIT_RUN: ${{ needs.select.outputs.cpu_unit_run }}
-          NPU_UNIT_RUN: ${{ needs.select.outputs.npu_unit_run }}
-          NPU_E2E_RUN: ${{ needs.select.outputs.npu_e2e_run }}
-          SKIP_REASON: ${{ needs.l3_npu_e2e.outputs.skip_reason }}
+          R_CPU: ${{ needs.l1_cpu_unit.result }}
+          R_NPU: ${{ needs.l2_npu.result }}
+          CPU_RUN: ${{ needs.select.outputs.cpu_job_count != '0' }}
+          NPU_RUN: ${{ needs.select.outputs.npu_job_count != '0' }}
+          SKIP_REASON: ${{ needs.l2_npu.outputs.skip_reason }}
           # Only the string is passed; report_gate.py decides what ci:e2e:strict means.
           LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
           IS_FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}

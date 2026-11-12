@@ -14,7 +14,7 @@ import torch.multiprocessing as mp
 from torchturbo.models.modules.comm.comm import all_to_all
 
 
-pytestmark = [pytest.mark.cpu, pytest.mark.rank_4]
+pytestmark = pytest.mark.cpu
 
 
 def _counts(world: int, case: str) -> list[list[int]]:

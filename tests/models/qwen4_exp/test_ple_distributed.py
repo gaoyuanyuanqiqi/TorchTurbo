@@ -34,10 +34,7 @@ from .test_ple import adapted, new_reference, row_ids
 from .test_ple_loading import load_tables, make_checkpoint
 
 
-pytestmark = [
-    pytest.mark.cpu,
-    pytest.mark.rank_4,
-]
+pytestmark = pytest.mark.cpu
 
 
 

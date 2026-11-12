@@ -19,9 +19,10 @@ scripts/ci/
   local_*        本机自检脚本，不进 CI
 ```
 
-正式 CPU 路径由 `plan.py` 生成 `host_jobs` matrix，再由 `run_job.py` 按 env
-创建 venv 执行。`unit_tests/run_tests.sh` 只保留给旧 NPU job 和手动回退使用；
-PR3 切换容器 matrix 后再删除。
+正式路径由 `plan.py` 生成 `cpu_jobs`、`npu_jobs` matrix，再由 `run_job.py`
+按 env 创建 venv，执行该设备的 pytest 和 e2e steps。GPU 当前只保留 marker
+和事实，不声明 `gpu_unit`，也不生成 GPU job。
+`unit_tests/run_tests.sh` 只保留给手动回退使用。
 
 通用规则交给 Ruff（Python）、`shellcheck`、`actionlint` 和 `hadolint`；自定义
 检查只保留通用工具看不到的仓库契约：job 依赖图、选测器自检、模型映射和 pytest
@@ -36,7 +37,7 @@ marker。
 | `lint_select/select_tests.py` | 这次改动该跑什么？ | `--explain` / `--coverage` / `--verify` / `--changed-from git` / `--mode pr\|full --labels …` |
 | `lint_select/lint_check.py` | 静态体检总入口；通用检查先跑，Turbo 契约后跑 | 无参数 = 全跑 / `--only NAME` |
 | `plan.py` | 选中项怎么变成 job / env / 进程？ | `--selection` / `--verify` / `--github-output` |
-| `run_job.py` | 一个 plan job 怎么装依赖、跑 pytest？ | `--job-json` 或 `--plan + --job-id` |
+| `run_job.py` | 一个 plan job 怎么装依赖、跑 pytest / e2e？ | `--job-json` 或 `--plan + --job-id` |
 | `venv_manager.py` | env 依赖装在哪、何时复用？ | 被 `run_job.py` 调用 |
 | `unit_tests/run_tests.sh` | 旧 NPU / 手动回退泳道怎么跑？ | `install` / `test`（`MODE=cpu\|npu`） |
 | `e2e_tests/prepare_model.py` | 模型和派生配置是否完成预处理？ | `plan` / `fetch` / `probe` / `cases` |
@@ -104,7 +105,7 @@ python3 scripts/ci/local_lint_select_test.py --only docker
 被下面这些 workflow 调用，`.github/workflows` 里的入口只负责声明输入：
 
 ```
-ci-pr.yml          唯一入口  select{lint,plan} -> {cpu matrix, npu-unit-tests, npu-e2e-tests} -> gate
+ci-pr.yml          唯一入口  select{lint,plan} -> {cpu, npu, gpu matrix} -> gate
                     mode=pr（PR 门禁） / mode=full（全量，不选测）
 ci-image.yml        构建基础镜像（**只手动 dispatch**）
 model_map.json      模型 -> 启动脚本 / 权重 / 端到端用例（被上面两个读）
@@ -176,7 +177,7 @@ python3 scripts/ci/plan.py --selection /tmp/s.json --output /tmp/p.json \
   --github-output /tmp/github-output
 
 # 执行计划中的一个 CPU job（会创建 venv 并安装依赖）
-python3 scripts/ci/run_job.py --plan /tmp/p.json --job-id default/cpu-1
+python3 scripts/ci/run_job.py --plan /tmp/p.json --job-id default/cpu
 
 # 解析模型对应的启动脚本 / 依赖脚本
 python3 scripts/ci/e2e_tests/prepare_model.py plan --map .github/workflows/model_map.json \
@@ -194,6 +195,7 @@ python3 scripts/ci/e2e_tests/prepare_model.py fetch --repo Qwen/Qwen3.5-35B-A3B 
 python3 scripts/ci/report/report_result.py junit --file /tmp/r.json --junit /tmp/pytest.xml
 
 # 门禁判定（手写 env 模拟各种结果）
-R_SEL=success SEL_FAILED_STEP=none R_CPU_UNIT=success R_NPU_UNIT=skipped R_NPU_E2E=skipped \
-  WANT_NPU=false WANT_E2E='[]' python3 scripts/ci/report/report_gate.py judge --mode pr
+R_SEL=success SEL_FAILED_STEP=none R_CPU=success R_NPU=skipped \
+  CPU_RUN=true NPU_RUN=false \
+  python3 scripts/ci/report/report_gate.py judge --mode pr
 ```

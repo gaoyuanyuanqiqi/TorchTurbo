@@ -22,11 +22,12 @@ def _load_selection(path: Path) -> dict[str, Any]:
 def _apply_test_path(root: Path, selection: dict[str, Any], value: str,
                      test_facts: dict[str, TestFacts]) -> tuple[
                          dict[str, Any], dict[str, list[str]], list[PlanError]]:
-    """Replace the CPU file list with an explicit manual test path."""
+    """Replace unit lane file lists with an explicit manual test path."""
     if not value or value == "-":
         return selection, {}, []
     selectors: dict[str, list[str]] = {}
     errors: list[PlanError] = []
+    lanes = dict(selection.get("lanes") or {})
     for token in value.split():
         base = token.split("::", 1)[0]
         candidate = (root / base).resolve()
@@ -48,12 +49,13 @@ def _apply_test_path(root: Path, selection: dict[str, Any], value: str,
             if facts is None:
                 errors.append(PlanError(path, "manual test path has no marker facts"))
                 continue
-            if facts.cpu_ranks:
-                selectors.setdefault(path, []).append(token if candidate.is_file() else path)
-    files = sorted(selectors)
+            selected = token if candidate.is_file() else path
+            for device in facts.devices:
+                lanes.setdefault(f"{device}_unit", {"run": False, "files": []})
+                lanes[f"{device}_unit"]["run"] = True
+                lanes[f"{device}_unit"].setdefault("files", []).append(path)
+            selectors.setdefault(path, []).append(selected)
     updated = dict(selection)
-    lanes = dict(selection.get("lanes") or {})
-    lanes["cpu_unit"] = {"run": bool(files), "files": files}
     updated["lanes"] = lanes
     return updated, selectors, errors
 
@@ -61,8 +63,6 @@ def _apply_test_path(root: Path, selection: dict[str, Any], value: str,
 def _rewrite_test_path_files(plan: dict[str, Any],
                              selectors: dict[str, list[str]]) -> None:
     for job in plan["jobs"]:
-        if job["device"] != "cpu":
-            continue
         for step in job["steps"]:
             if step["kind"] == "pytest":
                 step["files"] = sorted({
@@ -72,27 +72,34 @@ def _rewrite_test_path_files(plan: dict[str, Any],
                 })
 
 
-def _add_test(job: dict[str, Any], facts: TestFacts, device: str,
-              rank: int) -> None:
+def _marker_expression(device: str) -> str:
+    return "cpu" if device == "cpu" else f"{device} or multi_{device}"
+
+
+def _add_test(job: dict[str, Any], facts: TestFacts, device: str) -> None:
     key = (facts.env, facts.process)
+    processes = facts.processes_for(device)
     group = job["tests"].setdefault(key, {
         "kind": "pytest",
         "env": facts.env,
         "device": device,
-        "marker": device,
+        "marker": _marker_expression(device),
         "process": facts.process,
-        "rank": rank,
+        "processes": processes,
         "files": [],
     })
-    group["rank"] = max(group["rank"], rank)
+    group["processes"] = max(group["processes"], processes)
     group["files"].append(facts.path)
 
 
-def _job(catalog: CiCatalog, image: str, device: str, slots: int,
+def _job(catalog: CiCatalog, image: str, device: str, required_slots: int,
          errors: list[PlanError], path: str) -> dict[str, Any] | None:
-    lane = catalog.lane_for(image, device, slots)
+    lane = catalog.lane_for(image, device, required_slots)
     if lane is None:
-        errors.append(PlanError(path, f"no lane for image={image} device={device} slots={slots}"))
+        errors.append(PlanError(
+            path,
+            f"no lane for image={image} device={device} slots={required_slots}",
+        ))
         return None
     return {
         "id": lane.key,
@@ -100,6 +107,7 @@ def _job(catalog: CiCatalog, image: str, device: str, slots: int,
         "device": device,
         "resource": lane.resource,
         "slots": lane.slots,
+        "required_slots": required_slots,
         "runner_variable": lane.runner_variable,
         "runner": lane.runner,
         "tests": {},
@@ -129,9 +137,8 @@ def _lane_test_files(lane: dict[str, Any], test_facts: dict[str, TestFacts],
     if files:
         return files
     if lane.get("scope") == "all":
-        rank_field = "cpu_ranks" if device == "cpu" else "npu_ranks"
         return {test_path for test_path, facts in test_facts.items()
-                if getattr(facts, rank_field)}
+                if device in facts.devices}
     errors.append(PlanError(path, f"{device} lane is enabled without files or scope=all"))
     return set()
 
@@ -139,12 +146,11 @@ def _lane_test_files(lane: dict[str, Any], test_facts: dict[str, TestFacts],
 def compile_plan(catalog: CiCatalog, test_facts: dict[str, TestFacts],
                  selection: dict[str, Any]) -> tuple[dict[str, Any], list[PlanError]]:
     errors: list[PlanError] = []
-    jobs: dict[str, dict[str, Any]] = {}
+    work: dict[tuple[str, str], dict[str, Any]] = defaultdict(
+        lambda: {"tests": [], "cases": []}
+    )
     lanes = selection.get("lanes") or {}
-    for device, lane_name, rank_field in (
-        ("cpu", "cpu_unit", "cpu_ranks"),
-        ("npu", "npu_unit", "npu_ranks"),
-    ):
+    for device, lane_name in (("cpu", "cpu_unit"), ("npu", "npu_unit")):
         files = _lane_test_files(lanes.get(lane_name) or {}, test_facts, device,
                                  errors, lane_name)
         for path in sorted(files):
@@ -154,16 +160,12 @@ def compile_plan(catalog: CiCatalog, test_facts: dict[str, TestFacts],
                 continue
             if facts.env not in catalog.envs:
                 errors.append(PlanError(path, f"unknown env {facts.env!r}"))
-            ranks = getattr(facts, rank_field)
-            if not ranks:
-                errors.append(PlanError(path, "selected test has no rank for its lane"))
+            if device not in facts.devices:
+                errors.append(PlanError(
+                    path, f"selected test does not require {device}"
+                ))
                 continue
-            rank = max(ranks)
-            job = _job(catalog, facts.image, device, rank, errors, path)
-            if job is None:
-                continue
-            jobs.setdefault(job["id"], job)
-            _add_test(jobs[job["id"]], facts, device, rank)
+            work[(facts.image, device)]["tests"].append(facts)
 
     for selected in selection.get("e2e_cases") or []:
         case_id = str(selected.get("case_id") or "")
@@ -178,21 +180,35 @@ def compile_plan(catalog: CiCatalog, test_facts: dict[str, TestFacts],
                     case_id, f"selection {field}={selected[field]!r} "
                     f"does not match catalog {canonical[field]!r}"
                 ))
-        job = _job(catalog, case.image, "npu", case.cards, errors, case.case_id)
+        work[(case.image, "npu")]["cases"].append(canonical)
+
+    jobs: list[dict[str, Any]] = []
+    for (image, device), selected_work in sorted(work.items()):
+        required_slots = max(
+            [facts.processes_for(device) for facts in selected_work["tests"]]
+            + [int(case["cards"]) for case in selected_work["cases"]]
+            + [1]
+        )
+        path = (selected_work["tests"][0].path if selected_work["tests"]
+                else selected_work["cases"][0]["case_id"])
+        job = _job(catalog, image, device, required_slots, errors, path)
         if job is None:
             continue
-        jobs.setdefault(job["id"], job)
-        jobs[job["id"]]["e2e"][case.env].append(canonical)
+        for facts in selected_work["tests"]:
+            _add_test(job, facts, device)
+        for case in selected_work["cases"]:
+            job["e2e"][case["env"]].append(case)
+        jobs.append(job)
 
     output_jobs = []
-    for job_id in sorted(jobs):
-        job = jobs[job_id]
+    for job in sorted(jobs, key=lambda item: item["id"]):
         output_jobs.append({
-            "id": job_id,
+            "id": job["id"],
             "image": job["image"],
             "device": job["device"],
             "resource": job["resource"],
             "slots": job["slots"],
+            "required_slots": job["required_slots"],
             "runner_variable": job["runner_variable"],
             "runner": job["runner"],
             "steps": _steps(job),
@@ -201,7 +217,9 @@ def compile_plan(catalog: CiCatalog, test_facts: dict[str, TestFacts],
 
 
 def _summary(plan: dict[str, Any]) -> str:
-    lines = ["## Plan", "", "| job | runner | env | work |", "|---|---|---|---|"]
+    lines = ["## Plan", "",
+             "| job | required | runner | env | work |",
+             "|---|---:|---|---|---|"]
     for job in plan["jobs"]:
         for step in job["steps"]:
             if step["kind"] == "pytest":
@@ -209,16 +227,22 @@ def _summary(plan: dict[str, Any]) -> str:
             else:
                 work = "e2e " + ", ".join(case["case_id"] for case in step["cases"])
             lines.append(
-                f"| `{job['id']}` | `{job['runner']}` | `{step['env']}` | {work} |"
+                f"| `{job['id']}` | {job['required_slots']} | `{job['runner']}` | "
+                f"`{step['env']}` | {work} |"
             )
     if len(lines) == 4:
-        lines.append("| - | - | - | no work selected |")
+        lines.append("| - | - | - | - | no work selected |")
     return "\n".join(lines) + "\n"
 
 
-def host_jobs(plan: dict[str, Any]) -> list[dict[str, Any]]:
+def cpu_jobs(plan: dict[str, Any]) -> list[dict[str, Any]]:
     """Return CPU jobs in the compact shape consumed by an Actions matrix."""
     return [job for job in plan["jobs"] if job["device"] == "cpu"]
+
+
+def device_jobs(plan: dict[str, Any], device: str) -> list[dict[str, Any]]:
+    """Return accelerator jobs for one device."""
+    return [job for job in plan["jobs"] if job["device"] == device]
 
 
 def _write_github_output(path: Path, key: str, value: str) -> None:
@@ -235,8 +259,8 @@ def _render_errors(errors: list[PlanError]) -> None:
 def verify(catalog: CiCatalog, test_facts: dict[str, TestFacts],
            errors: list[PlanError]) -> list[PlanError]:
     failures = list(errors)
-    cpu = next((facts for facts in test_facts.values() if facts.cpu_ranks), None)
-    npu = next((facts for facts in test_facts.values() if facts.npu_ranks), None)
+    cpu = next((facts for facts in test_facts.values() if "cpu" in facts.devices), None)
+    npu = next((facts for facts in test_facts.values() if "npu" in facts.devices), None)
     e2e = next((case for case in catalog.cases if case.tier == "pr"), None)
     if cpu is None:
         failures.append(PlanError("tests", "no CPU test facts found"))
@@ -252,10 +276,10 @@ def verify(catalog: CiCatalog, test_facts: dict[str, TestFacts],
     }
     sample_plan, plan_errors = compile_plan(catalog, test_facts, sample)
     failures.extend(plan_errors)
-    cpu_jobs = host_jobs(sample_plan)
-    if cpu_jobs:
+    sample_cpu_jobs = cpu_jobs(sample_plan)
+    if sample_cpu_jobs:
         try:
-            json.dumps(cpu_jobs, separators=(",", ":"))
+            json.dumps(sample_cpu_jobs, separators=(",", ":"))
         except (TypeError, ValueError) as exc:
             failures.append(PlanError("verify", f"host matrix is not JSON serializable: {exc}"))
     else:
@@ -295,8 +319,8 @@ def _verify_rejections(catalog: CiCatalog, test_facts: dict[str, TestFacts],
            "unknown env")
     expect("unknown image", compile_with(replace(cpu, image="missing-image"),
                                          lane([cpu.path])), "no lane for image")
-    expect("missing rank", compile_with(replace(cpu, cpu_ranks=frozenset()),
-                                        lane([cpu.path])), "no rank")
+    expect("missing device", compile_with(replace(cpu, devices=frozenset()),
+                                          lane([cpu.path])), "does not require cpu")
     expect("unknown E2E case", compile_plan(
         catalog, test_facts, {"e2e_cases": [{"case_id": "missing-case"}]}
     )[1], "unknown E2E case")
@@ -322,6 +346,13 @@ def _verify_rejections(catalog: CiCatalog, test_facts: dict[str, TestFacts],
         elif not any(step["kind"] == "pytest"
                      for job in plan["jobs"] for step in job["steps"]):
             failures.append(PlanError("verify", "whole-lane NPU selection produced no tests"))
+        else:
+            npu_jobs = device_jobs(plan, "npu")
+            images = {job["image"] for job in npu_jobs}
+            if len(npu_jobs) != len(images):
+                failures.append(PlanError(
+                    "verify", "NPU work was split into multiple jobs for one image"
+                ))
     return failures
 
 
@@ -332,7 +363,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--output", default=None, help="write plan JSON here")
     parser.add_argument("--summary-file", default=None)
     parser.add_argument("--github-output", default=None,
-                        help="append host_jobs matrix JSON to a GitHub output file")
+                        help="append CPU/NPU/GPU matrix JSON to a GitHub output file")
     parser.add_argument("--test-path", default="",
                         help="manual CPU test path; '-' keeps the selector output")
     parser.add_argument("--verify", action="store_true", help="validate facts only")
@@ -375,10 +406,12 @@ def main(argv: list[str]) -> int:
         with open(args.summary_file, "a", encoding="utf-8") as handle:
             handle.write(_summary(plan))
     if args.github_output:
-        jobs = host_jobs(plan)
-        value = json.dumps(jobs, ensure_ascii=False, separators=(",", ":"))
-        _write_github_output(Path(args.github_output), "host_jobs", value)
-        _write_github_output(Path(args.github_output), "host_job_count", str(len(jobs)))
+        output = Path(args.github_output)
+        for key, jobs in (("cpu", cpu_jobs(plan)),
+                          ("npu", device_jobs(plan, "npu"))):
+            value = json.dumps(jobs, ensure_ascii=False, separators=(",", ":"))
+            _write_github_output(output, f"{key}_jobs", value)
+            _write_github_output(output, f"{key}_job_count", str(len(jobs)))
     return 0
 
 

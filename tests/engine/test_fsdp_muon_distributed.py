@@ -31,7 +31,7 @@ from torchturbo.runtime.cpu import CpuRuntime
 from torchturbo.utils.torch_utils import torch_version
 
 
-pytestmark = [pytest.mark.cpu, pytest.mark.rank_4]
+pytestmark = pytest.mark.cpu
 
 
 _HAS_GLOO = dist.is_available() and dist.is_gloo_available()

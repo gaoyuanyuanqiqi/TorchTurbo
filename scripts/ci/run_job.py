@@ -61,6 +61,29 @@ def _pytest_command(venv: Venv, step: dict[str, Any], junit: Path) -> list[str]:
     ]
 
 
+def _e2e_command() -> list[str]:
+    return ["bash", "scripts/ci/e2e_tests/run_train.sh", "lane"]
+
+
+def _e2e_environment(venv: Venv, step: dict[str, Any], result_json: Path,
+                     runner_label: str, image: str) -> dict[str, str]:
+    cases = step["cases"]
+    environment = venv.environment()
+    environment.update({
+        "E2E_CASES": json.dumps(cases, ensure_ascii=False, separators=(",", ":")),
+        "FRAMEWORK": str(cases[0].get("framework") or "lf"),
+        "RUNNER_LABEL": runner_label,
+        "IMAGE": image,
+        "RESULT_JSON": str(result_json),
+        "SEQ_LEN": os.environ.get("SEQ_LEN", "4096"),
+        "DATASET_IN": os.environ.get("DATASET_IN", "gsm8k"),
+        "FINETUNING_TYPE": os.environ.get("FINETUNING_TYPE", "full"),
+        "FETCH_TIMEOUT": os.environ.get("FETCH_TIMEOUT", "600"),
+        "CASE_TIMEOUT": os.environ.get("CASE_TIMEOUT", "1500"),
+    })
+    return environment
+
+
 def _merge_junit(paths: list[Path], output: Path) -> None:
     suites = []
     for path in paths:
@@ -96,8 +119,9 @@ def _write_versions(venvs: dict[str, Venv], output: Path, root: Path) -> None:
 
 
 def _execute(job: dict[str, Any], root: Path) -> int:
-    if job.get("device") != "cpu":
-        _log(f"::error::run_job currently accepts CPU jobs only: {job.get('id')}")
+    device = str(job.get("device") or "")
+    if device not in {"cpu", "npu", "gpu"}:
+        _log(f"::error::unsupported job device {device!r}: {job.get('id')}")
         return 2
     steps = job.get("steps") or []
     if not steps:
@@ -112,22 +136,24 @@ def _execute(job: dict[str, Any], root: Path) -> int:
         "CI_VENV_ROOT", _runner_temp() / "turbo-ci-venv"
     ))
     runner_label = os.environ.get("RUNNER_LABEL", str(job.get("runner", "")))
+    image = os.environ.get("IMAGE", str(job.get("image", "")))
     _report(
-        "init", result_json, "kind=pytest", "model_type=pytest-cpu-unit",
-        "mode=cpu", f"runner_label={runner_label}", f"image={job.get('image', '')}",
+        "init", result_json, "kind=pytest", f"model_type=pytest-{device}-unit",
+        f"mode={device}", f"runner_label={runner_label}", f"image={image}",
         f"job_id={job.get('id', '')}", f"test_path={job.get('id', '')}",
         f"pytest_args={os.environ.get('PYTEST_ARGS', '-v --durations=20')}",
     )
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.write_text("", encoding="utf-8")
 
-    manager = VenvManager(root, venv_root, "cpu", log_path)
+    manager = VenvManager(root, venv_root, device, log_path)
     venvs: dict[str, Venv] = {}
     junit_paths: list[Path] = []
     rc = 0
     for index, step in enumerate(steps):
-        if step.get("kind") != "pytest":
-            _log(f"::error::unsupported CPU step kind: {step.get('kind')}")
+        kind = str(step.get("kind") or "")
+        if kind not in {"pytest", "e2e"}:
+            _log(f"::error::unsupported step kind: {kind}")
             rc = 2
             break
         env_name = str(step["env"])
@@ -144,17 +170,27 @@ def _execute(job: dict[str, Any], root: Path) -> int:
                 break
             _phase(result_json, f"install {env_name}", int(time.monotonic() - started), 0)
 
-        junit = _runner_temp() / "turbo-junit" / f"step-{index:02d}.xml"
-        junit.parent.mkdir(parents=True, exist_ok=True)
         started = time.monotonic()
-        step_rc = _stream(
-            _pytest_command(venv, step, junit), cwd=root,
-            environment=venv.environment(), log_path=log_path,
-        )
+        if kind == "pytest":
+            junit = _runner_temp() / "turbo-junit" / f"step-{index:02d}.xml"
+            junit.parent.mkdir(parents=True, exist_ok=True)
+            step_rc = _stream(
+                _pytest_command(venv, step, junit), cwd=root,
+                environment=venv.environment(), log_path=log_path,
+            )
+            junit_paths.append(junit)
+            phase_name = f"pytest {env_name} {step.get('process', '')}"
+        else:
+            step_rc = _stream(
+                _e2e_command(), cwd=root,
+                environment=_e2e_environment(
+                    venv, step, result_json, runner_label, image
+                ),
+                log_path=log_path,
+            )
+            phase_name = f"e2e {env_name} {len(step['cases'])} case(s)"
         elapsed = int(time.monotonic() - started)
-        _phase(result_json, f"pytest {env_name} {step.get('process', '')}",
-               elapsed, step_rc)
-        junit_paths.append(junit)
+        _phase(result_json, phase_name, elapsed, step_rc)
         if step_rc != 0:
             rc = step_rc
             break

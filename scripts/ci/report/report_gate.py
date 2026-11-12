@@ -131,13 +131,12 @@ def timing() -> int:
 # One row per lane: (summary label, env suffix, why it was not selected).
 # A new device adds rows here; nothing below repeats the lane list.
 LANES = (
-    ("CPU-unit", "CPU_UNIT", "未选中 CPU 测试"),
-    ("NPU-unit", "NPU_UNIT", "未选中需要真卡的测试文件"),
-    ("NPU-e2e", "NPU_E2E", "无匹配 E2E 用例"),
+    ("CPU", "CPU", "未选中 CPU 测试"),
+    ("NPU", "NPU", "未选中 NPU 测试或 E2E 用例"),
 )
 LANE_KEYS = tuple(key for _, key, _ in LANES)
 # The lane that runs training cases; `SKIP_REASON` is published by it alone.
-E2E_LANE = "NPU_E2E"
+TRAINING_LANE = "NPU"
 
 
 class Report:
@@ -183,8 +182,7 @@ def _lane_why(key: str, fallback: str, sel_bad: bool) -> str:
     """Why a lane did not run: plan failure, an override label, or no match."""
     if sel_bad:
         return _skip_why()
-    # Lanes are named <DEVICE>_<depth>, so the device comes from the key itself.
-    device = key.split("_")[0].lower()
+    device = key.lower()
     if _has_label(f"ci:skip-{device}"):
         return f"ci:skip-{device} 标签，按设计未启动"
     return fallback
@@ -218,14 +216,16 @@ def judge_pr() -> int:
         # 跳过只可能是「自己没被选中」或「计划没算出来」。
         if _env("IS_FORK") == "true":
             # fork PR 的 NPU 泳道不执行是设计，不是故障。
-            if results["CPU_UNIT"] == "skipped" and want["CPU_UNIT"] == "false":
-                rep.rows.append(f"| CPU-unit | {SKIP} | 未选中 CPU 测试 |")
+            if results["CPU"] == "skipped" and want["CPU"] == "false":
+                rep.rows.append(f"| CPU | {SKIP} | 未选中 CPU 测试 |")
             else:
-                rep.required("CPU-unit", results["CPU_UNIT"])
-            for name, key, _ in LANES[1:]:
+                rep.required("CPU", results["CPU"])
+            for name, key, why in LANES[1:]:
                 res = results[key]
                 if res == "skipped":
-                    rep.rows.append(f"| {name} | {SKIP} | fork PR（secrets 不递） |")
+                    reason = ("fork PR（secrets 不递）" if want[key] == "true"
+                              else why)
+                    rep.rows.append(f"| {name} | {SKIP} | {reason} |")
                 elif res == "success":
                     rep.rows.append(f"| {name} | {OK} |  |")
                 else:
@@ -242,8 +242,8 @@ def judge_pr() -> int:
     # 跑起来了但自己宣告跳过（模型获取超时）：记 skipped-reason，
     # 默认判绿，只有 ci:e2e:strict 才判红。
     skip_reason = _env("SKIP_REASON")
-    if skip_reason and results[E2E_LANE] == "success":
-        rep.note("npu-e2e 跳过原因", f"⚠️ {skip_reason}")
+    if skip_reason and results[TRAINING_LANE] == "success":
+        rep.note("NPU 训练跳过原因", f"⚠️ {skip_reason}")
         if _has_label("ci:e2e:strict"):
             rep.failed = True
 

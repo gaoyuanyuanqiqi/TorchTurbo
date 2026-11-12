@@ -16,7 +16,7 @@ from torchturbo.models.modules.moe.moe_utils import (
 from torchturbo.models.modules.moe.router import TopKRouter
 
 
-pytestmark = [pytest.mark.cpu, pytest.mark.rank_4]
+pytestmark = pytest.mark.cpu
 
 
 

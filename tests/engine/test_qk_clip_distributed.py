@@ -44,7 +44,7 @@ from torchturbo.parallel import FSDPParallelPlan, FSDPPlanSpec
 from torchturbo.runtime.cpu import CpuRuntime
 
 
-pytestmark = [pytest.mark.cpu, pytest.mark.rank_4]
+pytestmark = pytest.mark.cpu
 
 
 

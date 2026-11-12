@@ -117,7 +117,7 @@ class VenvManager:
         base_python = _base_python(spec.python)
         print(f"[venv] creating {target.name} with {base_python}", flush=True)
         command = [base_python, "-m", "venv"]
-        if self.device == "npu":
+        if self.device != "cpu":
             command.append("--system-site-packages")
         command.append(str(target))
         self._run(command, cwd=self.root, environment=os.environ.copy())
@@ -164,7 +164,7 @@ class VenvManager:
         print(f"[venv] ready: {target}", flush=True)
 
     def _constraints(self, venv: Venv, environment: dict[str, str]) -> str:
-        packages = ["torch", "numpy"] if self.device == "npu" else ["torch"]
+        packages = ["torch", "numpy"] if self.device != "cpu" else ["torch"]
         code = (
             "import importlib.metadata as m, sys\n"
             "names = sys.argv[1:]\n"

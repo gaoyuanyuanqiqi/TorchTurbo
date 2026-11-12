@@ -18,7 +18,7 @@ from safetensors.torch import load_file, save_file
 from torch import nn
 
 
-pytestmark = [pytest.mark.cpu, pytest.mark.rank_4]
+pytestmark = pytest.mark.cpu
 
 
 

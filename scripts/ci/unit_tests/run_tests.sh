@@ -144,7 +144,7 @@ printf '  %s\n' "${FILES[@]}" | head -30
 # the CPU runner. Asking the wrong lane for a test selects nothing and exits 5.
 echo "--- stage: marker ---"
 if [ "$MODE" = "npu" ]; then
-  MARK=(-m npu)
+  MARK=(-m "npu or multi_npu")
 else
   MARK=(-m cpu)
 fi

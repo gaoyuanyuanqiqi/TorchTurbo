@@ -2,8 +2,8 @@
 """Pod environment checks, torch guard, and cleanup.
 
 Commands:
-  probe    capture torch, then verify the selected CPU or NPU stack
-  check    fail if pip replaced the custom NPU torch
+  probe    capture torch, then verify the selected CPU, NPU, or GPU stack
+  check    fail if pip replaced the accelerator torch stack
   cleanup  remove leftovers after timeout or cancellation
 
 A replaced torch still imports, but torch.npu disappears and tensors fall back
@@ -40,6 +40,8 @@ def _verify_environment(device: str) -> int:
     """Validate the selected device and its stack."""
     if device == "cpu":
         return _verify_cpu_environment()
+    if device == "gpu":
+        return _verify_gpu_environment()
     nodes = list(Path("/dev").glob("davinci*"))
     if not nodes:
         error("no /dev/davinci*, NPUs not mapped into the pod")
@@ -82,6 +84,26 @@ def _verify_cpu_environment() -> int:
     return 0
 
 
+def _verify_gpu_environment() -> int:
+    """Validate that the selected CUDA stack can see at least one device."""
+    try:
+        import torch
+    except Exception as exc:  # noqa: BLE001 - accelerator install must provide torch
+        error(f"torch is not importable: {type(exc).__name__}: {exc}")
+        return 1
+    print("python:", sys.version.split()[0], "| machine:", platform.machine())
+    print("torch :", torch.__version__)
+    if not torch.cuda.is_available():
+        error("torch.cuda.is_available() is False: no GPU assigned")
+        return 1
+    count = torch.cuda.device_count()
+    if count < 1:
+        error("torch.cuda.device_count() == 0: no GPU assigned")
+        return 1
+    print("gpu   : True | devices:", count)
+    return 0
+
+
 # ---------------------------------------------------------------- install guard
 # probe writes the baseline before pip; check compares it after pip.
 def _torch_state() -> dict:
@@ -98,6 +120,11 @@ def _torch_state() -> dict:
         doc["npu_file"] = torch_npu.__file__
     except Exception as exc:  # noqa: BLE001 - absence is an observation
         doc["npu_error"] = f"{type(exc).__name__}: {exc}"
+    try:
+        doc["cuda_available"] = bool(torch.cuda.is_available())
+        doc["cuda_devices"] = int(torch.cuda.device_count())
+    except Exception as exc:  # noqa: BLE001 - absence is an observation
+        doc["cuda_error"] = f"{type(exc).__name__}: {exc}"
     return doc
 
 
@@ -138,6 +165,9 @@ def cmd_check(path: str, device: str) -> int:
         return 1
     if device == "npu" and before.get("npu_version") and not after.get("npu_version"):
         error(f"torch_npu disappeared after install (was {before['npu_version']})")
+        return 1
+    if device == "gpu" and before.get("cuda_available") and not after.get("cuda_available"):
+        error("torch.cuda disappeared after install")
         return 1
     log(f"ok: torch {after.get('torch_version')}; torch_npu {after.get('npu_version', 'n/a')}")
     return 0
@@ -212,11 +242,11 @@ def main(argv: list[str]) -> int:
 
     prb = sub.add_parser("probe", help="capture torch and verify devices and stack")
     prb.add_argument("--file", default="/tmp/torch-before.json")
-    prb.add_argument("--device", choices=("cpu", "npu"), default="npu")
+    prb.add_argument("--device", choices=("cpu", "npu", "gpu"), default="npu")
 
     chk = sub.add_parser("check", help="fail if torch was replaced")
     chk.add_argument("--file", required=True)
-    chk.add_argument("--device", choices=("cpu", "npu"), default="npu")
+    chk.add_argument("--device", choices=("cpu", "npu", "gpu"), default="npu")
     cln = sub.add_parser("cleanup", help="remove leftovers after timeout or cancellation")
     cln.add_argument("--output-dir", default="/tmp/tblf-sft")
 

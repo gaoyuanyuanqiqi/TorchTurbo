@@ -33,7 +33,7 @@ from torchturbo.runtime.cpu import CpuRuntime
 import torchturbo.runtime.runtime as runtime_module
 
 
-pytestmark = [pytest.mark.cpu, pytest.mark.rank_2]
+pytestmark = pytest.mark.cpu
 
 
 def _adapter_cases():

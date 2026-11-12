@@ -364,11 +364,12 @@ def _iter_statements(tree: ast.AST):
                 stack.append(child)
 
 
-# Device and rank are separate facts: `npu` selects the runner class, `rank_N`
-# selects how many slots that runner must provide.
-NPU_MARKERS = frozenset({"npu"})
-DEVICE_MARKERS = frozenset({"cpu", "npu"})
-KNOWN_MARKERS = DEVICE_MARKERS | {"rank_2", "rank_4", "rank_8", "integration"}
+# Capacity is a code fact. Markers only choose the device lane; `multi_*`
+# states that the lane needs more than one device, not a 2/4/8 job shape.
+NPU_MARKERS = frozenset({"npu", "multi_npu"})
+GPU_MARKERS = frozenset({"gpu", "multi_gpu"})
+DEVICE_MARKERS = frozenset({"cpu", *NPU_MARKERS, *GPU_MARKERS})
+KNOWN_MARKERS = DEVICE_MARKERS | {"integration"}
 
 
 @dataclass(frozen=True)
@@ -464,7 +465,8 @@ def test_requirement(path: Path) -> TestRequirement:
         hit = TestRequirement(
             marker_names=frozenset(names),
             module_markers=frozenset(module),
-            min_npus=1 if "npu" in names else 0,
+            min_npus=(2 if "multi_npu" in names else
+                      1 if "npu" in names else 0),
             npu_tests=sum(bool(markers & NPU_MARKERS) for markers in test_sets),
             test_count=len(tests),
             unclassified_tests=tuple(
@@ -710,7 +712,7 @@ def select(index: Index, changed: list[str], force_all: bool = False,
 
     # ---- split into lanes by explicit pytest markers ---------------------
     # Pure NPU files go to the NPU lane; pure CPU files go to the CPU lane;
-    # mixed files go to both and `-m npu` / `-m cpu` split them.
+    # mixed files go to both and the device expression splits them.
     requirements = {t: test_requirement(index.root / t) for t in targets}
     npu_targets = [t for t in targets if requirements[t].npu]
     cpu_targets = [t for t in targets if requirements[t].cpu]

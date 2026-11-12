@@ -28,7 +28,7 @@ from torchturbo.runtime.cpu import CpuRuntime
 import torchturbo.runtime.runtime as runtime_module
 
 
-pytestmark = [pytest.mark.cpu, pytest.mark.rank_4]
+pytestmark = pytest.mark.cpu
 
 
 def _check_moe(

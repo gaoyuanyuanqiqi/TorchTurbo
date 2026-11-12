@@ -23,7 +23,7 @@ from torchturbo.models.qwen3_5.vision_balance import Qwen3_5VisionBalanceIO
 from torchturbo.parallel import VisionBalanceMode, VisionBalanceSpec
 
 
-pytestmark = [pytest.mark.cpu, pytest.mark.rank_8]
+pytestmark = pytest.mark.cpu
 
 
 def _tower():

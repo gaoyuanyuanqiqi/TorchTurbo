@@ -21,7 +21,7 @@ from torchturbo.ops.dispatcher import OpDispatcher
 from torchturbo.runtime.cpu import CpuRuntime
 
 
-pytestmark = [pytest.mark.cpu, pytest.mark.rank_2]
+pytestmark = pytest.mark.cpu
 
 
 

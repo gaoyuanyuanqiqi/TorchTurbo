@@ -39,7 +39,7 @@ MODEL_MAP = WORKFLOWS / "model_map.json"
 
 # Marker contract: the lane a file lands in must match the marker it declares.
 CPU_MARK = re.compile(r"pytest\.mark\.cpu\b")
-NPU_MARK = re.compile(r"pytest\.mark\.npu\b")
+NPU_MARK = re.compile(r"pytest\.mark\.(?:multi_npu|npu)\b")
 
 LANE_KEYS = ("cpu_unit", "npu_unit", "npu_e2e")
 
@@ -292,8 +292,9 @@ def step_contract() -> None:
     check("every selector output is produced", from_selector <= produced,
           str(sorted(from_selector - produced)))
     check("every consumed output is declared", used <= declared, str(sorted(used - declared)))
-    check("every lane switch is declared",
-          {f"{k}_run" for k in LANE_KEYS} <= declared, str(sorted(declared)))
+    check("every device matrix is declared",
+          {"cpu_jobs", "cpu_job_count", "npu_jobs", "npu_job_count"}
+          <= declared, str(sorted(declared)))
     check("lint shares the select job", "lint_check.py" in block)
     check("lint runs before the planner",
           block.find("lint_check.py") < block.find("select_tests.py")
@@ -320,7 +321,8 @@ def step_summary() -> None:
     check("summary renders the image", rows == [f"| image | `{image}` |"], str(rows))
     check("summary has a plan table", "## Plan" in got["_summary"])
     check("summary lists lanes in order",
-          re.search(r"\| lanes \(cpu_unit/npu_unit/npu_e2e\) \| `true / true / true` \|",
+          re.search(r"\| lanes \(cpu_unit/npu_unit/npu_e2e\) \| "
+                    r"`true / true / true` \|",
                     got["_summary"]) is not None,
           "lane row missing or mislabelled")
 
