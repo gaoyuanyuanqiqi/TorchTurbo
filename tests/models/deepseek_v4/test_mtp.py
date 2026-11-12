@@ -2,6 +2,7 @@
 
 import importlib
 import json
+import time
 from functools import partial
 
 import pytest
@@ -32,6 +33,15 @@ from .test_packed_inputs import (
 
 
 pytestmark = pytest.mark.cpu
+
+_GLOO_SHUTDOWN_GRACE_SECONDS = 0.3
+
+
+def _destroy_process_group():
+    dist.destroy_process_group()
+    # Let Gloo's runloop release Python work references before interpreter
+    # teardown; PyTorch 2.10 can otherwise abort in this shutdown window.
+    time.sleep(_GLOO_SHUTDOWN_GRACE_SECONDS)
 
 
 
@@ -441,7 +451,7 @@ def test_dspark_placeholder_blocks_do_not_train_router(
         assert ("aux_loss" in metrics) == (aux_coeff > 0)
         assert ("z_loss" in metrics) == (z_coeff > 0)
     finally:
-        dist.destroy_process_group()
+        _destroy_process_group()
 
 
 def _dspark_sp_worker(rank, init_file, block_size, window):
@@ -491,7 +501,7 @@ def _dspark_sp_worker(rank, init_file, block_size, window):
             dist.all_reduce(grad)
             torch.testing.assert_close(grad / 2, reference_grad, atol=1e-6, rtol=1e-5)
     finally:
-        dist.destroy_process_group()
+        _destroy_process_group()
 
 
 @pytest.mark.skipif(not dist.is_gloo_available(), reason="Gloo is required")
