@@ -238,10 +238,12 @@ def _summary(plan: dict[str, Any]) -> str:
     lines = ["## Plan", "",
              "| job | required | runner | env | work |",
              "|---|---:|---|---|---|"]
+    files: set[str] = set()
     for job in plan["jobs"]:
         for step in job["steps"]:
             if step["kind"] == "pytest":
                 work = f"pytest {len(step['files'])} file(s) / {step['process']}"
+                files.update(step["files"])
             else:
                 work = "e2e " + ", ".join(case["case_id"] for case in step["cases"])
             lines.append(
@@ -250,6 +252,12 @@ def _summary(plan: dict[str, Any]) -> str:
             )
     if len(lines) == 4:
         lines.append("| - | - | - | - | no work selected |")
+    if files:
+        shown = sorted(files)
+        lines += ["", "### Test files", "", "```", *shown[:40]]
+        if len(shown) > 40:
+            lines.append(f"... (+{len(shown) - 40} more)")
+        lines += ["```"]
     return "\n".join(lines) + "\n"
 
 
