@@ -869,7 +869,8 @@ def select_e2e_cases(catalog: CiCatalog, changed: list[str], *, all_cases: bool,
             add(ci_fallback_case(catalog, env), CI_FALLBACK_PRIORITY,
                 f"{path} ({scope} CI fallback)")
         elif path == ".github/workflows/model_map.json":
-            add_pr(catalog.cases, 1, f"{path} (E2E map)")
+            add(ci_fallback_case(catalog), CI_FALLBACK_PRIORITY,
+                f"{path} (E2E map fallback)")
         elif is_ci_control_path(path):
             add(ci_fallback_case(catalog), CI_FALLBACK_PRIORITY,
                 f"{path} (CI fallback)")

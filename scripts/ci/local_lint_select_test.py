@@ -120,17 +120,6 @@ def cases_with_trigger(trigger: str) -> int:
     )
 
 
-def models_with_trigger(trigger: str) -> list[str]:
-    rows = json.loads(MODEL_MAP.read_text(encoding="utf-8")).get("models", {})
-    picked = [
-        (case["id"], model)
-        for model, row in rows.items()
-        for case in row.get("cases") or []
-        if trigger in (case.get("triggers") or [])
-    ]
-    return [model for _, model in sorted(picked)]
-
-
 # ---------------------------------------------------------------- stages
 def step_lint() -> None:
     print("\n[1/5] static checks")
@@ -176,7 +165,7 @@ SCENARIOS = [
     # Editing a family directory picks that family, with its layer trim.
     dict(name="moe family dir", files=["src/torchturbo/models/qwen3_5_moe/__init__.py"],
          expect="precise", cpu=True, npu=True, e2e=True,
-         e2e_cases=[{"model_type": "qwen3_5_moe", "layers": 6}]),
+         e2e_cases=[{"model_type": "qwen3_5_moe", "layers": 4}]),
     dict(name="run config", files=["scripts/runs/qwen3_5_dense/lf_text_sft.yaml"],
          expect="precise", cpu=False, npu=False, e2e=True, e2e_models=["qwen3_5"]),
     dict(name="shared model layer", files=["src/torchturbo/models/modules/attention/__init__.py"],
@@ -193,8 +182,9 @@ SCENARIOS = [
     dict(name="shared env deps", files=["scripts/ci/envs/common.txt"], expect="all",
          cpu=True, npu=False, e2e=True, e2e_models=["bailing_hybrid"],
          full_reason="ci-config-changed"),
+    # E2E map edits cannot determine a targeted model, so use the tiny fallback.
     dict(name="E2E map", files=[".github/workflows/model_map.json"], expect="all",
-         cpu=True, npu=False, e2e=True, e2e_models=models_with_trigger("pr"),
+         cpu=True, npu=False, e2e=True, e2e_models=["bailing_hybrid"],
          full_reason="ci-config-changed"),
     # Dependency change: nothing can be trusted to install.
     dict(name="pyproject", files=["pyproject.toml"], expect="all",

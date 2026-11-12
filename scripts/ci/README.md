@@ -8,12 +8,13 @@
 ```text
 scripts/ci/
   lint_select/   lint 与 select 阶段
-  unit_tests/    旧 NPU / 手动 CPU 单测的回退 runner
+  unit_tests/    本机单测回退 runner
   e2e_tests/     NPU 模型用例：取模型、并行策略、训练监督
   image/         基础镜像构建
   common/        pod 环境
   report/        结果汇总与门禁判定
   bin/           venv 内训练脚本使用的工具 wrapper
+  manual_plan.py 手动 unit lane -> 一个 plan job
   run_job.py     按 plan 执行一个 job
   venv_manager.py  内容哈希 cache 的 env venv
   local_*        本机自检脚本，不进 CI
@@ -22,7 +23,8 @@ scripts/ci/
 正式路径由 `plan.py` 生成 `cpu_jobs`、`npu_jobs` matrix，再由 `run_job.py`
 按 env 创建 venv，执行该设备的 pytest 和 e2e steps。GPU 当前只保留 marker
 和事实，不声明 `gpu_unit`，也不生成 GPU job。
-`unit_tests/run_tests.sh` 只保留给手动回退使用。
+`unit_tests/run_tests.sh` 只保留给本机回退；manual workflow 也走
+`plan.py` + `run_job.py`，因此依赖版本与 PR lane 一致。
 
 通用规则交给 Ruff（Python）、`shellcheck`、`actionlint` 和 `hadolint`；自定义
 检查只保留通用工具看不到的仓库契约：job 依赖图、选测器自检、模型映射和 pytest
@@ -37,9 +39,10 @@ marker。
 | `lint_select/select_tests.py` | 这次改动该跑什么？ | `--explain` / `--coverage` / `--verify` / `--changed-from git` / `--mode pr\|full --labels …` |
 | `lint_select/lint_check.py` | 静态体检总入口；通用检查先跑，Turbo 契约后跑 | 无参数 = 全跑 / `--only NAME` |
 | `plan.py` | 选中项怎么变成 job / env / 进程？ | `--selection` / `--verify` / `--github-output` |
+| `manual_plan.py` | 手动 unit lane 怎么复用 PR 的 env plan？ | `--lane` / `--scope` / `--test-path` |
 | `run_job.py` | 一个 plan job 怎么装依赖、跑 pytest / e2e？ | `--job-json` 或 `--plan + --job-id` |
 | `venv_manager.py` | env 依赖装在哪、何时复用？ | 被 `run_job.py` 调用 |
-| `unit_tests/run_tests.sh` | 旧 NPU / 手动回退泳道怎么跑？ | `install` / `test`（`MODE=cpu\|npu`） |
+| `unit_tests/run_tests.sh` | 本机回退泳道怎么跑？ | `install` / `test`（`MODE=cpu\|npu`） |
 | `e2e_tests/prepare_model.py` | 模型和派生配置是否完成预处理？ | `plan` / `fetch` / `probe` / `cases` |
 | `e2e_tests/run_train.sh` | 一次训练冒烟分几步？ | `resolve` / `install` / `run` / `report` / `lane` |
 | `common/env_pod.py` | 这台 pod 现在是什么状态？ | `probe` / `check` / `cleanup` |
@@ -189,7 +192,7 @@ python3 scripts/ci/e2e_tests/prepare_model.py probe --dir /root/.cache/models/<r
 
 # 全量小模型 / 减层大模型（0 = 全量；N = 只保留前 N 层）
 python3 scripts/ci/e2e_tests/prepare_model.py fetch --repo Qwen/Qwen3.5-2B --layers 0
-python3 scripts/ci/e2e_tests/prepare_model.py fetch --repo Qwen/Qwen3.5-35B-A3B --layers 6
+python3 scripts/ci/e2e_tests/prepare_model.py fetch --repo Qwen/Qwen3.5-35B-A3B --layers 4
 
 # junit 计数
 python3 scripts/ci/report/report_result.py junit --file /tmp/r.json --junit /tmp/pytest.xml

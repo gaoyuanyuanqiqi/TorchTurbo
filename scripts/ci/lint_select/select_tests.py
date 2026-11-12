@@ -1256,7 +1256,7 @@ def verify(root: Path) -> int:
           and not r["lanes"]["npu_unit"]["run"] and r["lanes"]["npu_e2e"]["run"],
           str(lane_runs(r)))
     check("MoE family -> trimmed case",
-          [e["layers"] for e in sel("src/torchturbo/models/qwen3_5_moe/model.py")["e2e_cases"]] == [6])
+          [e["layers"] for e in sel("src/torchturbo/models/qwen3_5_moe/model.py")["e2e_cases"]] == [4])
     check("package root -> cheapest E2E case",
           [e["model_type"] for e in sel("src/torchturbo/__init__.py")["e2e_cases"]]
           == [CHEAPEST_MODEL])
@@ -1317,6 +1317,10 @@ def verify(root: Path) -> int:
           f"{r['mode']} {lane_runs(r)}")
     r = sel(".github/workflows/ci-pr.yml")
     check("workflow edit -> tiny E2E fallback",
+          [e["case_id"] for e in r["e2e_cases"]] == ["bailing_hybrid-lf-sft"],
+          str(r["e2e_cases"]))
+    r = sel(".github/workflows/model_map.json")
+    check("E2E map edit -> tiny E2E fallback",
           [e["case_id"] for e in r["e2e_cases"]] == ["bailing_hybrid-lf-sft"],
           str(r["e2e_cases"]))
     r = sel("scripts/ci/envs/common.txt")

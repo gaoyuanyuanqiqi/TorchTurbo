@@ -22,6 +22,10 @@ name: Manual lane test
 # means the lane broke, not a test. `all` is the whole suite and is expected to
 # be red for reasons outside CI (see tests/scripts/test_dequant.py, which fails
 # at collection and aborts the whole session in seconds).
+#
+# Unit lanes reuse plan.py and run_job.py, so a manual run installs the same
+# per-test venv profiles as ci-pr.yml. The old unpinned `pip install -e .[test]`
+# path silently moved transformers to 5.22.2 and broke tests written for 5.5.4.
 
 # Without this every run in the list is just "Manual lane test".
 run-name: manual / ${{ inputs.lane || github.event.label.name }} / ${{ github.ref_name }}
@@ -86,7 +90,6 @@ env:
   # answers "does the lane work", not "is the code correct".
   SMOKE_CPU: 'tests/detector tests/registry tests/engine/test_freeze.py'
   SMOKE_NPU: 'tests/ops/npu tests/ops/providers/npu'
-  SUITE_ALL: '-'
 
 jobs:
   cpu_unit:
@@ -108,36 +111,65 @@ jobs:
         with:
           python-version: '3.11'
           cache: pip
-          cache-dependency-path: pyproject.toml
+          cache-dependency-path: |
+            pyproject.toml
+            scripts/ci/envs.toml
+            scripts/ci/envs/*.txt
 
-      - name: install
+      # plan.py reads envs.toml through facts.py, which needs PyYAML.
+      - name: install planner dependencies
+        run: python3 -m pip install --quiet --disable-pip-version-check -r requirements-lint.txt
+
+      - name: plan manual job
+        id: plan
         env:
-          MODE: cpu
-          RESULT_JSON: /tmp/ci-result.json
+          SCOPE: ${{ inputs.scope || 'smoke' }}
+          TEST_PATH: ${{ inputs.test_path }}
+          SMOKE: ${{ env.SMOKE_CPU }}
         run: |
-          set -uo pipefail
-          python3 scripts/ci/report/report_result.py init --file "$RESULT_JSON" \
-            kind=pytest model_type=pytest-cpu-unit mode=cpu \
-            runner_label="${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}"
-          bash scripts/ci/unit_tests/run_tests.sh install
+          set -euo pipefail
+          python3 scripts/ci/manual_plan.py \
+            --lane cpu-unit --scope "$SCOPE" --test-path "$TEST_PATH" \
+            --smoke "$SMOKE" --plan /tmp/manual-plan.json \
+            --github-output "$GITHUB_OUTPUT"
 
-      - name: pytest
+      - name: restore venv cache
+        id: venv_cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/turbo-ci-venv
+          key: turbo-venv-${{ runner.os }}-${{ runner.arch }}-${{ steps.plan.outputs.job_id }}-${{ hashFiles('scripts/ci/envs.toml', 'scripts/ci/envs/**', 'pyproject.toml') }}
+
+      - name: execute plan
         env:
-          MODE: cpu
-          TEST_PATH: ${{ inputs.test_path || (inputs.scope == 'all' && env.SUITE_ALL || env.SMOKE_CPU) }}
-          RESULT_JSON: /tmp/ci-result.json
-        run: bash scripts/ci/unit_tests/run_tests.sh
+          JOB_ID: ${{ steps.plan.outputs.job_id }}
+          RUNNER_LABEL: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
+          RESULT_JSON: ${{ runner.temp }}/ci-result.json
+          CI_JOB_LOG: ${{ runner.temp }}/turbo-ci.log
+          JUNIT_OUT: ${{ runner.temp }}/pytest.xml
+          VERSIONS_OUT: ${{ runner.temp }}/versions.txt
+          CI_VENV_ROOT: ${{ runner.temp }}/turbo-ci-venv
+        run: python3 scripts/ci/run_job.py --plan /tmp/manual-plan.json --job-id "$JOB_ID"
 
       - name: summary
         if: always()
         env:
-          RESULT_JSON: /tmp/ci-result.json
+          RESULT_JSON: ${{ runner.temp }}/ci-result.json
         run: |
           set -uo pipefail
           python3 scripts/ci/report/report_result.py report --file "$RESULT_JSON" \
-            --train-log /tmp/pytest.log --junit /tmp/pytest.xml >> "$GITHUB_STEP_SUMMARY" || true
+            --train-log "${{ runner.temp }}/turbo-ci.log" \
+            --versions "${{ runner.temp }}/versions.txt" \
+            --junit "${{ runner.temp }}/pytest.xml" >> "$GITHUB_STEP_SUMMARY" || true
           python3 scripts/ci/report/report_result.py notice --file "$RESULT_JSON" \
             --model-type pytest-cpu-unit || true
+
+      - name: save venv cache
+        if: success() && steps.venv_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/turbo-ci-venv
+          key: turbo-venv-${{ runner.os }}-${{ runner.arch }}-${{ steps.plan.outputs.job_id }}-${{ hashFiles('scripts/ci/envs.toml', 'scripts/ci/envs/**', 'pyproject.toml') }}
 
   npu_unit:
     name: npu-unit-tests
@@ -179,18 +211,30 @@ jobs:
       - name: environment check
         run: python3 scripts/ci/common/env_pod.py probe --file /tmp/torch-before.json
 
-      - name: install
+      - name: plan manual job
+        id: plan
         env:
-          MODE: npu
-          RESULT_JSON: /tmp/ci-result.json
-        run: bash scripts/ci/unit_tests/run_tests.sh install
+          SCOPE: ${{ inputs.scope || 'smoke' }}
+          TEST_PATH: ${{ inputs.test_path }}
+          SMOKE: ${{ env.SMOKE_NPU }}
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/manual_plan.py \
+            --lane npu-unit --scope "$SCOPE" --test-path "$TEST_PATH" \
+            --smoke "$SMOKE" --plan /tmp/manual-plan.json \
+            --github-output "$GITHUB_OUTPUT"
 
-      - name: pytest
+      - name: execute plan
         env:
-          MODE: npu
-          TEST_PATH: ${{ inputs.test_path || (inputs.scope == 'all' && env.SUITE_ALL || env.SMOKE_NPU) }}
+          JOB_ID: ${{ steps.plan.outputs.job_id }}
+          RUNNER_LABEL: ${{ vars.CI_NPU_RUNNER || 'linux-aarch64-a3-800i-2' }}
+          IMAGE: ${{ inputs.image || vars.CI_NPU_IMAGE || 'swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:base-latest' }}
           RESULT_JSON: /tmp/ci-result.json
-        run: bash scripts/ci/unit_tests/run_tests.sh
+          CI_JOB_LOG: /tmp/turbo-ci.log
+          JUNIT_OUT: /tmp/pytest.xml
+          VERSIONS_OUT: /tmp/versions.txt
+          CI_VENV_ROOT: /tmp/turbo-ci-venv
+        run: python3 scripts/ci/run_job.py --plan /tmp/manual-plan.json --job-id "$JOB_ID"
 
       - name: summary
         if: always()
@@ -199,9 +243,16 @@ jobs:
         run: |
           set -uo pipefail
           python3 scripts/ci/report/report_result.py report --file "$RESULT_JSON" \
-            --train-log /tmp/pytest.log --junit /tmp/pytest.xml >> "$GITHUB_STEP_SUMMARY" || true
+            --train-log /tmp/turbo-ci.log --versions /tmp/versions.txt \
+            --junit /tmp/pytest.xml >> "$GITHUB_STEP_SUMMARY" || true
           python3 scripts/ci/report/report_result.py notice --file "$RESULT_JSON" \
             --model-type pytest-npu-unit || true
+
+      # timeout-minutes only kills the process; children would keep the cards.
+      - name: environment cleanup
+        if: always()
+        continue-on-error: true
+        run: python3 scripts/ci/common/env_pod.py cleanup
 
   npu_e2e:
     name: npu-e2e-tests
@@ -211,7 +262,7 @@ jobs:
       && (github.event_name != 'pull_request'
           || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ${{ vars.CI_E2E_RUNNER || 'linux-aarch64-a3-800i-8' }}
-    timeout-minutes: 45
+    timeout-minutes: 180
 
     container:
       image: ${{ inputs.image || vars.CI_NPU_IMAGE || 'swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:base-latest' }}
@@ -233,7 +284,7 @@ jobs:
 
       - name: training orchestration
         id: lane
-        timeout-minutes: 25
+        timeout-minutes: 150
         env:
           E2E_CASES: ${{ inputs.cases || env.E2E_CASES_DEFAULT }}
           # ci-pr always runs lf: the selector only offers models with an lf

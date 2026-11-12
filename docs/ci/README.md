@@ -234,7 +234,7 @@ CPU 泳道执行 `-m cpu`，NPU 泳道执行 `-m npu`。`cuda` / `xpu` / `mps` �
 | `docker/npu/**` | ✅ | 选中的 CPU 文件 | **✅ 全跑** | 最便宜的用例 |
 | `pyproject.toml` | ✅ | **全量** | **✅ 全跑** | 最便宜的用例 |
 | `.github/workflows/**`、`scripts/ci/**`（`model_map.json` 除外） | ✅ | **全量** | — | `bailing_hybrid` tiny 兜底 |
-| `.github/workflows/model_map.json` | ✅ | **全量** | — | 所有 PR 用例 |
+| `.github/workflows/model_map.json` | ✅ | **全量** | — | `bailing_hybrid` tiny 兜底 |
 | `scripts/runs/<dir>/**` | ✅ | 源码里真引用它的测试 | — | 该 `run_dir` 的模型 |
 | 其它 `scripts/**` | ✅ | 源码里真引用它的测试 | — | — |
 | `tests/**` | ✅ | affected | — | — |
@@ -452,16 +452,23 @@ timeout-minutes: ${{ fromJSON(inputs.timeout_minutes || 60) }}
 | `CI_NPU_RUNNER` | variable | 可选 | 默认 `linux-aarch64-a3-800i-2` |
 | `CI_E2E_RUNNER` | variable | 可选 | 默认 `linux-aarch64-a3-800i-8` |
 
-端到端用几张卡、sp/ep 各是多少，写在 `model_map.json` 每个模型的 `params` 里，
+端到端用几张卡、sp/ep 各是多少，写在 `model_map.json` 每个 case 的
+`cards` / `sp` / `ep` 里。E2E 的 `fetch_timeout` / `case_timeout` 是执行策略，
+统一写在 `scripts/ci/lanes.yml` 的 `e2e_defaults` 中，默认分别是 3600s / 7200s；
+需要手工排查时可用同名环境变量覆盖。
+
 **不从 runner 标签推断**：真实标签带位置后缀（`...-8-cn12-001`），取末段会得到
 `001`，于是 8 卡 pod 只起 1 个进程却全绿。`cards` 必须能整除 `sp`，`cards / sp`
 必须能整除 `ep`，否则拒绝启动；当前上限是 16 卡，常规 E2E 用 8 卡。
 
-小模型下载全量权重（`layers=0`）；大模型按 `model_map.json` 的 `trim:N` 只保留
+小模型下载全量权重（`download.layers=0`）；大模型按 `download.layers=N` 只保留
 前 N 层，同时改写嵌套的 `text_config`、逐层列表和 MTP 开关，并裁剪索引指向的
 分片。两种模式共用同一个 `probe`，以 config、index 和索引声明的分片文件
 一致作为“可用”的判据。减层目录用 `.tt-cache-marker` 标记内容，并在同级
 `.<目录名>.lock` 上加文件锁，避免同一缓存目标被并发裁剪；全量模型不加锁。
+`N` 取模型的最小不重复结构，而不是固定值：Qwen3.5-35B-A3B 的完整周期是
+4 层（3 层 linear attention + 1 层 full attention）；Ling-3.0-flash 的
+`layer_group_size=6` 且前 2 层为 dense，因此需要 6 层才能覆盖全部结构。
 
 ## 本地怎么验
 
