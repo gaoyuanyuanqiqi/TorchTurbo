@@ -23,6 +23,7 @@ REQUIRED_MARKERS = ("cpu", "npu", "multi_npu", "gpu", "multi_gpu", "integration"
 KNOWN_MARKERS = frozenset(REQUIRED_MARKERS)
 MODEL_PACKAGES = frozenset({"base", "modules", "registry", "weight_converter"})
 FRAMEWORK_PACKAGES = {"llamafactory": "lf", "swift": "swift"}
+CASE_TRIGGERS = frozenset({"pr", "nightly"})
 
 
 @dataclass(frozen=True)
@@ -65,7 +66,7 @@ class E2eCase:
     cards: int
     sp: int
     ep: int
-    tier: str
+    triggers: frozenset[str]
 
     def as_selection(self, reason: str) -> dict[str, Any]:
         return {
@@ -77,7 +78,7 @@ class E2eCase:
             "cards": self.cards,
             "sp": self.sp,
             "ep": self.ep,
-            "tier": self.tier,
+            "triggers": sorted(self.triggers),
             "reason": reason,
         }
 
@@ -317,7 +318,6 @@ def _load_cases(root: Path, models: dict[str, dict[str, Any]], envs: dict[str, E
                 images: frozenset[str], errors: list[str]) -> tuple[E2eCase, ...]:
     cases: list[E2eCase] = []
     seen: set[str] = set()
-    pr_representatives: dict[tuple[str, str], str] = {}
     for model, row in sorted(models.items()):
         run_dir = str(row.get("run_dir") or "")
         raw_cases = row.get("cases") or []
@@ -336,11 +336,11 @@ def _load_cases(root: Path, models: dict[str, dict[str, Any]], envs: dict[str, E
             install = str(raw.get("install") or "")
             train = str(raw.get("train") or "")
             dataset = str(raw.get("dataset") or "")
-            tier = str(raw.get("tier") or "")
+            raw_triggers = raw.get("triggers") or []
             download = raw.get("download") or {}
             required = {
                 "id": case_id, "framework": framework, "env": env,
-                "install": install, "train": train, "dataset": dataset, "tier": tier,
+                "install": install, "train": train, "dataset": dataset,
             }
             missing = [name for name, value in required.items() if not value]
             if missing:
@@ -358,17 +358,17 @@ def _load_cases(root: Path, models: dict[str, dict[str, Any]], envs: dict[str, E
                 errors.append(f"{where}: unknown image {image!r}")
             if framework and framework not in env:
                 errors.append(f"{where}: env {env!r} does not match framework {framework!r}")
-            if tier not in {"pr", "nightly"}:
-                errors.append(f"{where}: tier must be pr or nightly")
-            if tier == "pr":
-                key = (model, framework)
-                previous = pr_representatives.get(key)
-                if previous:
+            if not isinstance(raw_triggers, list) or any(
+                    not isinstance(trigger, str) for trigger in raw_triggers):
+                errors.append(f"{where}: triggers must be a list of strings")
+                triggers = frozenset()
+            else:
+                triggers = frozenset(raw_triggers)
+                unknown = triggers - CASE_TRIGGERS
+                if unknown:
                     errors.append(
-                        f"{where}: PR case duplicates {previous!r} for {model}/{framework}"
+                        f"{where}: unknown triggers {', '.join(sorted(unknown))}"
                     )
-                else:
-                    pr_representatives[key] = case_id
             if not isinstance(download, dict):
                 errors.append(f"{where}: download must be a mapping")
                 download = {}
@@ -393,7 +393,8 @@ def _load_cases(root: Path, models: dict[str, dict[str, Any]], envs: dict[str, E
             cases.append(E2eCase(
                 model=model, run_dir=run_dir, case_id=case_id, framework=framework,
                 env=env, image=image, install=install, train=train, hf_repo=hf_repo,
-                layers=layers, dataset=dataset, cards=cards, sp=sp, ep=ep, tier=tier,
+                layers=layers, dataset=dataset, cards=cards, sp=sp, ep=ep,
+                triggers=triggers,
             ))
     return tuple(cases)
 
@@ -749,18 +750,16 @@ def scan_tests(catalog: CiCatalog) -> tuple[dict[str, TestFacts], list[PlanError
     return facts, errors
 
 
-def nearest_case(cases: list[E2eCase]) -> E2eCase | None:
-    """Return the cheapest PR representative, preferring fewer cards and layers."""
-    candidates = [case for case in cases if case.tier == "pr"]
-    return min(candidates, key=lambda case: (case.cards, case.layers, case.case_id),
-               default=None)
+def pr_cases(cases: list[E2eCase]) -> list[E2eCase]:
+    return [case for case in cases if "pr" in case.triggers]
 
 
 def select_e2e_cases(catalog: CiCatalog, changed: list[str], *, all_cases: bool,
                      force: bool) -> list[dict[str, Any]]:
     by_model = {model: catalog.cases_for(model) for model in catalog.models}
     if all_cases:
-        return [case.as_selection("all cases (full run)") for case in catalog.cases]
+        return [case.as_selection("all cases (full run)") for case in catalog.cases
+                if "nightly" in case.triggers]
     if force:
         changed = ["pyproject.toml"]
 
@@ -773,6 +772,10 @@ def select_e2e_cases(catalog: CiCatalog, changed: list[str], *, all_cases: bool,
         if current is None or priority < current[0]:
             picks[case.case_id] = (priority, case, reason)
 
+    def add_pr(cases: list[E2eCase], priority: int, reason: str) -> None:
+        for case in pr_cases(cases):
+            add(case, priority, reason)
+
     for path in changed:
         if path.startswith("scripts/runs/"):
             parts = path.split("/")
@@ -781,43 +784,41 @@ def select_e2e_cases(catalog: CiCatalog, changed: list[str], *, all_cases: bool,
                 exact = [case for case in catalog.cases
                          if case.run_dir == run_dir
                          and script in {case.train, case.install}]
-                for case in exact:
-                    add(case, 0, f"{path} (exact case)")
                 if exact:
+                    add_pr(exact, 0, f"{path} (exact case)")
                     continue
                 for case in catalog.cases_for_run_dir(run_dir):
-                    add(nearest_case([case]), 1, f"{path} (run_dir={run_dir})")
+                    add_pr([case], 1, f"{path} (run_dir={run_dir})")
             elif len(parts) == 3:
                 for case in catalog.cases_for_run_dir(parts[2]):
-                    add(nearest_case([case]), 1, f"{path} (run_dir)")
+                    add_pr([case], 1, f"{path} (run_dir)")
         elif path.startswith("scripts/ci/envs/") or path == "scripts/ci/envs.toml":
             env = Path(path).stem
             affected = (catalog.cases if env in {"envs", "common"} else
                         [case for case in catalog.cases if case.env == env])
             scope = "all envs" if env in {"envs", "common"} else f"env={env}"
-            add(nearest_case(affected), 1, f"{path} ({scope})")
+            add_pr(affected, 1, f"{path} ({scope})")
         elif path == ".github/workflows/model_map.json":
-            add(nearest_case(catalog.cases), 1, f"{path} (E2E map)")
+            add_pr(catalog.cases, 1, f"{path} (E2E map)")
         elif path.startswith("src/torchturbo/adapters/"):
             if not path.endswith(".py"):
                 continue
             framework = "swift" if "swift" in path else "lf"
             for model, cases in by_model.items():
-                add(nearest_case([case for case in cases if case.framework == framework]),
-                    1, f"{path} (framework={framework})")
+                add_pr([case for case in cases if case.framework == framework],
+                       1, f"{path} (framework={framework})")
         elif path.startswith("src/torchturbo/models/"):
             if not path.endswith(".py"):
                 continue
             parts = path.split("/")
             family = parts[3] if len(parts) > 3 else ""
             if family in by_model and family not in MODEL_PACKAGES:
-                add(nearest_case(by_model[family]), 0, f"{path} (family={family})")
+                add_pr(by_model[family], 0, f"{path} (family={family})")
             else:
-                add(nearest_case(by_model.get("qwen3_5", [])), 2,
-                    f"{path} (shared model layer)")
+                add_pr(by_model.get("qwen3_5", []), 2, f"{path} (shared model layer)")
         elif path.startswith("src/torchturbo/") and path.endswith(".py"):
-            add(nearest_case(by_model.get("qwen3_5", [])), 2, f"{path} (startup path)")
+            add_pr(by_model.get("qwen3_5", []), 2, f"{path} (startup path)")
         elif path.startswith("docker/npu/") or path == "pyproject.toml":
-            add(nearest_case(by_model.get("qwen3_5", [])), 2, f"{path} (image/deps)")
+            add_pr(by_model.get("qwen3_5", []), 2, f"{path} (image/deps)")
     ordered = sorted(picks.values(), key=lambda item: (item[0], item[1].case_id))
     return [case.as_selection(reason) for _, case, reason in ordered]

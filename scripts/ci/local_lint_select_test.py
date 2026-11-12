@@ -110,9 +110,25 @@ def cases(got: dict) -> list[dict]:
         return []
 
 
-def cases_with_case() -> int:
+def cases_with_trigger(trigger: str) -> int:
     rows = json.loads(MODEL_MAP.read_text(encoding="utf-8")).get("models", {})
-    return sum(len(row.get("cases") or []) for row in rows.values())
+    return sum(
+        1
+        for row in rows.values()
+        for case in row.get("cases") or []
+        if trigger in (case.get("triggers") or [])
+    )
+
+
+def models_with_trigger(trigger: str) -> list[str]:
+    rows = json.loads(MODEL_MAP.read_text(encoding="utf-8")).get("models", {})
+    picked = [
+        (case["id"], model)
+        for model, row in rows.items()
+        for case in row.get("cases") or []
+        if trigger in (case.get("triggers") or [])
+    ]
+    return [model for _, model in sorted(picked)]
 
 
 # ---------------------------------------------------------------- stages
@@ -171,10 +187,10 @@ SCENARIOS = [
     dict(name="ci script", files=["scripts/ci/lint_select/select_tests.py"], expect="all",
          cpu=True, npu=False, e2e=False, full_reason="ci-config-changed"),
     dict(name="shared env deps", files=["scripts/ci/envs/common.txt"], expect="all",
-         cpu=True, npu=False, e2e=True, e2e_models=["bailing_hybrid"],
+         cpu=True, npu=False, e2e=True, e2e_models=models_with_trigger("pr"),
          full_reason="ci-config-changed"),
     dict(name="E2E map", files=[".github/workflows/model_map.json"], expect="all",
-         cpu=True, npu=False, e2e=True, e2e_models=["bailing_hybrid"],
+         cpu=True, npu=False, e2e=True, e2e_models=models_with_trigger("pr"),
          full_reason="ci-config-changed"),
     # Dependency change: nothing can be trusted to install.
     dict(name="pyproject", files=["pyproject.toml"], expect="all",
@@ -232,8 +248,9 @@ def assert_scenario(case: dict) -> None:
 
     picked = cases(got)
     if case.get("e2e_all"):
-        check(f"{name}: every declared case ({cases_with_case()})",
-              len(picked) == cases_with_case(), f"got {len(picked)}")
+        expected = cases_with_trigger("nightly")
+        check(f"{name}: every nightly case ({expected})",
+              len(picked) == expected, f"got {len(picked)}")
     elif "e2e_count" in case:
         check(f"{name}: e2e count={case['e2e_count']}", len(picked) == case["e2e_count"],
               f"got {[c['model_type'] for c in picked]}")

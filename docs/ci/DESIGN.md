@@ -116,6 +116,19 @@ runner，因此不生成 GPU lane 或 GPU job。
 
 这些数字是事实样例，不是永久常量。plan 每次根据实际选中集合重新计算。
 
+### 1.4 E2E triggers
+
+每个 e2e case 用 `triggers` 声明参与的阶段：
+
+```json
+"triggers": ["pr", "nightly"]
+```
+
+- 缺省或空列表表示不自动触发；
+- PR 选择所有路径命中且包含 `pr` 的 case，不再只取一个代表；
+- full/nightly 选择所有包含 `nightly` 的 case；
+- 同一模型/框架可以声明多个 `pr` case，成本由配置者通过 trigger 控制。
+
 ---
 
 ## 2. lane 与 job

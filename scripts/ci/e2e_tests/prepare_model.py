@@ -69,7 +69,9 @@ def read_model_case_plan(map_path: str, model_type: str, framework: str,
     candidates = [case for case in cases if isinstance(case, dict)
                   and (not case_id or case.get("id") == case_id)
                   and (case_id or case.get("framework") == framework)]
-    candidates.sort(key=lambda case: (case.get("tier") != "pr", str(case.get("id"))))
+    candidates.sort(key=lambda case: (
+        "pr" not in (case.get("triggers") or []), str(case.get("id"))
+    ))
     if not candidates:
         suffix = f" case={case_id}" if case_id else f" framework={framework}"
         raise SystemExit(f"{model_type}: no E2E case for{suffix}")

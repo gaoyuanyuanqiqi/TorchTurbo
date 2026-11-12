@@ -1260,6 +1260,39 @@ def verify(root: Path) -> int:
     check("package root -> cheapest E2E case",
           [e["model_type"] for e in sel("src/torchturbo/__init__.py")["e2e_cases"]]
           == [CHEAPEST_MODEL])
+
+    ci_root = Path(__file__).resolve().parents[1]
+    if str(ci_root) not in sys.path:
+        sys.path.insert(0, str(ci_root))
+    from facts import CiCatalog, E2eCase, select_e2e_cases
+
+    def synthetic_case(case_id: str, triggers: set[str]) -> E2eCase:
+        return E2eCase(
+            model="bailing_hybrid", run_dir="bailing_v3", case_id=case_id,
+            framework="lf", env="lf", image="default",
+            install="install_lf_deps.sh", train="lf_sft.sh", hf_repo="org/model",
+            layers=0, dataset="gsm8k", cards=8, sp=2, ep=4,
+            triggers=frozenset(triggers),
+        )
+
+    catalog = CiCatalog(
+        root=index.root, envs={}, lanes={}, models={"bailing_hybrid": {}},
+        cases=(synthetic_case("case-pr-a", {"pr"}),
+               synthetic_case("case-pr-b", {"pr"}),
+               synthetic_case("case-nightly", {"nightly"})),
+        model_envs={}, test_envs={},
+    )
+    picked = select_e2e_cases(
+        catalog, ["src/torchturbo/models/bailing_hybrid/model.py"],
+        all_cases=False, force=False,
+    )
+    check("multiple PR cases in one family are all selected",
+          [case["case_id"] for case in picked] == ["case-pr-a", "case-pr-b"],
+          str(picked))
+    picked = select_e2e_cases(catalog, [], all_cases=True, force=False)
+    check("full run selects nightly cases only",
+          [case["case_id"] for case in picked] == ["case-nightly"], str(picked))
+
     r = sel("docker/npu/Dockerfile_aarch64")
     check("image recipe -> npu_unit runs the whole lane",
           r["lanes"]["npu_unit"]["run"]

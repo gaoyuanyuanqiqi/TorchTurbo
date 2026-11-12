@@ -23,7 +23,7 @@ on:
         default: false
         type: boolean
       with_e2e:
-        description: 'pr: one cheapest E2E case; full: every E2E case'
+        description: 'pr: path-selected E2E cases; full: every nightly E2E case'
         required: false
         default: false
         type: boolean

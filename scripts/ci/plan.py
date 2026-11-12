@@ -174,7 +174,8 @@ def compile_plan(catalog: CiCatalog, test_facts: dict[str, TestFacts],
             errors.append(PlanError("selection", f"unknown E2E case {case_id!r}"))
             continue
         canonical = case.as_selection(str(selected.get("reason") or ""))
-        for field in ("model_type", "framework", "env", "layers", "cards", "sp", "ep", "tier"):
+        for field in ("model_type", "framework", "env", "layers", "cards", "sp", "ep",
+                      "triggers"):
             if field in selected and selected[field] != canonical[field]:
                 errors.append(PlanError(
                     case_id, f"selection {field}={selected[field]!r} "
@@ -261,7 +262,7 @@ def verify(catalog: CiCatalog, test_facts: dict[str, TestFacts],
     failures = list(errors)
     cpu = next((facts for facts in test_facts.values() if "cpu" in facts.devices), None)
     npu = next((facts for facts in test_facts.values() if "npu" in facts.devices), None)
-    e2e = next((case for case in catalog.cases if case.tier == "pr"), None)
+    e2e = next((case for case in catalog.cases if "pr" in case.triggers), None)
     if cpu is None:
         failures.append(PlanError("tests", "no CPU test facts found"))
     if npu is None:
