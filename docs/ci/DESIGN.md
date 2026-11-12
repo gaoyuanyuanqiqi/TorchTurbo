@@ -334,6 +334,7 @@ job = (image, device, stage, work_id)
 - 不在全局 Python 安装 LF/Swift，不修改共享 cache；
 - e2e 的 `pip`、`python`、`torchrun` 通过 `PATH` 指向当前 venv；
 - 同一 env 的多个 pytest group 复用 venv。
+- venv 仅存在于当前 job/pod，不做跨 run 的远端缓存。
 
 ### 5.3 失败与超时
 

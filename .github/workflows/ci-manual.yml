@@ -108,7 +108,6 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
-        id: setup_python
         with:
           python-version: '3.11'
           cache: pip
@@ -134,17 +133,6 @@ jobs:
             --smoke "$SMOKE" --plan /tmp/manual-plan.json \
             --github-output "$GITHUB_OUTPUT"
 
-      - name: restore venv cache
-        id: venv_cache
-        uses: actions/cache/restore@v4
-        with:
-          path: ${{ runner.temp }}/turbo-ci-venv
-          key: turbo-venv-${{ runner.os }}-${{ runner.arch }}-${{ steps.plan.outputs.job_id }}-py${{ steps.setup_python.outputs.python-version }}-${{ hashFiles('scripts/ci/venv_manager.py', 'scripts/ci/common/env_pod.py') }}-${{ hashFiles('scripts/ci/envs.toml', 'scripts/ci/envs/**', 'pyproject.toml') }}
-          # Reuse the newest compatible archive. VenvManager validates each
-          # content-addressed profile and rebuilds only changed environments.
-          restore-keys: |
-            turbo-venv-${{ runner.os }}-${{ runner.arch }}-${{ steps.plan.outputs.job_id }}-py${{ steps.setup_python.outputs.python-version }}-${{ hashFiles('scripts/ci/venv_manager.py', 'scripts/ci/common/env_pod.py') }}-
-
       - name: execute plan
         env:
           JOB_ID: ${{ steps.plan.outputs.job_id }}
@@ -168,13 +156,6 @@ jobs:
             --junit "${{ runner.temp }}/pytest.xml" >> "$GITHUB_STEP_SUMMARY" || true
           python3 scripts/ci/report/report_result.py notice --file "$RESULT_JSON" \
             --model-type pytest-cpu-unit || true
-
-      - name: save venv cache
-        if: success() && steps.venv_cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: ${{ runner.temp }}/turbo-ci-venv
-          key: turbo-venv-${{ runner.os }}-${{ runner.arch }}-${{ steps.plan.outputs.job_id }}-py${{ steps.setup_python.outputs.python-version }}-${{ hashFiles('scripts/ci/venv_manager.py', 'scripts/ci/common/env_pod.py') }}-${{ hashFiles('scripts/ci/envs.toml', 'scripts/ci/envs/**', 'pyproject.toml') }}
 
   npu_unit:
     name: npu-unit-tests

@@ -147,6 +147,7 @@ def _execute(job: dict[str, Any], root: Path) -> int:
         f"mode={device}", f"runner_label={runner_label}", f"image={image}",
         f"job_id={job.get('id', '')}", f"test_path={job.get('id', '')}",
         f"pytest_args={os.environ.get('PYTEST_ARGS', '-v --durations=20')}",
+        f"junit={merged_junit}",
     )
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.write_text("", encoding="utf-8")

@@ -16,7 +16,7 @@ scripts/ci/
   bin/           venv 内训练脚本使用的工具 wrapper
   manual_plan.py 手动 unit lane -> 一个 plan job
   run_job.py     按 plan 执行一个 job
-  venv_manager.py  内容哈希 cache 的 env venv
+  venv_manager.py  job 内按内容哈希复用 env venv
   local_*        本机自检脚本，不进 CI
 ```
 

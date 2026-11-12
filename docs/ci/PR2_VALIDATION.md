@@ -46,6 +46,6 @@ python3 scripts/ci/local_lint_select_test.py
 - `cpu-unit-tests` 只为 plan 中的 `(image, cpu resource)` 生成 box。
 - job 内按 env 建 venv；同一 env 的多个 process-isolated pytest step 复用 venv。
 - 任一 step 失败立即停止，后续 step 不继续占用 runner。
-- venv cache 只保存成功的 job；命中 cache 时不再重复 save。
+- venv 只在单个 job 内复用，不做跨 run 的 venv 缓存。
 - NPU 两条旧 job 的入口、输出和 gate 语义不变。
 
