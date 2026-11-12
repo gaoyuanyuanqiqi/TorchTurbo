@@ -14,12 +14,17 @@ from typing import Any
 DEVICE_BY_LANE = {"cpu-unit": "cpu", "npu-unit": "npu"}
 
 
-def _selection(device: str, scope: str, test_path: str) -> dict[str, Any]:
+def _selection(device: str, scope: str, test_path: str,
+               changed_files: list[str]) -> dict[str, Any]:
     """Build the minimal selection consumed by plan.py."""
     lane = {"run": False}
     if scope == "all" and not test_path:
         lane = {"run": True, "files": [], "scope": "all"}
-    return {"mode": "manual", "lanes": {f"{device}_unit": lane}}
+    return {
+        "mode": "manual",
+        "changed": changed_files,
+        "lanes": {f"{device}_unit": lane},
+    }
 
 
 def _write_output(path: str, values: dict[str, str]) -> None:
@@ -37,9 +42,10 @@ def _run_plan(
     device: str,
     scope: str,
     test_path: str,
+    changed_files: list[str],
 ) -> int:
     selection_path.write_text(
-        json.dumps(_selection(device, scope, test_path)),
+        json.dumps(_selection(device, scope, test_path, changed_files)),
         encoding="utf-8",
     )
     command = [
@@ -70,6 +76,9 @@ def main(argv: list[str]) -> int:
     parser.add_argument(
         "--smoke", default="", help="smoke paths used when test-path is empty"
     )
+    parser.add_argument(
+        "--changed-files", default="", help="newline-separated changed paths"
+    )
     parser.add_argument("--root", default=None)
     parser.add_argument("--plan", default="/tmp/manual-plan.json")
     parser.add_argument("--github-output", default="")
@@ -85,10 +94,19 @@ def main(argv: list[str]) -> int:
         if not test_path:
             print("::error::smoke scope needs --smoke paths", file=sys.stderr)
             return 2
+    changed_files: list[str] = []
+    if args.changed_files:
+        changed_files = [
+            line.strip()
+            for line in Path(args.changed_files).read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
 
     plan_path = Path(args.plan)
     selection_path = plan_path.with_name(f"{plan_path.name}.selection.json")
-    rc = _run_plan(root, plan_path, selection_path, device, args.scope, test_path)
+    rc = _run_plan(
+        root, plan_path, selection_path, device, args.scope, test_path, changed_files
+    )
     if rc != 0:
         return rc
 

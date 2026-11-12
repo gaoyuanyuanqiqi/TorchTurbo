@@ -106,6 +106,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -126,11 +128,15 @@ jobs:
           SCOPE: ${{ inputs.scope || 'smoke' }}
           TEST_PATH: ${{ inputs.test_path }}
           SMOKE: ${{ env.SMOKE_CPU }}
+          BASE_REF: ${{ github.event.pull_request.base.ref || 'main' }}
         run: |
           set -euo pipefail
+          git diff --name-only "origin/${BASE_REF}...HEAD" > /tmp/manual-changed.txt || \
+            { echo "::warning::cannot compute changed files"; : > /tmp/manual-changed.txt; }
           python3 scripts/ci/manual_plan.py \
             --lane cpu-unit --scope "$SCOPE" --test-path "$TEST_PATH" \
             --smoke "$SMOKE" --plan /tmp/manual-plan.json \
+            --changed-files /tmp/manual-changed.txt \
             --github-output "$GITHUB_OUTPUT"
 
       - name: execute plan
@@ -181,6 +187,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: preflight
         env:
@@ -203,11 +211,15 @@ jobs:
           SCOPE: ${{ inputs.scope || 'smoke' }}
           TEST_PATH: ${{ inputs.test_path }}
           SMOKE: ${{ env.SMOKE_NPU }}
+          BASE_REF: ${{ github.event.pull_request.base.ref || 'main' }}
         run: |
           set -euo pipefail
+          git diff --name-only "origin/${BASE_REF}...HEAD" > /tmp/manual-changed.txt || \
+            { echo "::warning::cannot compute changed files"; : > /tmp/manual-changed.txt; }
           python3 scripts/ci/manual_plan.py \
             --lane npu-unit --scope "$SCOPE" --test-path "$TEST_PATH" \
             --smoke "$SMOKE" --plan /tmp/manual-plan.json \
+            --changed-files /tmp/manual-changed.txt \
             --github-output "$GITHUB_OUTPUT"
 
       - name: execute plan

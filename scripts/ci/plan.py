@@ -234,30 +234,35 @@ def compile_plan(catalog: CiCatalog, test_facts: dict[str, TestFacts],
     return {"schema": 1, "mode": selection.get("mode", "pr"), "jobs": output_jobs}, errors
 
 
-def _summary(plan: dict[str, Any]) -> str:
-    lines = ["## Plan", "",
-             "| job | required | runner | env | work |",
-             "|---|---:|---|---|---|"]
-    files: set[str] = set()
+def _summary(plan: dict[str, Any], changed_files: list[str] | None = None) -> str:
+    lines = ["## Plan", ""]
+    if changed_files:
+        lines += ["### Changed files", "", "```text", *changed_files[:100]]
+        if len(changed_files) > 100:
+            lines.append(f"... (+{len(changed_files) - 100} more)")
+        lines += ["```", ""]
+    lines += [
+        "| job | required | runner | env | process | test files |",
+        "|---|---:|---|---|---|---|",
+    ]
+    rows = 0
     for job in plan["jobs"]:
         for step in job["steps"]:
             if step["kind"] == "pytest":
-                work = f"pytest {len(step['files'])} file(s) / {step['process']}"
-                files.update(step["files"])
+                process = str(step.get("process", ""))
+                files = "<br>".join(f"`{path}`" for path in step["files"])
             else:
-                work = "e2e " + ", ".join(case["case_id"] for case in step["cases"])
+                process = "e2e"
+                files = "<br>".join(
+                    f"`{case['case_id']}`" for case in step["cases"]
+                )
             lines.append(
                 f"| `{job['id']}` | {job['required_slots']} | `{job['runner']}` | "
-                f"`{step['env']}` | {work} |"
+                f"`{step['env']}` | `{process}` | {files} |"
             )
-    if len(lines) == 4:
-        lines.append("| - | - | - | - | no work selected |")
-    if files:
-        shown = sorted(files)
-        lines += ["", "### Test files", "", "```", *shown[:40]]
-        if len(shown) > 40:
-            lines.append(f"... (+{len(shown) - 40} more)")
-        lines += ["```"]
+            rows += 1
+    if not rows:
+        lines.append("| - | - | - | - | - | no work selected |")
     return "\n".join(lines) + "\n"
 
 
@@ -454,6 +459,7 @@ def main(argv: list[str]) -> int:
         parser.error("--selection is required unless --verify is used")
 
     selection = _load_selection(Path(args.selection))
+    changed_files = [str(path) for path in selection.get("changed") or []]
     selection, selectors, path_errors = _apply_test_path(
         root, selection, args.test_path, test_facts
     )
@@ -472,7 +478,7 @@ def main(argv: list[str]) -> int:
         sys.stdout.write(text)
     if args.summary_file:
         with open(args.summary_file, "a", encoding="utf-8") as handle:
-            handle.write(_summary(plan))
+            handle.write(_summary(plan, changed_files))
     if args.github_output:
         output = Path(args.github_output)
         for key, jobs in (("cpu", cpu_jobs(plan)),
