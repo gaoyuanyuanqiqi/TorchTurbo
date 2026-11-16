@@ -7,12 +7,12 @@
 
 ```text
 scripts/ci/
-  lint_select/   lint 与 select 阶段
+  lint_select/   lint 阶段
   unit_tests/    本机单测回退 runner
   e2e_tests/     NPU 模型用例：取模型、并行策略、训练监督
   image/         基础镜像构建
   common/        pod 环境
-  report/        结果汇总与门禁判定
+  report/        结果汇总与计时
   bin/           venv 内训练脚本使用的工具 wrapper
   catalog.yml    images / venvs / lanes / workloads 的静态事实
   policies.yml   pull_request / nightly 的运行范围
@@ -24,9 +24,7 @@ scripts/ci/
   executor.py    Plan 中的一个 Job -> JobResult
   gate.py        Plan + JobResult -> Decision
   venv_manager.py  按 Plan 中自包含的 venv 规格复用环境
-  manual_plan.py 迁移期：手动 unit lane -> 旧 plan job
-  run_job.py     迁移期：执行旧 plan job
-  local_*        本机自检脚本，不进 CI
+  tests/         Planner / Executor / Gate / Catalog 契约测试
 ```
 
 正式路径只有一条：`lint -> Planner -> PlanArtifact -> Executor -> JobResult -> Gate`。
@@ -40,14 +38,10 @@ nightly 跑所有 pytest suite 和所有 E2E case。
 Plan/Gate 这两个轻量步骤，让必过检查仍然能给出明确结论。分类失败或无法读取
 diff 时按代码变更处理。
 
-`manual_plan.py`、`run_job.py` 是迁移期兼容入口，只供 manual workflow 和回滚使用。
 `unit_tests/run_tests.sh` 只保留给本机回退。
 
 通用规则交给 Ruff（Python）、`shellcheck`、`actionlint` 和 `hadolint`；自定义
-检查只保留通用工具看不到的仓库契约：job 依赖图、选测器自检、模型映射和 pytest
-marker。
-
-`local_*` 表示「只在本机跑」，不会出现在任何 workflow 里。
+检查只保留通用工具看不到的仓库契约：job 依赖图、模型映射和 pytest marker。
 
 **按阶段划分，一个入口回答一个阶段的问题**：
 
@@ -56,18 +50,14 @@ marker。
 | `planner.py` | Catalog + Policy 这轮要跑什么？ | `--policy` / `--verify` / `--github-output` / `--image-ref` / `--target-job` |
 | `executor.py` | Plan 中一个 Job 怎么执行并留下证据？ | `--plan + --job-id` / `--dry-run` / `--record-skip` |
 | `gate.py` | Plan 与 JobResult 是否完整且一致？ | `--plan` / `--results` / `--summary` |
-| `lint_select/select_tests.py` | 这次改动该跑什么？ | `--explain` / `--coverage` / `--verify` / `--changed-from git` / `--mode pr\|full --labels …` |
 | `lint_select/lint_check.py` | 静态体检总入口；通用检查先跑，Turbo 契约后跑 | 无参数 = 全跑 / `--only NAME` |
-| `plan.py` | 迁移期：旧选测结果怎么变成 job / env / 进程？ | `--selection` / `--verify` / `--github-output` |
-| `manual_plan.py` | 迁移期：手动 unit lane 怎么复用旧 env plan？ | `--lane` / `--scope` / `--test-path` |
-| `run_job.py` | 迁移期：旧 plan job 怎么装依赖、跑 pytest / e2e？ | `--job-json` 或 `--plan + --job-id` |
-| `venv_manager.py` | env 依赖装在哪、何时复用？ | 被 `executor.py` / `run_job.py` 调用 |
+| `venv_manager.py` | env 依赖装在哪、何时复用？ | 被 `executor.py` 调用 |
 | `unit_tests/run_tests.sh` | 本机回退泳道怎么跑？ | `install` / `test`（`MODE=cpu\|npu`） |
 | `e2e_tests/prepare_model.py` | 模型和派生配置是否完成预处理？ | `plan` / `fetch` / `probe` / `cases` |
 | `e2e_tests/run_train.sh` | 一次训练冒烟分几步？ | `resolve` / `install` / `run` / `report` / `lane` |
 | `common/env_pod.py` | 这台 pod 现在是什么状态？ | `probe` / `check` / `cleanup` |
 | `image/build_image.py` | 基础镜像该不该建 / 怎么建 / 发什么引用 / SWR 上传链路是否可用 | `env` / `tag` / `build` / `verify` / `selftest` / `publish` / `resolve` / `hadolint` / `summary` / `cleanup` |
-| `report/report_gate.py` | 迁移期：旧 lane 结果算不算通过？ | `timing` / `judge --mode pr\|full` / `failed-step` |
+| `report/report_gate.py` | 本轮 CI 排队和执行了多久？ | `timing` |
 | `report/report_result.py` | 事实 → 人看的摘要 | `init` / `set` / `phase` / `report` / `notice` / `junit` / `migrate-map` |
 
 ### lint：通用工具先行，Turbo 契约后置
@@ -77,8 +67,8 @@ marker。
 入口。检查之间不 import 本仓代码，只有少数跨文件契约会主动调用脚本。
 
 `lint_check.py` 只负责 CLI 和汇总；`lint_common_check.py` 依次跑 Ruff、shellcheck、
-actionlint、hadolint；`lint_turbo_check.py` 再跑 `contract`、`selector`、`model_map`、
-`markers`。通用规则不在这里重新实现。
+actionlint、hadolint；`lint_turbo_check.py` 再跑 `contract`、`model_map`、`markers`。
+通用规则不在这里重新实现。
 
 `CHECKS` 是 `Check(name, description, function)` 的元组。加一个 Turbo 检查 = 写函数 +
 在 `lint_turbo_check.py` 的 `CHECKS` 里加一行：
@@ -112,13 +102,12 @@ src/torchturbo/utils/torch_utils.py:133: invalid syntax
 `TORCHTURBO_LINT_TOOLS`；缺失时按文件里固定的版本从 release 下载，不使用
 `curl | bash`。Ruff 由 CI 的 pip 步骤固定版本安装。
 
-### 本机自检
+### 契约自检
 
-`local_lint_select_test.py` 不是 CI 阶段，任何 workflow 都不调用它。跑一遍等于把
-`lint`、`select --verify`、13 个真实改动场景和 job 图契约全验一次：
+Catalog、Policy、Planner、Executor 和 Gate 的行为由 `scripts/ci/tests` 固定：
 
 ```bash
-python3 scripts/ci/local_lint_select_test.py --only docker
+python3 -m pytest scripts/ci/tests -q
 ```
 
 模型 job 分为 `environment check -> training orchestration -> environment cleanup`。
@@ -132,13 +121,13 @@ ascend-pr.yml       唯一入口  plan{lint,image,Planner} -> {cpu,npu matrix} -
                     mode=pr（core pytest + 1 model guard）
                     mode=full（全量 pytest + 全量 E2E）；可被 nightly 复用
                     target_job=<job-id> 只保留一个 Job，供单点诊断
-ascend-manual.yml   手动单泳道（dispatch 或 ci:manual:<lane> 标签）
+ascend-manual.yml   手动单 Job：复用主 workflow，Planner 只保留 target_job
 ascend-image.yml    构建基础镜像（**只手动 dispatch**）
 ascend-nightly.yml  全量 nightly 入口（schedule 暂注释，只支持手动 dispatch）
 catalog.yml         images / venvs / lanes / pytest / E2E 的静态事实
 policies.yml        pull_request / nightly 的选择范围
-model_map.json      迁移期：manual workflow 与旧执行器读取
-pytest.ini          测试根 / 导入路径 / marker 契约（与 select_tests.py 交叉校验）
+model_map.json      训练脚本兼容映射；Catalog 校验仍会读取
+pytest.ini          测试根 / 导入路径 / marker 契约
 ```
 
 `plan / cpu / npu / gate` 四个 job **内联**在 `ascend-pr.yml`。
@@ -163,15 +152,15 @@ yaml 里只留「输什么、调哪个脚本」，超过 10 行的 bash 一律�
 
 反过来，下面这些**不合并**，因为它们回答的是不同的问题：
 
-* `select_tests.py`（选什么）与 `report_gate.py`（算不算过）—— 选错和判错是两类故障，
+* `planner.py`（选什么）与 `gate.py`（算不算过）—— 选错和判错是两类故障，
   合一起会让门禁自己变成黑盒。
 * `report_result.py`（事实 → 文字）—— 其他脚本都向它写事实，它不该反过来依赖任何人。
 * `install_deps.sh` 已并入 `run_tests.sh install`：workflow 仍用两个 step，
   装挂了与测试挂了仍然分得开。
 
 生产路径的范围语义只放在 `policies.yml`：`mode=pr|full` 只负责选择 policy，
-不再根据 diff 或标签改选测集合。迁移期 manual workflow 仍使用旧
-`select_tests.py` 的标签语义；旧入口删除时一并移除。
+不再根据 diff 或标签改选测集合。Manual 使用同一份 policy，再通过
+`target_job` 缩减为一个 Job，不维护第二套选测规则。
 
 ## 约定
 
@@ -218,12 +207,6 @@ python3 scripts/ci/executor.py --plan /tmp/plan.json --job-id <job-id> \
 python3 scripts/ci/gate.py --plan /tmp/plan.json --results /tmp/ci-results \
   --output /tmp/decision.json --summary /tmp/summary.md
 
-# 迁移期选测与旧执行器仍可单独验证
-python3 scripts/ci/lint_select/select_tests.py --verify
-python3 scripts/ci/plan.py --selection /tmp/s.json --output /tmp/legacy-plan.json \
-  --github-output /tmp/github-output
-python3 scripts/ci/run_job.py --plan /tmp/legacy-plan.json --job-id default/cpu
-
 # 装依赖前后 torch 有没有被换掉
 python3 scripts/ci/common/env_pod.py probe --device cpu --file /tmp/t.json
 python3 scripts/ci/common/env_pod.py check --device cpu --file /tmp/t.json
@@ -243,7 +226,4 @@ python3 scripts/ci/e2e_tests/prepare_model.py fetch --repo Qwen/Qwen3.5-35B-A3B 
 # junit 计数
 python3 scripts/ci/report/report_result.py junit --file /tmp/r.json --junit /tmp/pytest.xml
 
-# 迁移期旧门禁（手写 env 模拟各种结果）
-R_SEL=success SEL_FAILED_STEP=none R_CPU=success R_NPU=skipped \
-  CPU_RUN=true NPU_RUN=false python3 scripts/ci/report/report_gate.py judge --mode pr
 ```

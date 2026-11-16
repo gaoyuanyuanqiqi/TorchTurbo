@@ -9,7 +9,7 @@ import re
 import sys
 from pathlib import Path
 
-from lint_common_check import CI, ROOT, WORKFLOWS, Check, Problem, relative, run, text
+from lint_common_check import CI, ROOT, WORKFLOWS, Check, Problem, relative, text
 
 BUILTIN_MARKERS = frozenset({
     "filterwarnings",
@@ -103,72 +103,6 @@ def check_contract() -> list[Problem]:
         if plan_jobs:
             problems.extend(_check_planner_v2(rel, jobs, yaml.safe_dump(doc, allow_unicode=True)))
             continue
-        planner_names = [name for name, job in jobs.items()
-                         if "select_tests.py" in _job_run_text(job)]
-        if not planner_names:
-            continue
-        if len(planner_names) > 1:
-            problems.append(Problem(rel, "expected one planner job; found "
-                                         f"{sorted(planner_names)}"))
-            continue
-        planner_name = planner_names[0]
-        planner = jobs[planner_name]
-        planner_body = _job_run_text(planner)
-        dumped = yaml.safe_dump(doc, allow_unicode=True)
-
-        planner_yaml = yaml.safe_dump(planner, allow_unicode=True)
-        if "--changed-from git" in planner_body and "fetch-depth: 0" not in planner_yaml:
-            problems.append(Problem(
-                rel, f"{planner_name} uses git history without fetch-depth: 0"
-            ))
-
-        declared = set((planner.get("outputs") or {}).keys())
-        output_pattern = rf"needs\.{re.escape(planner_name)}\.outputs\.([A-Za-z0-9_-]+)"
-        used = set(re.findall(output_pattern, dumped))
-        for name in sorted(used - declared):
-            problems.append(Problem(
-                rel,
-                f"reads needs.{planner_name}.outputs.{name} but the planner does not declare it",
-            ))
-        for name in sorted(declared - used):
-            problems.append(Problem(rel, f"planner output {name!r} has no consumer"))
-
-        lint_jobs = {name for name, job in jobs.items()
-                     if "lint_check.py" in _job_run_text(job)}
-        if planner_name not in lint_jobs:
-            problems.append(Problem(rel, "planner job must also run lint_check.py"))
-        elif planner_body.index("lint_check.py") > planner_body.index("select_tests.py"):
-            problems.append(Problem(rel, "select_tests.py runs before lint_check.py"))
-        if "select_tests.py --verify" in planner_body:
-            problems.append(Problem(rel, "lint_check.py already runs the selector self-test"))
-        extra_lint_jobs = sorted(lint_jobs - {planner_name})
-        if extra_lint_jobs:
-            problems.append(Problem(rel, "lint must run only in the planner job; found in "
-                                         f"{extra_lint_jobs}"))
-
-        needed = {dependency for job in jobs.values() for dependency in _job_needs(job)}
-        terminals = sorted(set(jobs) - needed)
-        lanes = sorted({name for name, job in jobs.items()
-                        if planner_name in _job_needs(job)} - set(terminals))
-        if not lanes:
-            problems.append(Problem(rel, "planner must feed at least one lane"))
-        for name in lanes:
-            lane_dependencies = set(_job_needs(jobs[name]))
-            chained = sorted(lane_dependencies & set(lanes))
-            if chained:
-                problems.append(Problem(rel, f"lane {name!r} depends on lanes {chained}"))
-
-        if len(terminals) != 1:
-            problems.append(Problem(
-                rel, "planner workflow must have exactly one terminal job; "
-                     f"found {terminals}"
-            ))
-            continue
-        terminal = terminals[0]
-        reachable = _job_closure(jobs, terminal)
-        missing = sorted({planner_name, *lanes} - reachable)
-        if missing:
-            problems.append(Problem(rel, f"terminal job {terminal!r} does not reach {missing}"))
     return problems
 
 
@@ -184,9 +118,6 @@ def _check_planner_v2(rel: str, jobs: dict, dumped: str) -> list[Problem]:
     planner_body = _job_run_text(planner)
     if "lint_check.py" not in planner_body:
         problems.append(Problem(rel, "Planner job must also run lint_check.py"))
-    if "select_tests.py" in planner_body:
-        problems.append(Problem(rel, "Planner job must not run the legacy selector"))
-
     declared = set((planner.get("outputs") or {}).keys())
     output_pattern = rf"needs\.{re.escape(planner_name)}\.outputs\.([A-Za-z0-9_-]+)"
     used = set(re.findall(output_pattern, dumped))
@@ -228,17 +159,6 @@ def _check_planner_v2(rel: str, jobs: dict, dumped: str) -> list[Problem]:
     return problems
 
 
-def check_selector() -> list[Problem]:
-    """Run the selector's own rule assertions."""
-    selector = CI / "lint_select" / "select_tests.py"
-    proc = run([sys.executable, str(selector), "--verify"], timeout=180)
-    if proc.returncode == 0:
-        return []
-    output = (proc.stdout + proc.stderr).strip().splitlines()
-    detail = output[-1] if output else f"exit {proc.returncode}"
-    return [Problem(relative(selector), f"selector self-test failed: {detail}")]
-
-
 def check_model_map() -> list[Problem]:
     """Validate model, env, lane, and E2E case facts together."""
     sys.path.insert(0, str(CI))
@@ -247,45 +167,6 @@ def check_model_map() -> list[Problem]:
     catalog = load_catalog(ROOT)
     return [Problem(message.split(":", 1)[0], message.split(":", 1)[-1].strip())
             for message in catalog.errors]
-
-
-def check_plan() -> list[Problem]:
-    """Run the planner's fact and sample-job assertions."""
-    planner = CI / "plan.py"
-    proc = run([sys.executable, str(planner), "--verify"], timeout=180)
-    if proc.returncode == 0:
-        return []
-    output = (proc.stdout + proc.stderr).strip().splitlines()
-    detail = output[-1] if output else f"exit {proc.returncode}"
-    return [Problem(relative(planner), f"plan self-test failed: {detail}")]
-
-
-def _module_marker_names(path: Path) -> set[str]:
-    """Collect string keys/values from module-level names ending in MARKERS."""
-    tree = ast.parse(text(path))
-    names: set[str] = set()
-    for node in tree.body:
-        targets = []
-        value = None
-        if isinstance(node, ast.Assign):
-            targets, value = node.targets, node.value
-        elif isinstance(node, ast.AnnAssign):
-            targets, value = [node.target], node.value
-        if value is None or not any(isinstance(t, ast.Name) and t.id.endswith("MARKERS")
-                                    for t in targets):
-            continue
-        while isinstance(value, ast.Call) and isinstance(value.func, ast.Name) \
-                and value.func.id in ("frozenset", "set") and len(value.args) == 1:
-            value = value.args[0]
-        try:
-            literal = ast.literal_eval(value)
-        except (ValueError, SyntaxError):
-            continue
-        if isinstance(literal, dict):
-            names.update(key for key in literal if isinstance(key, str))
-        elif isinstance(literal, (set, frozenset, list, tuple)):
-            names.update(item for item in literal if isinstance(item, str))
-    return names
 
 
 def _test_marker_names() -> set[str]:
@@ -307,10 +188,9 @@ def _test_marker_names() -> set[str]:
 
 
 def check_markers() -> list[Problem]:
-    """Every marker used by the selector or tests is registered in pytest.ini."""
+    """Every marker used by tests is registered in pytest.ini."""
     ini = ROOT / "pytest.ini"
     pyproject = ROOT / "pyproject.toml"
-    selector = CI / "lint_select" / "select_tests.py"
     problems = []
 
     if "[tool.pytest.ini_options]" in text(pyproject):
@@ -328,7 +208,7 @@ def check_markers() -> list[Problem]:
     sys.path.insert(0, str(CI))
     from facts import REQUIRED_MARKERS
 
-    markers = _module_marker_names(selector) | _test_marker_names()
+    markers = _test_marker_names()
     for name in sorted(markers - configured):
         problems.append(Problem("pytest.ini", f"marker {name!r} is used but not registered"))
     for name in sorted(configured - set(REQUIRED_MARKERS)):
@@ -338,8 +218,6 @@ def check_markers() -> list[Problem]:
 
 CHECKS = (
     Check("contract", "planner/lint/lane topology and output contracts", check_contract),
-    Check("selector", "selector self-test and precision guards", check_selector),
     Check("model_map", "model, env, lane, and E2E case facts", check_model_map),
-    Check("plan", "env, lane, and process plan", check_plan),
     Check("markers", "registered pytest marker contract", check_markers),
 )

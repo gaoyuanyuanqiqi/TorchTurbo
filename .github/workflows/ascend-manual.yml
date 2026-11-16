@@ -1,293 +1,50 @@
 name: Ascend-Manual-CI
+run-name: Ascend-Manual-CI ${{ inputs.target_job }} ${{ github.ref_name }}
 
-# Run ONE lane by hand: no selection, no gate, no sibling lanes, so a red run
-# points at the lane instead of the diff. ascend-pr.yml stays the only PR entry.
+# Debug one exact job through the normal CI graph. Manual runs use the same
+# Catalog/Policy -> Plan -> Executor -> Gate pipeline as PR and nightly, but
+# reduce the Plan to one target job. No second planner or executor path.
 #
-# No lint / select here on purpose: this workflow answers "does this lane work",
-# which the PR gate already proves for correct code. Running the selector would
-# also filter out the very case being debugged.
+# target_job is the Plan job id. Common values:
+#   pytest-core-cpu-cpu-default-default
+#   pytest-core-npu-npu-default-default
+#   model-e2e-bailing-hybrid-lf-sft
 #
-# Web UI: Actions -> "Manual lane test" -> Run workflow -> pick lane -> branch.
-# The branch selector picks which code runs, so any branch can be tested without
-# touching it. If the run still uses the old script names, the branch predates
-# the scripts/ci rename.
-#
-# Label: add ci:manual:<lane> to a PR (pull_request workflows are read from the
-# PR head, so this works even before the file reaches main). Re-run by removing
-# the label and adding it again.
-#
-# Suggested order: cpu-unit -> npu-unit -> npu-e2e.
-#
-# Unit lanes default to `smoke`: a handful of dirs that stay green, so a red run
-# means the lane broke, not a test. `all` is the whole suite and is expected to
-# be red for reasons outside CI (see tests/scripts/test_dequant.py, which fails
-# at collection and aborts the whole session in seconds).
-#
-# Unit lanes reuse plan.py and run_job.py, so a manual run installs the same
-# per-test venv profiles as ascend-pr.yml. The old unpinned `pip install -e .[test]`
-# path silently moved transformers to 5.22.2 and broke tests written for 5.5.4.
-
-# Without this every run in the list is just "Manual lane test".
-run-name: Ascend-Manual-CI ${{ inputs.lane || github.event.label.name }} ${{ github.ref_name }}
+# Use mode=pr for PR scope, or mode=full to target a job that only nightly
+# selects (for example a nightly-only model E2E case). An unknown target fails
+# in Planner before any runner starts.
 
 on:
-  pull_request:
-    types: [labeled]
   workflow_dispatch:
     inputs:
-      lane:
-        description: 'which lane to run'
+      mode:
+        description: 'pr = PR policy; full = nightly policy'
         required: true
-        default: 'cpu-unit'
+        default: 'pr'
         type: choice
         options:
-          - cpu-unit
-          - npu-unit
-          - npu-e2e
-      scope:
-        description: 'unit lanes: smoke = a few green dirs; all = the whole suite (slow, known red)'
+          - pr
+          - full
+      target_job:
+        description: 'exact Plan job id to execute'
         required: true
-        default: 'smoke'
-        type: choice
-        options:
-          - smoke
-          - all
-      test_path:
-        description: "unit lanes: explicit path(s) or node ids, space separated; overrides scope"
-        required: false
-        default: ''
-        type: string
-      cases:
-        description: 'npu-e2e: E2E cases as JSON {model_type, layers}; layers=0 keeps all layers'
-        required: false
-        default: '[{"model_type":"qwen3_5","layers":0}]'
-        type: string
-      framework:
-        description: 'npu-e2e: launcher family to run; some models only have swift'
-        required: true
-        default: 'lf'
-        type: choice
-        options:
-          - lf
-          - swift
-      image:
-        description: 'npu lanes: container image (empty = repo default)'
-        required: false
-        default: 'swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:base-latest'
+        default: 'pytest-core-cpu-cpu-default-default'
         type: string
 
-# Same PR labelled twice (or re-labelled mid-run) must not stack runs.
 concurrency:
-  group: manual-${{ github.event.pull_request.number || github.run_id }}-${{ github.event.label.name || inputs.lane }}
+  group: ci-manual-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
   contents: read
-
-env:
-  E2E_CASES_DEFAULT: '[{"model_type":"qwen3_5","layers":0}]'
-  # Dirs with no optional deps and no known failures. Keep this list short: it
-  # answers "does the lane work", not "is the code correct".
-  SMOKE_CPU: 'tests/detector tests/registry tests/engine/test_freeze.py'
-  SMOKE_NPU: 'tests/ops/npu tests/ops/providers/npu'
+  pull-requests: read
+  actions: read
 
 jobs:
-  cpu_unit:
-    name: Ascend-Manual-CPU-Unit
-    if: >-
-      (github.event_name == 'pull_request' && github.event.label.name == 'ci:manual:cpu-unit')
-      || (github.event_name == 'workflow_dispatch' && inputs.lane == 'cpu-unit')
-    runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
-    timeout-minutes: 40
-
-    defaults:
-      run:
-        shell: bash
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: pip
-          cache-dependency-path: |
-            pyproject.toml
-            scripts/ci/envs.toml
-            scripts/ci/envs/*.txt
-
-      # plan.py reads envs.toml through facts.py, which needs PyYAML.
-      - name: install planner dependencies
-        run: python3 -m pip install --quiet --disable-pip-version-check -r requirements-lint.txt
-
-      - name: plan manual job
-        id: plan
-        env:
-          SCOPE: ${{ inputs.scope || 'smoke' }}
-          TEST_PATH: ${{ inputs.test_path }}
-          SMOKE: ${{ env.SMOKE_CPU }}
-          BASE_REF: ${{ github.event.pull_request.base.ref || 'main' }}
-        run: |
-          set -euo pipefail
-          git diff --name-only "origin/${BASE_REF}...HEAD" > /tmp/manual-changed.txt || \
-            { echo "::warning::cannot compute changed files"; : > /tmp/manual-changed.txt; }
-          python3 scripts/ci/manual_plan.py \
-            --lane cpu-unit --scope "$SCOPE" --test-path "$TEST_PATH" \
-            --smoke "$SMOKE" --plan /tmp/manual-plan.json \
-            --changed-files /tmp/manual-changed.txt \
-            --github-output "$GITHUB_OUTPUT"
-
-      - name: execute plan
-        env:
-          JOB_ID: ${{ steps.plan.outputs.job_id }}
-          RUNNER_LABEL: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
-          RESULT_JSON: ${{ runner.temp }}/ci-result.json
-          CI_JOB_LOG: ${{ runner.temp }}/turbo-ci.log
-          JUNIT_OUT: ${{ runner.temp }}/pytest.xml
-          VERSIONS_OUT: ${{ runner.temp }}/versions.txt
-          CI_VENV_ROOT: ${{ runner.temp }}/turbo-ci-venv
-        run: python3 scripts/ci/run_job.py --plan /tmp/manual-plan.json --job-id "$JOB_ID"
-
-      - name: summary
-        if: always()
-        env:
-          RESULT_JSON: ${{ runner.temp }}/ci-result.json
-        run: |
-          set -uo pipefail
-          python3 scripts/ci/report/report_result.py report --file "$RESULT_JSON" \
-            --train-log "${{ runner.temp }}/turbo-ci.log" \
-            --versions "${{ runner.temp }}/versions.txt" \
-            --junit "${{ runner.temp }}/pytest.xml" >> "$GITHUB_STEP_SUMMARY" || true
-          python3 scripts/ci/report/report_result.py notice --file "$RESULT_JSON" \
-            --model-type pytest-cpu-unit || true
-
-  npu_unit:
-    name: Ascend-Manual-NPU-Unit
-    if: |
-      ((github.event_name == 'pull_request' && github.event.label.name == 'ci:manual:npu-unit')
-       || (github.event_name == 'workflow_dispatch' && inputs.lane == 'npu-unit'))
-    runs-on: ${{ vars.CI_NPU_RUNNER || 'linux-aarch64-a3-800i-2' }}
-    timeout-minutes: 40
-
-    container:
-      image: ${{ inputs.image || vars.CI_NPU_IMAGE || 'swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:base-latest' }}
-      options: --user root
-
-    defaults:
-      run:
-        shell: bash
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: preflight
-        env:
-          RESULT_JSON: /tmp/ci-result.json
-        run: |
-          set -uo pipefail
-          python3 scripts/ci/report/report_result.py init --file "$RESULT_JSON" \
-            kind=pytest model_type=pytest-npu-unit mode=npu \
-            runner_label="${{ vars.CI_NPU_RUNNER || 'linux-aarch64-a3-800i-2' }}" \
-            image="${{ inputs.image || vars.CI_NPU_IMAGE || 'swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:base-latest' }}"
-          uname -m; nproc; free -h | head -2; python -V
-
-      # 20 s to find "no NPU" beats discovering it after installing deps.
-      - name: environment check
-        run: python3 scripts/ci/common/env_pod.py probe --file /tmp/torch-before.json
-
-      - name: plan manual job
-        id: plan
-        env:
-          SCOPE: ${{ inputs.scope || 'smoke' }}
-          TEST_PATH: ${{ inputs.test_path }}
-          SMOKE: ${{ env.SMOKE_NPU }}
-          BASE_REF: ${{ github.event.pull_request.base.ref || 'main' }}
-        run: |
-          set -euo pipefail
-          git diff --name-only "origin/${BASE_REF}...HEAD" > /tmp/manual-changed.txt || \
-            { echo "::warning::cannot compute changed files"; : > /tmp/manual-changed.txt; }
-          python3 scripts/ci/manual_plan.py \
-            --lane npu-unit --scope "$SCOPE" --test-path "$TEST_PATH" \
-            --smoke "$SMOKE" --plan /tmp/manual-plan.json \
-            --changed-files /tmp/manual-changed.txt \
-            --github-output "$GITHUB_OUTPUT"
-
-      - name: execute plan
-        env:
-          JOB_ID: ${{ steps.plan.outputs.job_id }}
-          RUNNER_LABEL: ${{ vars.CI_NPU_RUNNER || 'linux-aarch64-a3-800i-2' }}
-          IMAGE: ${{ inputs.image || vars.CI_NPU_IMAGE || 'swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:base-latest' }}
-          RESULT_JSON: /tmp/ci-result.json
-          CI_JOB_LOG: /tmp/turbo-ci.log
-          JUNIT_OUT: /tmp/pytest.xml
-          VERSIONS_OUT: /tmp/versions.txt
-          CI_VENV_ROOT: /tmp/turbo-ci-venv
-        run: python3 scripts/ci/run_job.py --plan /tmp/manual-plan.json --job-id "$JOB_ID"
-
-      - name: summary
-        if: always()
-        env:
-          RESULT_JSON: /tmp/ci-result.json
-        run: |
-          set -uo pipefail
-          python3 scripts/ci/report/report_result.py report --file "$RESULT_JSON" \
-            --train-log /tmp/turbo-ci.log --versions /tmp/versions.txt \
-            --junit /tmp/pytest.xml >> "$GITHUB_STEP_SUMMARY" || true
-          python3 scripts/ci/report/report_result.py notice --file "$RESULT_JSON" \
-            --model-type pytest-npu-unit || true
-
-      # timeout-minutes only kills the process; children would keep the cards.
-      - name: environment cleanup
-        if: always()
-        continue-on-error: true
-        run: python3 scripts/ci/common/env_pod.py cleanup
-
-  npu_e2e:
-    name: Ascend-Manual-NPU-E2E
-    if: |
-      ((github.event_name == 'pull_request' && github.event.label.name == 'ci:manual:npu-e2e')
-       || (github.event_name == 'workflow_dispatch' && inputs.lane == 'npu-e2e'))
-    runs-on: ${{ vars.CI_E2E_RUNNER || 'linux-aarch64-a3-800i-8' }}
-    timeout-minutes: 180
-
-    container:
-      image: ${{ inputs.image || vars.CI_NPU_IMAGE || 'swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:base-latest' }}
-      options: --user root
-
-    defaults:
-      run:
-        shell: bash
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: environment check
-        id: environment
-        run: python3 scripts/ci/common/env_pod.py probe --file /tmp/torch-before.json
-
-      - name: training orchestration
-        id: lane
-        timeout-minutes: 150
-        env:
-          E2E_CASES: ${{ inputs.cases || env.E2E_CASES_DEFAULT }}
-          # ci-pr always runs lf: the selector only offers models with an lf
-          # launcher. Manual runs may target a swift-only model (qwen4_exp).
-          FRAMEWORK: ${{ inputs.framework || 'lf' }}
-          RUNNER_LABEL: ${{ vars.CI_E2E_RUNNER || 'linux-aarch64-a3-800i-8' }}
-          IMAGE: ${{ inputs.image || vars.CI_NPU_IMAGE || 'swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:base-latest' }}
-          SEQ_LEN: '4096'
-          DATASET_IN: 'gsm8k'
-          FINETUNING_TYPE: 'full'
-          FETCH_TIMEOUT: '1800'
-          RESULT_JSON: /tmp/ci-result.json
-        run: bash scripts/ci/e2e_tests/run_train.sh lane
-
-      # timeout-minutes only kills the process; children would keep the cards.
-      - name: environment cleanup
-        if: always()
-        continue-on-error: true
-        run: python3 scripts/ci/common/env_pod.py cleanup
+  manual:
+    name: Ascend-Manual (${{ inputs.target_job }})
+    uses: ./.github/workflows/ascend-pr.yml
+    with:
+      mode: ${{ inputs.mode == 'full' && 'full' || 'pr' }}
+      target_job: ${{ inputs.target_job }}
+    secrets: inherit

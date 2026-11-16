@@ -11,7 +11,7 @@ run-name: Ascend-PR-CI ${{ github.event.pull_request.number && format('#{0}', gi
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_call:
     inputs:
       mode:
@@ -39,7 +39,7 @@ on:
         type: string
 
 concurrency:
-  group: ci-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || format('full-{0}', github.run_id) }}${{ startsWith(github.event.label.name || '', 'ci:manual:') && '-manual-label' || '' }}
+  group: ci-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || format('full-{0}', github.run_id) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -55,7 +55,6 @@ env:
 jobs:
   plan:
     name: Ascend-PR-Plan
-    if: ${{ !startsWith(github.event.label.name || '', 'ci:manual:') }}
     runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
     timeout-minutes: 20
     outputs:
@@ -309,7 +308,7 @@ jobs:
   gate:
     name: Ascend-PR-Gate
     needs: [plan, cpu, npu]
-    if: ${{ always() && !startsWith(github.event.label.name || '', 'ci:manual:') }}
+    if: ${{ always() }}
     runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
     timeout-minutes: 10
     steps:
