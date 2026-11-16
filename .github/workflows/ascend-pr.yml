@@ -121,9 +121,15 @@ jobs:
               --fail-message "image resolution failed"
             exit 1
           fi
-          python3 scripts/ci/planner.py "${COMMON[@]}" \
+          MATRIX_OUTPUT="$RUNNER_TEMP/matrix-output"
+          if ! python3 scripts/ci/planner.py "${COMMON[@]}" \
             --image-ref "npu-default=$IMAGE_REF" \
-            --github-output "$GITHUB_OUTPUT"
+            --github-output "$MATRIX_OUTPUT"; then
+            exit 1
+          fi
+          echo "Planner matrix outputs:"
+          cat "$MATRIX_OUTPUT"
+          cat "$MATRIX_OUTPUT" >> "$GITHUB_OUTPUT"
 
       - name: upload plan
         if: always()
