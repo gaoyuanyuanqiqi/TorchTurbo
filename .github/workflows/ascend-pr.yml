@@ -49,10 +49,10 @@ jobs:
     runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
     timeout-minutes: 20
     outputs:
-      cpu_jobs: ${{ steps.plan.outputs.cpu_jobs || '[]' }}
-      cpu_job_count: ${{ steps.plan.outputs.cpu_job_count || '0' }}
-      npu_jobs: ${{ steps.plan.outputs.npu_jobs || '[]' }}
-      npu_job_count: ${{ steps.plan.outputs.npu_job_count || '0' }}
+      cpu_jobs: ${{ steps.publish.outputs.cpu_jobs || '[]' }}
+      cpu_job_count: ${{ steps.publish.outputs.cpu_job_count || '0' }}
+      npu_jobs: ${{ steps.publish.outputs.npu_jobs || '[]' }}
+      npu_job_count: ${{ steps.publish.outputs.npu_job_count || '0' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -90,7 +90,7 @@ jobs:
       # Always publish a PlanArtifact, including lint/image failures. Gate is a
       # consumer of contracts, not of shell exit codes.
       - name: plan
-        id: plan
+        id: publish
         if: always()
         env:
           LINT_OUTCOME: ${{ steps.lint.outcome }}
