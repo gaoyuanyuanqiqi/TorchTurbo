@@ -48,14 +48,26 @@ resources:
       device: npu
       image: npu-default
       capacity_slots: 2
-      runner_variable: CI_NPU_RUNNER
+      runner_variable: CI_NPU_2_RUNNER
       runner: linux-aarch64-a3-800i-2
+    npu/default-4:
+      device: npu
+      image: npu-default
+      capacity_slots: 4
+      runner_variable: CI_NPU_4_RUNNER
+      runner: linux-aarch64-a3-800i-4
     npu/default-8:
       device: npu
       image: npu-default
       capacity_slots: 8
-      runner_variable: CI_E2E_RUNNER
+      runner_variable: CI_NPU_8_RUNNER
       runner: linux-aarch64-a3-800i-8
+    npu/default-16:
+      device: npu
+      image: npu-default
+      capacity_slots: 16
+      runner_variable: CI_NPU_16_RUNNER
+      runner: linux-aarch64-a3-800i-16
 
 workloads:
   pytest:

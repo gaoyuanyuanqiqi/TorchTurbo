@@ -41,6 +41,22 @@ def test_catalog_routes_resolve_to_images_and_lanes(catalog: Catalog) -> None:
             assert lane.image_name == image.name
 
 
+@pytest.mark.parametrize(
+    ("ranks", "lane_name"),
+    (
+        (1, "npu/default-2"),
+        (2, "npu/default-2"),
+        (4, "npu/default-4"),
+        (8, "npu/default-8"),
+        (16, "npu/default-16"),
+    ),
+)
+def test_npu_lane_picks_smallest_sufficient_capacity(
+    catalog: Catalog, ranks: int, lane_name: str
+) -> None:
+    assert catalog.lane_for("npu", "npu-default", ranks).name == lane_name
+
+
 def test_catalog_model_venv_distribution(catalog: Catalog) -> None:
     model_venvs = Counter(
         entry.venv_name for entry in catalog.tests if entry.suite == "model"
