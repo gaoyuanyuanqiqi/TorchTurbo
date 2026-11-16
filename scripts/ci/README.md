@@ -135,7 +135,7 @@ model_map.json      迁移期：manual workflow 与旧执行器读取
 pytest.ini          测试根 / 导入路径 / marker 契约（与 select_tests.py 交叉校验）
 ```
 
-`plan / cpu / npu / npu_fork_skip / gate` 五个 job **内联**在 `ascend-pr.yml`。
+`plan / cpu / npu / gate` 四个 job **内联**在 `ascend-pr.yml`。
 `cpu` 与 `npu` 各自按 Plan 的 matrix 展开；NPU pytest 与模型 E2E 使用同一套
 Executor，不再复制 job wiring。`ascend-nightly.yml` 只调用这个入口，不复制 job。
 

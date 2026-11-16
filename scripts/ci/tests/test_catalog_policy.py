@@ -65,7 +65,7 @@ def test_pull_request_policy_is_fixed_scope(pr_policy) -> None:
         "qwen3_5-lf-text-sft",
         "bailing_hybrid-lf-flash-sft",
     )
-    assert pr_policy.allow_skip == {"npu": ("fork-pr-no-secrets",)}
+    assert pr_policy.allow_skip == {}
 
 
 def test_nightly_policy_selects_all(nightly_policy) -> None:

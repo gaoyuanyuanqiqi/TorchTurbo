@@ -360,23 +360,15 @@ PR / 全量的 `select` 用 `--repo "$GITHUB_REPOSITORY"` 读最近一份。解�
 里：yaml 只把标签拼成字符串传过去。这样 `--verify` 能把每种组合钉死，
 而「加一个标签」只需要改一处，不会出现 yaml 和文档两套说法。
 
-## fork PR 的 NPU 泳道不自动跑
+## fork PR 与同仓 PR 走同一套 NPU 泳道
 
-fork PR 拿不到 secrets，而两条 NPU 泳道都需要 SWR 凭据。更关键的是：
-**把 secrets 递到 fork 的代码上等于 RCE**，`pull_request_target` 就是这么出事的，
-本仓库明确不用。
+NPU 镜像发布在公开 SWR，匿名 `pull` 不需要 SWR 凭据，因此 `pull_request`
+不向 workflow 注入 secrets。fork PR 和同仓 PR 都由同一套 Planner / Executor /
+Gate 执行，不按 `head.repo.full_name` 区分执行路径。
 
-所以 fork PR 的 NPU 泳道被跳过，并在 Summary 里写 `⏭ 跳过 | fork PR（secrets 不递）`。
-需要跑的话，由 maintainer 把 commit 推进本仓分支：
-
-```bash
-git fetch origin pull/123/head:ci/pr-123
-git push origin ci/pr-123
-gh workflow run ascend-pr.yml -F ref=ci/pr-123
-```
-
-或者直接 dispatch `ascend-pr.yml`：`mode=pr` + `force_all` 跑全部单测，
-`mode=full` 连 E2E 一起跑。
+仍然不允许把 secrets 递给 fork 的代码：`pull_request_target` 不在本仓库使用。
+允许 fork 代码进入自托管 NPU runner 的前提是 runner 临时化、无长期凭据、缓存
+隔离和网络访问受控。
 
 ## 时间预算
 
@@ -448,7 +440,7 @@ timeout-minutes: ${{ fromJSON(inputs.timeout_minutes || 60) }}
 
 | 名称 | 类型 | 必需 | 用途 |
 |---|---|:--:|---|
-| `SWR_USERNAME` / `SWR_PASSWORD` | secret | ✅ | 拉私有基础镜像；image CI 推送 |
+| `SWR_USERNAME` / `SWR_PASSWORD` | secret | ✅ | image CI 推送；PR 拉公开镜像不需要 |
 | `BASE_IMAGE_TAG` | variable | 可选 | **人工覆盖**镜像引用，平时不用设（不设就用固定链接） |
 | `CI_CPU_RUNNER` | variable | 可选 | 默认 `ubuntu-22.04-arm` |
 | `CI_NPU_RUNNER` | variable | 可选 | 默认 `linux-aarch64-a3-800i-2` |

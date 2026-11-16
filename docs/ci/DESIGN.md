@@ -371,8 +371,9 @@ plan 阶段 fail：
 5. 模型获取超时；
 6. skip 原因不在 lane 白名单。
 
-gate 只读每个 device job 的结果，不再分别判断 NPU unit 和 E2E。fork PR 的
-NPU job 不执行是设计内跳过；`ci:e2e:strict` 仍由统一 NPU job 的 skip reason 判定。
+gate 只读每个 device job 的结果，不再分别判断 NPU unit 和 E2E。fork PR 与同仓
+PR 都执行同一套 NPU job；没有 fork-only 的设计内跳过。`ci:e2e:strict` 仍由统一
+NPU job 的 skip reason 判定。
 
 ---
 

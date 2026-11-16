@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,7 @@ import executor
 from contracts import (
     ModelE2ESpec,
     PytestSpec,
+    build_plan,
     load_job_result,
     write_json,
 )
@@ -45,6 +47,20 @@ def _write_junit(path: Path) -> None:
     path.write_text(
         '<testsuite tests="2" failures="0" errors="0" skipped="1"></testsuite>\n',
         encoding="utf-8",
+    )
+
+
+def _plan_with_allowed_skip(plan, job_id: str, reason: str):
+    jobs = tuple(
+        replace(job, allowed_skip_reasons=(reason,)) if job.id == job_id else job
+        for job in plan.jobs
+    )
+    return build_plan(
+        policy=plan.policy,
+        source=plan.source,
+        inputs=plan.inputs,
+        coverage=plan.coverage,
+        jobs=jobs,
     )
 
 
@@ -170,19 +186,20 @@ def test_record_skip_enforces_allowed_reason(tmp_path: Path, pr_plan) -> None:
         item for item in pr_plan.jobs
         if item.kind == "pytest" and item.runtime.device == "npu"
     )
+    plan = _plan_with_allowed_skip(pr_plan, npu.id, "maintenance")
     result = executor.record_skip(
-        pr_plan,
+        plan,
         npu.id,
-        "fork-pr-no-secrets",
+        "maintenance",
         output_dir=tmp_path / "skip",
     )
     assert result.status == "skipped"
-    assert result.skip_reason == "fork-pr-no-secrets"
+    assert result.skip_reason == "maintenance"
     assert result.steps == ()
 
     with pytest.raises(executor.ExecutorError, match="does not allow"):
         executor.record_skip(
-            pr_plan,
+            plan,
             npu.id,
             "free-form-reason",
             output_dir=tmp_path / "skip",
@@ -275,24 +292,25 @@ def test_cli_record_skip_writes_result_file(tmp_path: Path, pr_plan) -> None:
     plan_path = tmp_path / "plan.json"
     output_path = tmp_path / "artifacts" / "job-result.json"
     summary_path = tmp_path / "summary.md"
-    write_json(plan_path, pr_plan.to_dict())
     job = next(
         item for item in pr_plan.jobs
         if item.runtime.device == "npu" and item.kind == "pytest"
     )
+    plan = _plan_with_allowed_skip(pr_plan, job.id, "maintenance")
+    write_json(plan_path, plan.to_dict())
 
     assert executor.main([
         "--plan", str(plan_path),
         "--job-id", job.id,
-        "--record-skip", "fork-pr-no-secrets",
-        "--skip-message", "fork PR has no registry secrets",
+        "--record-skip", "maintenance",
+        "--skip-message", "NPU maintenance window",
         "--output", str(output_path),
         "--summary", str(summary_path),
     ]) == 0
 
     result = load_job_result(output_path)
     assert result.status == "skipped"
-    assert result.skip_reason == "fork-pr-no-secrets"
-    assert result.skip_message == "fork PR has no registry secrets"
+    assert result.skip_reason == "maintenance"
+    assert result.skip_message == "NPU maintenance window"
     assert (output_path.parent / "job-result.json").is_file()
     assert "## CI Job: skipped" in summary_path.read_text(encoding="utf-8")

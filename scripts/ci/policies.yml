@@ -11,9 +11,6 @@ policies:
       cases:
         - qwen3_5-lf-text-sft
         - bailing_hybrid-lf-flash-sft
-    allow_skip:
-      npu:
-        - fork-pr-no-secrets
 
   nightly:
     pytest:

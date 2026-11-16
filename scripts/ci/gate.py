@@ -206,8 +206,6 @@ def _result_failures(plan: Plan, job: Job, result: JobResult) -> list[dict[str, 
             failures.append(_failure("skip-reason", "skipped result has no reason", job_id=job.id))
         elif result.skip_reason not in job.allowed_skip_reasons:
             failures.append(_failure("skip-reason", "skip reason is not allowed by Plan", job_id=job.id))
-        if result.skip_reason == "fork-pr-no-secrets" and job.runtime.device != "npu":
-            failures.append(_failure("skip-device", "fork-pr-no-secrets is only valid for NPU", job_id=job.id))
         if result.steps:
             failures.append(_failure("skip-steps", "skipped result contains step results", job_id=job.id))
     elif result.status == "failed":

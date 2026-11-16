@@ -219,9 +219,7 @@ jobs:
     needs: plan
     if: |
       always() && needs.plan.result == 'success' &&
-      needs.plan.outputs.npu_job_count != '0' &&
-      (github.event_name != 'pull_request' ||
-       github.event.pull_request.head.repo.full_name == github.repository)
+      needs.plan.outputs.npu_job_count != '0'
     strategy:
       fail-fast: false
       max-parallel: 2
@@ -231,9 +229,6 @@ jobs:
     timeout-minutes: ${{ matrix.timeout_minutes }}
     container:
       image: ${{ matrix.image_ref }}
-      credentials:
-        username: ${{ secrets.SWR_USERNAME }}
-        password: ${{ secrets.SWR_PASSWORD }}
       options: --user root
     defaults:
       run:
@@ -275,64 +270,9 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-  # Fork PRs cannot receive SWR secrets. Emit the same typed JobResults as a
-  # normal run so Gate can distinguish an allowed platform skip from a lost job.
-  npu_fork_skip:
-    name: Ascend-PR-NPU-Skip (${{ matrix.job_id }})
-    needs: plan
-    if: |
-      always() && needs.plan.result == 'success' &&
-      needs.plan.outputs.npu_job_count != '0' &&
-      github.event_name == 'pull_request' &&
-      github.event.pull_request.head.repo.full_name != github.repository
-    strategy:
-      fail-fast: false
-      matrix:
-        include: ${{ fromJSON(needs.plan.outputs.npu_jobs) }}
-    runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
-    timeout-minutes: 10
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: ci-plan
-          path: ${{ runner.temp }}/ci-plan
-
-      - name: record skip
-        run: |
-          python3 scripts/ci/executor.py \
-            --plan "$RUNNER_TEMP/ci-plan/plan.json" \
-            --job-id "${{ matrix.job_id }}" \
-            --record-skip fork-pr-no-secrets \
-            --skip-message "fork PR has no SWR secrets" \
-            --output "$RUNNER_TEMP/ci-result/job-result.json" \
-            --summary "$GITHUB_STEP_SUMMARY"
-
-      - name: verify result
-        if: always()
-        run: |
-          result="$RUNNER_TEMP/ci-result/job-result.json"
-          if [ ! -s "$result" ]; then
-            echo "::error::executor exited without writing $result"
-            exit 1
-          fi
-
-      - name: upload result
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ci-result-${{ matrix.job_id }}
-          path: ${{ runner.temp }}/ci-result
-          if-no-files-found: warn
-          retention-days: 7
-
   gate:
     name: Ascend-PR-Gate
-    needs: [plan, cpu, npu, npu_fork_skip]
+    needs: [plan, cpu, npu]
     if: ${{ always() && !startsWith(github.event.label.name || '', 'ci:manual:') }}
     runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
     timeout-minutes: 10

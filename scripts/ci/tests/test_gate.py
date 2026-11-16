@@ -8,6 +8,7 @@ from contracts import (
     ModelE2EEvidence,
     PytestEvidence,
     StepResult,
+    build_plan,
     build_plan_artifact,
     digest,
     read_json,
@@ -59,6 +60,20 @@ def _result_for(plan, job, status: str = "passed") -> JobResult:
 
 def _results(plan) -> list[JobResult]:
     return [_result_for(plan, job) for job in plan.jobs]
+
+
+def _plan_with_allowed_skip(plan, job_id: str, reason: str):
+    jobs = tuple(
+        replace(job, allowed_skip_reasons=(reason,)) if job.id == job_id else job
+        for job in plan.jobs
+    )
+    return build_plan(
+        policy=plan.policy,
+        source=plan.source,
+        inputs=plan.inputs,
+        coverage=plan.coverage,
+        jobs=jobs,
+    )
 
 
 def test_all_jobs_pass(pr_plan) -> None:
@@ -128,7 +143,28 @@ def test_runtime_mismatch_fails(pr_plan) -> None:
     assert "result-runtime" in {failure["code"] for failure in decision.failures}
 
 
-def test_allowed_fork_skip_passes(pr_plan) -> None:
+def test_allowed_skip_passes(pr_plan) -> None:
+    index = next(
+        i for i, result in enumerate(_results(pr_plan))
+        if result.runtime.device == "npu" and result.kind == "pytest"
+    )
+    job = pr_plan.jobs[index]
+    plan = _plan_with_allowed_skip(pr_plan, job.id, "maintenance")
+    results = _results(plan)
+    results[index] = replace(
+        results[index],
+        status="skipped",
+        steps=(),
+        failure=None,
+        skip_reason="maintenance",
+        skip_message="NPU maintenance window",
+    )
+    decision = decide(plan, results)
+    assert decision.status == "passed"
+    assert decision.summary["skipped"] == 1
+
+
+def test_skip_reason_outside_allowlist_fails(pr_plan) -> None:
     results = _results(pr_plan)
     index = next(
         i for i, result in enumerate(results)
@@ -139,27 +175,8 @@ def test_allowed_fork_skip_passes(pr_plan) -> None:
         status="skipped",
         steps=(),
         failure=None,
-        skip_reason="fork-pr-no-secrets",
-        skip_message="fork PR has no SWR secrets",
-    )
-    decision = decide(pr_plan, results)
-    assert decision.status == "passed"
-    assert decision.summary["skipped"] == 1
-
-
-def test_skip_reason_outside_allowlist_fails(pr_plan) -> None:
-    results = _results(pr_plan)
-    index = next(
-        i for i, result in enumerate(results)
-        if result.runtime.device == "cpu" and result.kind == "pytest"
-    )
-    results[index] = replace(
-        results[index],
-        status="skipped",
-        steps=(),
-        failure=None,
-        skip_reason="fork-pr-no-secrets",
-        skip_message="not allowed for cpu",
+        skip_reason="maintenance",
+        skip_message="not allowed for npu",
     )
     decision = decide(pr_plan, results)
     assert decision.status == "failed"

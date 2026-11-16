@@ -599,8 +599,6 @@ def record_skip(
     job = _job(plan, job_id)
     if reason not in job.allowed_skip_reasons:
         raise ExecutorError(f"job {job.id!r} does not allow skip reason {reason!r}")
-    if reason == "fork-pr-no-secrets" and job.runtime.device != "npu":
-        raise ExecutorError("fork-pr-no-secrets is only valid for NPU jobs")
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = _now()
     result = JobResult(

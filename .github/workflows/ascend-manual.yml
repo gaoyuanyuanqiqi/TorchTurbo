@@ -165,20 +165,14 @@ jobs:
 
   npu_unit:
     name: Ascend-Manual-NPU-Unit
-    # Fork PRs get no secrets, and a container pull without them fails opaquely.
     if: |
       ((github.event_name == 'pull_request' && github.event.label.name == 'ci:manual:npu-unit')
        || (github.event_name == 'workflow_dispatch' && inputs.lane == 'npu-unit'))
-      && (github.event_name != 'pull_request'
-          || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ${{ vars.CI_NPU_RUNNER || 'linux-aarch64-a3-800i-2' }}
     timeout-minutes: 40
 
     container:
       image: ${{ inputs.image || vars.CI_NPU_IMAGE || 'swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:base-latest' }}
-      credentials:
-        username: ${{ secrets.SWR_USERNAME }}
-        password: ${{ secrets.SWR_PASSWORD }}
       options: --user root
 
     defaults:
@@ -257,16 +251,11 @@ jobs:
     if: |
       ((github.event_name == 'pull_request' && github.event.label.name == 'ci:manual:npu-e2e')
        || (github.event_name == 'workflow_dispatch' && inputs.lane == 'npu-e2e'))
-      && (github.event_name != 'pull_request'
-          || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ${{ vars.CI_E2E_RUNNER || 'linux-aarch64-a3-800i-8' }}
     timeout-minutes: 180
 
     container:
       image: ${{ inputs.image || vars.CI_NPU_IMAGE || 'swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:base-latest' }}
-      credentials:
-        username: ${{ secrets.SWR_USERNAME }}
-        password: ${{ secrets.SWR_PASSWORD }}
       options: --user root
 
     defaults:
