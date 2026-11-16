@@ -666,7 +666,7 @@ def main(argv: list[str]) -> int:
                 key,
                 json.dumps(value, ensure_ascii=False, separators=(",", ":")),
             )
-            _write_github_output(output_path, f"{key}_count", str(len(value)))
+            _write_github_output(output_path, f"{key[:-1]}_count", str(len(value)))
     if not args.output:
         print(canonical_json(artifact.plan.to_dict()))
     return 0

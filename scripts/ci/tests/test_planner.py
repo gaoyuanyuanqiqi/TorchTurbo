@@ -113,6 +113,29 @@ def test_matrix_adapter_only_exposes_platform_fields(
             assert "job_json" not in entry
 
 
+def test_cli_matrix_outputs_match_workflow_contract(
+    tmp_path: Path, repo_root: Path
+) -> None:
+    plan_path = tmp_path / "plan.json"
+    output_path = tmp_path / "github-output"
+    assert main([
+        "--root", str(repo_root),
+        "--policy", "pull_request",
+        "--output", str(plan_path),
+        "--github-output", str(output_path),
+    ]) == 0
+
+    keys = {
+        line.partition("=")[0]
+        for line in output_path.read_text(encoding="utf-8").splitlines()
+    }
+    assert {
+        "cpu_jobs", "cpu_job_count",
+        "npu_jobs", "npu_job_count",
+        "gpu_jobs", "gpu_job_count",
+    } <= keys
+
+
 def test_planner_failure_artifact_round_trip(
     tmp_path: Path, catalog: Catalog, source
 ) -> None:
