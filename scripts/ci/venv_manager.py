@@ -57,7 +57,7 @@ class VenvManager:
         self.device = device
         self.log_path = log_path
         if specs is None:
-            from facts import load_catalog
+            from catalog import load as load_catalog
 
             specs = load_catalog(root).envs
         self.specs = dict(specs)

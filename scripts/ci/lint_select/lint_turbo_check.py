@@ -159,14 +159,16 @@ def _check_planner_v2(rel: str, jobs: dict, dumped: str) -> list[Problem]:
     return problems
 
 
-def check_model_map() -> list[Problem]:
-    """Validate model, env, lane, and E2E case facts together."""
+def check_catalog() -> list[Problem]:
+    """Validate catalog.yml and all facts derived from the repository."""
     sys.path.insert(0, str(CI))
-    from facts import load_catalog
+    from catalog import CatalogError, load
 
-    catalog = load_catalog(ROOT)
-    return [Problem(message.split(":", 1)[0], message.split(":", 1)[-1].strip())
-            for message in catalog.errors]
+    try:
+        load(ROOT)
+    except CatalogError as exc:
+        return [Problem(issue.path, issue.message) for issue in exc.issues]
+    return []
 
 
 def _test_marker_names() -> set[str]:
@@ -206,7 +208,7 @@ def check_markers() -> list[Problem]:
             configured.add(line.split(":", 1)[0].strip())
 
     sys.path.insert(0, str(CI))
-    from facts import REQUIRED_MARKERS
+    from test_scan import REQUIRED_MARKERS
 
     markers = _test_marker_names()
     for name in sorted(markers - configured):
@@ -218,6 +220,6 @@ def check_markers() -> list[Problem]:
 
 CHECKS = (
     Check("contract", "planner/lint/lane topology and output contracts", check_contract),
-    Check("model_map", "model, env, lane, and E2E case facts", check_model_map),
+    Check("catalog", "catalog, test facts, and E2E case contract", check_catalog),
     Check("markers", "registered pytest marker contract", check_markers),
 )

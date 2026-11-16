@@ -11,7 +11,7 @@ from typing import Any, Iterable
 
 import yaml
 
-import facts as legacy_facts
+import test_scan
 from contracts import (
     DEVICES,
     SCHEMA_VERSION,
@@ -24,7 +24,7 @@ from contracts import (
     write_json,
 )
 
-MODEL_PACKAGES = frozenset({"base", "modules", "registry", "weight_converter"})
+MODEL_PACKAGES = test_scan.MODEL_PACKAGES
 FRAMEWORKS = ("lf", "swift")
 
 
@@ -712,56 +712,10 @@ def resolve_venv(path: str, families: Iterable[str], frameworks: Iterable[str],
 
 
 def _scan_tests(root: Path, registered: set[str], venvs: dict[str, VenvSpec],
-                lanes: dict[str, CatalogLane], workload: PytestWorkload,
-                model_models: dict[str, dict[str, Any]],
+                workload: PytestWorkload,
                 issue_list: list[Issue]) -> tuple[TestEntry, ...]:
-    legacy_envs = {
-        name: legacy_facts.EnvSpec(
-            name=name,
-            python=spec.python,
-            requirements=spec.requirements[0] if spec.requirements else "",
-            overrides=spec.overrides,
-            extends=spec.extends or "",
-            constraints=spec.constraints,
-        )
-        for name, spec in venvs.items()
-    }
-    legacy_lanes = {
-        name: legacy_facts.LaneSpec(
-            image=lane.image_name,
-            device=lane.device,
-            resource=lane.device,
-            slots=lane.capacity_slots,
-            runner_variable=lane.runner_variable,
-            runner=lane.runner,
-        )
-        for name, lane in lanes.items()
-    }
-    legacy_lanes["__auto__"] = legacy_facts.LaneSpec(
-        image="default",
-        device="cpu",
-        resource="auto",
-        slots=1,
-        runner_variable="",
-        runner="auto",
-    )
-    model_envs = {
-        family: legacy_facts.ModelEnv(env=venv, image="default")
-        for family, venv in workload.model_venvs.items()
-    }
-    legacy_catalog = legacy_facts.CiCatalog(
-        root=root,
-        envs=legacy_envs,
-        lanes=legacy_lanes,
-        models=model_models,
-        cases=(),
-        model_envs=model_envs,
-        test_envs={path: override.venv for path, override in workload.overrides.items()},
-        e2e_defaults={},
-    )
-    scanned, errors = legacy_facts.scan_tests(legacy_catalog)
+    scanned, errors = test_scan.scan_tests(root, registered)
     issue_list.extend(_issue(error.path, error.message) for error in errors)
-    issue_list.extend(_issue("catalog", message) for message in legacy_catalog.errors)
 
     entries: list[TestEntry] = []
     for path, fact in sorted(scanned.items()):
@@ -825,19 +779,10 @@ def load(root: Path, *, image_refs: dict[str, str] | None = None) -> Catalog:
         model_row.get("models"), root, defaults, venvs, images, issues
     )
 
-    registered = legacy_facts.registered_models(root)
+    registered = test_scan.registered_models(root)
     for model in sorted({case.model for case in cases} - registered):
         issues.append(_issue("workloads.model_e2e.models", f"model {model!r} is not registered"))
-    model_models = {
-        name: {
-            "run_dir": next(
-                (case.run_dir for case in cases if case.model == name),
-                "-",
-            )
-        }
-        for name in sorted(registered)
-    }
-    tests = _scan_tests(root, registered, venvs, lanes, pytest_workload, model_models, issues)
+    tests = _scan_tests(root, registered, venvs, pytest_workload, issues)
     for entry in tests:
         if not entry.devices:
             issues.append(_issue(entry.path, "test has no device"))

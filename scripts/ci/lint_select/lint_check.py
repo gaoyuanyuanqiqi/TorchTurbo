@@ -3,7 +3,7 @@
 
 The generic stage is delegated to Ruff, shellcheck, actionlint, and hadolint.
 The custom stage only contains rules that need repository context: job graph
-wiring, test selection, model mapping, and pytest markers.
+wiring, catalog facts, and pytest markers.
 
 Usage:
     lint_check.py                  run every check
@@ -27,19 +27,15 @@ from lint_common_check import Check, Problem
 
 CHECKS = lint_common_check.CHECKS + lint_turbo_check.CHECKS
 CHECK_BY_NAME = {check.name: check for check in CHECKS}
-ALIASES = {
-    "map": "model_map",
-}
 
 
 def _selected(names: list[str]) -> list[Check]:
     if not names:
         return list(CHECKS)
-    resolved = [ALIASES.get(name, name) for name in names]
-    unknown = [name for name in resolved if name not in CHECK_BY_NAME]
+    unknown = [name for name in names if name not in CHECK_BY_NAME]
     if unknown:
         raise ValueError(f"unknown check(s): {', '.join(unknown)}")
-    return [CHECK_BY_NAME[name] for name in resolved]
+    return [CHECK_BY_NAME[name] for name in names]
 
 
 def _summary(rows: list[tuple[str, str, int]]) -> str:
@@ -91,7 +87,7 @@ def run(checks: Iterable[Check], summary_path: str | None) -> int:
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Run TorchTurbo static checks")
     parser.add_argument("--only", action="append", default=[], metavar="NAME",
-                        help="run one check (repeatable); accepts the legacy 'map' alias")
+                        help="run one check (repeatable)")
     parser.add_argument("--list", action="store_true", help="list check names and exit")
     parser.add_argument("--summary", default=None,
                         help="write a Markdown summary to this file")

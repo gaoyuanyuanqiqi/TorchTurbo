@@ -8,7 +8,6 @@
 ```text
 scripts/ci/
   lint_select/   lint 阶段
-  unit_tests/    本机单测回退 runner
   e2e_tests/     NPU 模型用例：取模型、并行策略、训练监督
   image/         基础镜像构建
   common/        pod 环境
@@ -18,6 +17,7 @@ scripts/ci/
   policies.yml   pull_request / nightly 的运行范围
   contracts.py   Plan / JobResult / Decision 的可序列化契约
   catalog.py     Catalog loader 与 test/E2E facts 扫描
+  test_scan.py   pytest AST 事实扫描（marker / device / rank / env family）
   policy.py      Policy loader 与跨 Catalog 校验
   change_scope.py  文档/文本变更分类
   planner.py     Catalog + Policy -> PlanArtifact
@@ -38,10 +38,8 @@ nightly 跑所有 pytest suite 和所有 E2E case。
 Plan/Gate 这两个轻量步骤，让必过检查仍然能给出明确结论。分类失败或无法读取
 diff 时按代码变更处理。
 
-`unit_tests/run_tests.sh` 只保留给本机回退。
-
 通用规则交给 Ruff（Python）、`shellcheck`、`actionlint` 和 `hadolint`；自定义
-检查只保留通用工具看不到的仓库契约：job 依赖图、模型映射和 pytest marker。
+检查只保留通用工具看不到的仓库契约：job 依赖图、Catalog 事实和 pytest marker。
 
 **按阶段划分，一个入口回答一个阶段的问题**：
 
@@ -52,13 +50,12 @@ diff 时按代码变更处理。
 | `gate.py` | Plan 与 JobResult 是否完整且一致？ | `--plan` / `--results` / `--summary` |
 | `lint_select/lint_check.py` | 静态体检总入口；通用检查先跑，Turbo 契约后跑 | 无参数 = 全跑 / `--only NAME` |
 | `venv_manager.py` | env 依赖装在哪、何时复用？ | 被 `executor.py` 调用 |
-| `unit_tests/run_tests.sh` | 本机回退泳道怎么跑？ | `install` / `test`（`MODE=cpu\|npu`） |
-| `e2e_tests/prepare_model.py` | 模型和派生配置是否完成预处理？ | `plan` / `fetch` / `probe` / `cases` |
-| `e2e_tests/run_train.sh` | 一次训练冒烟分几步？ | `resolve` / `install` / `run` / `report` / `lane` |
+| `e2e_tests/prepare_model.py` | 模型是否完整、能否取到减层权重？ | `fetch` / `probe` |
+| `e2e_tests/run_train.sh` | 一个已解析的模型 Job 怎么执行？ | `case`（内部 `run`） |
 | `common/env_pod.py` | 这台 pod 现在是什么状态？ | `probe` / `check` / `cleanup` |
 | `image/build_image.py` | 基础镜像该不该建 / 怎么建 / 发什么引用 / SWR 上传链路是否可用 | `env` / `tag` / `build` / `verify` / `selftest` / `publish` / `resolve` / `hadolint` / `summary` / `cleanup` |
 | `report/report_gate.py` | 本轮 CI 排队和执行了多久？ | `timing` |
-| `report/report_result.py` | 事实 → 人看的摘要 | `init` / `set` / `phase` / `report` / `notice` / `junit` / `migrate-map` |
+| `report/report_result.py` | 模型 E2E 事实 → 人看的摘要 | `init` / `set` / `phase` / `report` / `notice` |
 
 ### lint：通用工具先行，Turbo 契约后置
 
@@ -67,7 +64,7 @@ diff 时按代码变更处理。
 入口。检查之间不 import 本仓代码，只有少数跨文件契约会主动调用脚本。
 
 `lint_check.py` 只负责 CLI 和汇总；`lint_common_check.py` 依次跑 Ruff、shellcheck、
-actionlint、hadolint；`lint_turbo_check.py` 再跑 `contract`、`model_map`、`markers`。
+actionlint、hadolint；`lint_turbo_check.py` 再跑 `contract`、`catalog`、`markers`。
 通用规则不在这里重新实现。
 
 `CHECKS` 是 `Check(name, description, function)` 的元组。加一个 Turbo 检查 = 写函数 +
@@ -83,8 +80,7 @@ def check_tabs() -> list[Problem]:
 Check("tabs", "indentation uses spaces", check_tabs)
 ```
 
-`--list` 和 `--only` 都从 `CHECKS` 读；`--only` 可重复，`map` 是 `model_map`
-的兼容别名（训练侧仍会调用 `--only map`）。
+`--list` 和 `--only` 都从 `CHECKS` 读；`--only` 可重复。
 
 ```bash
 python3 scripts/ci/lint_select/lint_check.py --only ruff
@@ -111,8 +107,8 @@ python3 -m pytest scripts/ci/tests -q
 ```
 
 模型 job 分为 `environment check -> training orchestration -> environment cleanup`。
-训练编排内部按模型训练用例执行 `resolve -> install -> preprocess -> train -> report`；
-`lane` 是训练编排入口，不是独立阶段。
+训练编排只消费 Planner 已解析的单个 `ModelE2ESpec`，依次执行
+`install -> prepare -> train -> report`；资源 lane、镜像和并行参数都来自 Plan。
 
 被下面这些 workflow 调用，`.github/workflows` 里的入口只负责声明输入：
 
@@ -126,7 +122,6 @@ ascend-image.yml    构建基础镜像（**只手动 dispatch**）
 ascend-nightly.yml  全量 nightly 入口（schedule 暂注释，只支持手动 dispatch）
 catalog.yml         images / venvs / lanes / pytest / E2E 的静态事实
 policies.yml        pull_request / nightly 的选择范围
-model_map.json      训练脚本兼容映射；Catalog 校验仍会读取
 pytest.ini          测试根 / 导入路径 / marker 契约
 ```
 
@@ -144,10 +139,9 @@ yaml 里只留「输什么、调哪个脚本」，超过 10 行的 bash 一律�
 | 合并 | 原来的问题 |
 |---|---|
 | `model_cache.sh` + `hf_fetch.py` + `flash_trim.py` → `prepare_model.py fetch` | 三个都在回答「模型能不能用」，拆开后 probe 与 fetch 对「什么算完整」各写一遍 |
-| `plan_parallel.py` → `prepare_model.py plan` | 卡数与 sp/ep 由 `model_map.json` 声明，不再从 runner 标签或 yaml 推断 |
+| `plan_parallel.py` → Plan runtime | 卡数与 sp/ep 由 Catalog/Planner 固化，不再从 runner 标签或 yaml 推断 |
 | `supervise_train.sh` → `run_train.sh` 的 `run_supervised()` | 监督逻辑只服务一次训练启动，独立文件增加参数与临时 `KEY=value` 往返 |
 | `verify_env.py` + `torch_guard.sh` + `npu_cleanup.sh` → `env_pod.py` | 三个都在回答「pod 现在什么状态」（体检 / 防破坏 / 复原） |
-| `run_pytest.sh` + `junit_merge.py` → `run_tests.sh` | 后者只被前者调用，而且只用了它的单分片路径 |
 | `lint_checks.py` + `lint.sh` → `lint_check.py` + 两个检查模块 | 通用工具和仓库契约分开，入口只做汇总 |
 
 反过来，下面这些**不合并**，因为它们回答的是不同的问题：
@@ -155,8 +149,6 @@ yaml 里只留「输什么、调哪个脚本」，超过 10 行的 bash 一律�
 * `planner.py`（选什么）与 `gate.py`（算不算过）—— 选错和判错是两类故障，
   合一起会让门禁自己变成黑盒。
 * `report_result.py`（事实 → 文字）—— 其他脚本都向它写事实，它不该反过来依赖任何人。
-* `install_deps.sh` 已并入 `run_tests.sh install`：workflow 仍用两个 step，
-  装挂了与测试挂了仍然分得开。
 
 生产路径的范围语义只放在 `policies.yml`：`mode=pr|full` 只负责选择 policy，
 不再根据 diff 或标签改选测集合。Manual 使用同一份 policy，再通过
@@ -185,7 +177,7 @@ python3 scripts/ci/planner.py --policy pull_request --change-scope docs_only \
   --output /tmp/docs-plan.json                         # 零 Job Plan
 python3 -m pytest scripts/ci/tests -q                  # 契约/Planner/Executor/Gate
 
-bash -n scripts/ci/bin/* scripts/ci/unit_tests/*.sh scripts/ci/e2e_tests/*.sh
+bash -n scripts/ci/bin/* scripts/ci/e2e_tests/*.sh
 
 # 生成 PlanArtifact 与平台 matrix（不需要网络）
 python3 scripts/ci/planner.py --policy pull_request --output /tmp/plan.json \
@@ -211,10 +203,6 @@ python3 scripts/ci/gate.py --plan /tmp/plan.json --results /tmp/ci-results \
 python3 scripts/ci/common/env_pod.py probe --device cpu --file /tmp/t.json
 python3 scripts/ci/common/env_pod.py check --device cpu --file /tmp/t.json
 
-# 解析模型对应的启动脚本 / 依赖脚本
-python3 scripts/ci/e2e_tests/prepare_model.py plan --map .github/workflows/model_map.json \
-  --model-type qwen3_5 --framework lf
-
 # 模型目录完不完整（不需要网络；--layers N 同时校验减层结果）
 python3 scripts/ci/e2e_tests/prepare_model.py probe --dir /root/.cache/models/<repo> \
   [--layers N]
@@ -222,8 +210,5 @@ python3 scripts/ci/e2e_tests/prepare_model.py probe --dir /root/.cache/models/<r
 # 全量小模型 / 减层大模型（0 = 全量；N = 只保留前 N 层）
 python3 scripts/ci/e2e_tests/prepare_model.py fetch --repo Qwen/Qwen3.5-2B --layers 0
 python3 scripts/ci/e2e_tests/prepare_model.py fetch --repo Qwen/Qwen3.5-35B-A3B --layers 4
-
-# junit 计数
-python3 scripts/ci/report/report_result.py junit --file /tmp/r.json --junit /tmp/pytest.xml
 
 ```

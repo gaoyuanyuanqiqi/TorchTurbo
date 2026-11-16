@@ -1,18 +1,14 @@
 #!/usr/bin/env bash
 # NPU E2E job:
 #   environment check      - workflow: env_pod.py probe
-#   training orchestration - this script: stages 1-5 per selected E2E case
+#   training orchestration - this script: install -> prepare -> train -> report
 #   environment cleanup    - workflow: env_pod.py cleanup
 #
 # Training stages:
-#   1. plan       - model_map.json -> scripts, card count, sp/ep
-#   2. install    - install torchturbo and model dependencies
-#   3. prepare    - rewrite the engine config, then obtain the weights
-#   4. train      - launch training under a watchdog
-#   5. report     - render facts, job summary, and annotation
-#
-# `lane` is training orchestration, not a stage: it runs stages 1-5 for every
-# selected E2E case.
+#   1. install    - install torchturbo and model dependencies
+#   2. prepare    - rewrite the engine config, then obtain the weights
+#   3. train      - launch training under a watchdog
+#   4. report     - render facts, job summary, and annotation
 
 set -uo pipefail
 
@@ -20,12 +16,11 @@ CI_SCRIPTS="${CI_SCRIPTS:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 MODEL_HELPER="$CI_SCRIPTS/e2e_tests/prepare_model.py"
 RESULT_JSON="${RESULT_JSON:-/tmp/ci-result.json}"
 GITHUB_OUTPUT="${GITHUB_OUTPUT:-/dev/null}"
-MAP="${MAP:-.github/workflows/model_map.json}"
 
 : "${MODEL_TYPE:=}"; : "${CASE_ID:=}"; : "${FRAMEWORK:=lf}"; : "${ENV_NAME:=}"; : "${RUNNER_LABEL:=}"
 : "${IMAGE:=}"; : "${LAYERS:=0}"; : "${MODEL_HINT:=}"; : "${REPO_IN:=}"
 : "${SEQ_LEN:=1024}"; : "${FINETUNING_TYPE:=full}"; : "${DATASET_IN:=gsm8k}"; : "${DATASET:=${DATASET_IN}}"
-: "${FETCH_TIMEOUT:=1800}"; : "${CASE_TIMEOUT:=7200}"; : "${E2E_CASES:=[]}"
+: "${FETCH_TIMEOUT:=1800}"; : "${CASE_TIMEOUT:=7200}"
 : "${INSTALL_SCRIPT:=}"; : "${TRAIN_SCRIPT:=}"; : "${HF_REPO:=}"
 : "${INSTALL_ARGS:=}"; : "${TRAIN_ARGS:=}"
 : "${TORCH_BEFORE:=/tmp/torch-before.json}"
@@ -46,44 +41,7 @@ parse_kv() {  # parse_kv <KEY=value lines>
   done <<< "$1"
 }
 
-# ---------------------------------------------------------------- Stage 1: plan
-# Map model_type to its scripts, repo, and the declared card/parallel plan.
-cmd_plan() {
-  result init --file "$RESULT_JSON" \
-    kind=train model_type="$MODEL_TYPE" case_id="$CASE_ID" framework="$FRAMEWORK" env="$ENV_NAME" \
-    runner_label="$RUNNER_LABEL" image="$IMAGE" layers="$LAYERS" dataset="$DATASET"
-
-  local resolved
-  if ! resolved=$(python3 "$MODEL_HELPER" plan \
-      --map "$MAP" --model-type "$MODEL_TYPE" --framework "$FRAMEWORK" \
-      --case-id "$CASE_ID"); then
-    return 1
-  fi
-  parse_kv "$resolved"
-  ENV_NAME="${ENV:-$ENV_NAME}"
-  [ -n "${TRAIN_SCRIPT:-}" ] && [ -n "${INSTALL_SCRIPT:-}" ] \
-    || { echo "::error::模型脚本解析结果为空"; return 1; }
-  # Declared per model in model_map.json. Kept in PLAN_* so the stage-3 parse
-  # cannot be confused with the values patch_run_scripts.py echoes back.
-  PLAN_CARDS=$CARDS; PLAN_SP=$SP; PLAN_EP=$EP
-
-  # cmd_lane re-enters this script for process isolation. Export the resolved
-  # case state before that boundary, otherwise the child sees empty scripts.
-  export CASE_ID FRAMEWORK ENV_NAME MODEL_TYPE LAYERS DATASET_IN \
-    RUN_DIR INSTALL_SCRIPT TRAIN_SCRIPT HF_REPO REPO_IN MODEL_HINT \
-    PLAN_CARDS PLAN_SP PLAN_EP RESULT_JSON
-
-  echo "case=$CASE_ID model_type=$MODEL_TYPE framework=$FRAMEWORK env=$ENV_NAME run_dir=$RUN_DIR train=$TRAIN_SCRIPT repo=$HF_REPO"
-  echo "plan: cards=$PLAN_CARDS sp=$PLAN_SP ep=$PLAN_EP"
-  result set --file "$RESULT_JSON" \
-    env="$ENV_NAME" run_dir="$RUN_DIR" install_script="$INSTALL_SCRIPT" \
-    train_script="$TRAIN_SCRIPT"
-  printf 'case_id=%s\nenv=%s\nrun_dir=%s\ninstall_script=%s\ntrain_script=%s\nhf_repo=%s\n' \
-    "$CASE_ID" "$ENV_NAME" "$RUN_DIR" "$INSTALL_SCRIPT" "$TRAIN_SCRIPT" "$HF_REPO" >> "$GITHUB_OUTPUT"
-  python3 "$CI_SCRIPTS/lint_select/lint_check.py" --only map
-}
-
-# ---------------------------------------------------------------- Stage 2: install
+# ---------------------------------------------------------------- Stage 1: install
 # Install torchturbo and model dependencies, then verify torch was not replaced.
 pip_step() {  # pip_step <name> [install script] [install args]
   local name="$1" script="${2:-}" extra="${3:-}" log start rc
@@ -131,7 +89,7 @@ cmd_install() {
   pip_step "模型依赖 \`${INSTALL_SCRIPT}\`" "$INSTALL_SCRIPT" "$INSTALL_ARGS"
 }
 
-# ---------------------------------------------------------------- Stage 3: prepare
+# ---------------------------------------------------------------- Stage 2: prepare
 # Rewrite the declared plan into the engine config, then obtain the weights.
 PREP_NPUS_PER_NODE=""
 PREP_MODEL=""
@@ -156,8 +114,6 @@ cmd_prepare() {
   fail_fetch() {  # fail_fetch <reason> <seconds>
     echo "::error::$1"
     echo "skip_reason=$1" >> "$GITHUB_OUTPUT"
-    # Cases run in a subshell, so the reason leaves through a file as well.
-    [ -n "${SKIP_FILE:-}" ] && printf '%s\n' "$1" >> "$SKIP_FILE"
     result set --file "$RESULT_JSON" skip_reason="$1"
     result phase --file "$RESULT_JSON" --name '模型获取' --seconds "$2" --rc 1
     return 1
@@ -165,14 +121,11 @@ cmd_prepare() {
 
   local MODEL="" BYTES=0 SHARDS=0 HIT=no CARDS="" SP="" EP="" TT_CONFIG=""
   local configured prepared start trc
-  # The plan is declared in model_map.json and does not depend on the runner
-  # label: real labels carry a location suffix (`...-8-cn12-001`) whose last
-  # segment parses as 1, so an 8-card pod would start one process and stay
-  # green. The same call rewrites the engine config in place, which is why the
-  # launcher keeps its own TT_CONFIG default.
+  # The Plan supplies cards/sp/ep. Real runner labels carry a location suffix
+  # whose last segment parses as a rank count, so inferring from labels is wrong.
   case "$PLAN_CARDS" in
     ''|-|*[!0-9]*)
-      echo "::error::model_map.json 里 ${CASE_ID} 没有 cards/sp/ep，无法确定卡数与并行策略"
+      echo "::error::Plan 里 ${CASE_ID} 没有 cards/sp/ep，无法确定卡数与并行策略"
       return 1 ;;
   esac
   if ! configured=$(python3 "$CI_SCRIPTS/e2e_tests/patch_run_scripts.py" config \
@@ -183,7 +136,7 @@ cmd_prepare() {
   fi
   parse_kv "$configured"
   NPUS_PER_NODE=$CARDS
-  echo "cards=${NPUS_PER_NODE} (model_map.json)"
+  echo "cards=${NPUS_PER_NODE} (Plan)"
   local -a args=(fetch --repo "$hf_repo" --layers "${LAYERS:-0}")
   [ -n "$MODEL_HINT" ] && args+=(--hint "$MODEL_HINT")
   start=$(date +%s)
@@ -214,7 +167,7 @@ cmd_prepare() {
   PREP_SFS_UUID=${uuid:-?}
 }
 
-# ---------------------------------------------------------------- Stage 4: train
+# ---------------------------------------------------------------- Stage 3: train
 # Launch the training script and supervise its process group and output log.
 SUP_TRAIN_PID=""
 SUP_TAIL_PID=""
@@ -339,16 +292,9 @@ cmd_train() {
   return "$rc"
 }
 
-# ---------------------------------------------------------------- Stage 5: report
+# ---------------------------------------------------------------- Stage 4: report
 # Render the Job Summary and emit the final annotation from recorded facts.
 cmd_report() {
-  result migrate-map --file "$RESULT_JSON" --map "$MAP"
-  result report --file "$RESULT_JSON" --train-log /tmp/train.log \
-    --versions /tmp/after.txt >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
-  result notice --file "$RESULT_JSON" --model-type "${MODEL_TYPE:-}" || true
-}
-
-cmd_case_report() {
   result report --file "$RESULT_JSON" --train-log /tmp/train.log \
     --versions /tmp/after.txt >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
   result notice --file "$RESULT_JSON" --model-type "${MODEL_TYPE:-}" || true
@@ -360,8 +306,7 @@ cmd_run() {
   cmd_train
 }
 
-# Run one fully resolved ModelE2ESpec supplied by executor.py. Unlike `lane`,
-# this path does not read model_map.json and does not select cases.
+# Run one fully resolved ModelE2ESpec supplied by executor.py.
 cmd_case() {
   local rc=0
   : "${MODEL_TYPE:?MODEL_TYPE is required}"
@@ -382,60 +327,14 @@ cmd_case() {
         "$CASE_TIMEOUT" bash "$0" run )
     rc=$?
   fi
-  cmd_case_report || true
-  return "$rc"
-}
-
-# Training orchestration, not a stage: run stages 1-5 for every selected E2E case.
-cmd_lane() {
-  local rc=0 total=0 skipped=0 case_rc mt layers case_list reasons
-  local resolved_case_id resolved_framework resolved_env resolved_dataset
-  export DATASET="${DATASET_IN:-${DATASET:-gsm8k}}"
-  SKIP_FILE=$(mktemp); export SKIP_FILE
-  case_list=$(python3 "$MODEL_HELPER" cases --map "$MAP" --framework "$FRAMEWORK" \
-    "${E2E_CASES:-[]}") || return 1
-  while IFS=$'\t' read -r resolved_case_id resolved_framework resolved_env mt layers resolved_dataset; do
-    [ -n "$mt" ] || continue
-    total=$((total + 1))
-    echo "::group::training case $total: $resolved_case_id (layers=${layers:-0})"
-    export CASE_ID="$resolved_case_id" FRAMEWORK="$resolved_framework" ENV_NAME="$resolved_env"
-    export MODEL_TYPE="$mt" LAYERS="${layers:-0}" DATASET_IN="${resolved_dataset:-$DATASET_IN}"
-    if ! GITHUB_OUTPUT=/dev/null cmd_plan; then
-      rc=1
-    elif ! cmd_install; then
-      rc=1
-    else
-      ( GITHUB_OUTPUT=/dev/null timeout --foreground --kill-after=30s \
-          "$CASE_TIMEOUT" bash "$0" run )
-      case_rc=$?
-      if [ "$case_rc" -eq 3 ]; then skipped=$((skipped + 1))
-      elif [ "$case_rc" -ne 0 ]; then rc=1
-      fi
-    fi
-    cmd_report || true
-    echo "::endgroup::"
-  done <<< "$case_list"
-  # One aggregated line: partial skips used to reach the gate with no reason,
-  # so `ci:e2e:strict` could not tell a timeout from a clean run.
-  reasons=$(sort -u "$SKIP_FILE" 2>/dev/null | tr '\n' ';' | sed 's/;$//')
-  rm -f "$SKIP_FILE"
-  if [ "$total" -eq 0 ]; then
-    echo "::notice::no E2E case selected, nothing to train"
-    echo "skip_reason=no E2E case selected" >> "$GITHUB_OUTPUT"
-  elif [ "$skipped" -gt 0 ]; then
-    echo "skip_reason=${skipped}/${total} E2E case(s) skipped: ${reasons}" >> "$GITHUB_OUTPUT"
-  fi
+  cmd_report || true
   return "$rc"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   case "${1:-}" in
-    plan) cmd_plan ;;
-    install) cmd_install ;;
     run) cmd_run ;;
-    report) cmd_report ;;
-    lane) cmd_lane ;;
     case) cmd_case ;;
-    *) echo "用法：$0 {plan|install|run|report|lane|case}" >&2; exit 2 ;;
+    *) echo "用法：$0 {run|case}" >&2; exit 2 ;;
   esac
 fi
