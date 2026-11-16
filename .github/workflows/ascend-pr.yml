@@ -100,6 +100,11 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: install CI dependencies
+        run: |
+          python3 -m pip install --quiet --disable-pip-version-check \
+            -r requirements-lint.txt
+
       - name: lint
         id: lint
         if: steps.changes.outputs.change_scope != 'docs_only'
@@ -107,8 +112,6 @@ jobs:
           PYTHONUNBUFFERED: '1'
         run: |
           set -uo pipefail
-          python3 -m pip install --quiet --disable-pip-version-check \
-            -r requirements-lint.txt
           python3 scripts/ci/lint_select/lint_check.py
 
       - name: resolve image
