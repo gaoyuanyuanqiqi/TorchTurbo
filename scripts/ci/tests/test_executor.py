@@ -82,6 +82,30 @@ def test_execute_pytest_job_writes_passing_result(
     assert loaded.to_dict() == result.to_dict()
 
 
+def test_execute_leaves_provisional_result_if_terminated(
+    tmp_path: Path, monkeypatch, pr_plan
+) -> None:
+    job = next(item for item in pr_plan.jobs if item.kind == "pytest")
+    _patch_execution(monkeypatch, tmp_path, job)
+    output_dir = tmp_path / "result"
+    observed: list[tuple[str, str]] = []
+
+    def fake_run(command, *, cwd, environment, log_path, timeout_seconds):
+        provisional = load_job_result(output_dir / "job-result.json")
+        observed.append((provisional.status, provisional.failure["code"]))
+        raise SystemExit(137)
+
+    monkeypatch.setattr(executor, "_run_stream", fake_run)
+    with pytest.raises(SystemExit, match="137"):
+        executor.execute(pr_plan, job.id, output_dir=output_dir, root=tmp_path)
+
+    assert observed == [("infra_error", "executor-incomplete")]
+    result = load_job_result(output_dir / "job-result.json")
+    assert result.status == "infra_error"
+    assert result.failure["code"] == "executor-incomplete"
+    assert result.steps == ()
+
+
 def test_execute_stops_after_first_failed_step(tmp_path: Path, monkeypatch, pr_plan) -> None:
     job = next(item for item in pr_plan.jobs if item.kind == "pytest")
 

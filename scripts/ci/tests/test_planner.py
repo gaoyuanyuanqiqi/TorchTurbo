@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
@@ -134,6 +135,51 @@ def test_cli_matrix_outputs_match_workflow_contract(
         "npu_jobs", "npu_job_count",
         "gpu_jobs", "gpu_job_count",
     } <= keys
+
+
+def test_cli_target_job_reduces_plan_to_one_job(
+    tmp_path: Path, repo_root: Path
+) -> None:
+    target = "pytest-core-npu-npu-default-default"
+    plan_path = tmp_path / "plan.json"
+    output_path = tmp_path / "github-output"
+    assert main([
+        "--root", str(repo_root),
+        "--policy", "pull_request",
+        "--output", str(plan_path),
+        "--github-output", str(output_path),
+        "--target-job", target,
+    ]) == 0
+
+    artifact = load_plan_artifact(plan_path)
+    assert artifact.status == "ready"
+    assert artifact.plan is not None
+    assert [job.id for job in artifact.plan.jobs] == [target]
+    assert artifact.plan.coverage["jobs"] == 1
+    assert artifact.plan.inputs["target_job"] == target
+
+    values = dict(
+        line.split("=", 1)
+        for line in output_path.read_text(encoding="utf-8").splitlines()
+    )
+    assert json.loads(values["cpu_jobs"]) == []
+    assert [job["job_id"] for job in json.loads(values["npu_jobs"])] == [target]
+
+
+def test_cli_unknown_target_job_fails_artifact(
+    tmp_path: Path, repo_root: Path
+) -> None:
+    plan_path = tmp_path / "plan.json"
+    assert main([
+        "--root", str(repo_root),
+        "--policy", "pull_request",
+        "--output", str(plan_path),
+        "--target-job", "missing-job",
+    ]) == 1
+
+    artifact = load_plan_artifact(plan_path)
+    assert artifact.status == "failed"
+    assert [issue.code for issue in artifact.errors] == ["unknown-job"]
 
 
 def test_planner_failure_artifact_round_trip(

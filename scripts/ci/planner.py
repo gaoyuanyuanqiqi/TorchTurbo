@@ -313,6 +313,53 @@ def build(catalog: Catalog, policy: Policy, source: Source) -> Plan:
     )
 
 
+def _target_plan(plan: Plan, target_job: str) -> Plan:
+    """Reduce a validated Plan to one job for an explicit manual run."""
+    jobs = tuple(job for job in plan.jobs if job.id == target_job)
+    if not jobs:
+        raise PlanError([_issue(
+            target_job,
+            f"target job {target_job!r} is not in the full plan",
+            "unknown-job",
+        )])
+
+    pytest_files = {suite: set() for suite in ("core", "model", "adapter")}
+    pytest_routes = {suite: 0 for suite in ("core", "model", "adapter")}
+    e2e_cases: list[str] = []
+    for job in jobs:
+        for step in job.steps:
+            if isinstance(step.spec, PytestSpec):
+                pytest_files[step.spec.suite].update(step.spec.files)
+                pytest_routes[step.spec.suite] += len(step.spec.files)
+            elif isinstance(step.spec, ModelE2ESpec):
+                e2e_cases.append(step.spec.case_id)
+
+    pytest_coverage = {
+        suite: {
+            "mode": "explicit" if files else "none",
+            "files": len(files),
+            "routes": pytest_routes[suite],
+        }
+        for suite, files in pytest_files.items()
+    }
+    coverage = {
+        "pytest": pytest_coverage,
+        "model_e2e": {
+            "mode": "explicit" if e2e_cases else "none",
+            "cases": sorted(e2e_cases),
+        },
+        "jobs": len(jobs),
+    }
+    inputs = {**plan.inputs, "target_job": target_job}
+    return build_plan(
+        policy=plan.policy,
+        source=plan.source,
+        inputs=inputs,
+        coverage=coverage,
+        jobs=jobs,
+    )
+
+
 def validate_plan(plan: Plan, catalog: Catalog, policy: Policy) -> list[Issue]:
     """Validate a plan against the catalog and policy that produced it."""
     issues: list[Issue] = []
@@ -536,7 +583,7 @@ def validate_plan(plan: Plan, catalog: Catalog, policy: Policy) -> list[Issue]:
 
 
 def artifact_for(catalog: Catalog | None, policy_name: str, source: Source,
-                 issues: Iterable[Issue]) -> PlanArtifact:
+                 issues: Iterable[Issue], target_job: str = "") -> PlanArtifact:
     values = tuple(issues)
     if catalog is None or values:
         return build_plan_artifact(policy=policy_name, source=source, errors=values)
@@ -544,6 +591,8 @@ def artifact_for(catalog: Catalog | None, policy_name: str, source: Source,
         policy = load_policy(catalog.root / "scripts" / "ci" / "policies.yml", policy_name)
         plan = build(catalog, policy, source)
         plan_issues = validate_plan(plan, catalog, policy)
+        if not plan_issues and target_job:
+            plan = _target_plan(plan, target_job)
     except (PlanError, PolicyError) as exc:
         return build_plan_artifact(
             policy=policy_name,
@@ -598,8 +647,15 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--fail-code", default="planner-precondition")
     parser.add_argument("--fail-path", default="planner")
     parser.add_argument("--fail-message", default="")
+    parser.add_argument(
+        "--target-job", default="",
+        help="reduce a validated plan to one exact job for a manual run",
+    )
     parser.add_argument("--verify", action="store_true")
     args = parser.parse_args(argv)
+
+    if args.verify and args.target_job:
+        parser.error("--target-job cannot be combined with --verify")
 
     root = Path(args.root).resolve() if args.root else Path(__file__).resolve().parents[2]
     source = source_for(
@@ -652,7 +708,9 @@ def main(argv: list[str]) -> int:
         print(f"planner OK ({len(catalog.cases)} E2E cases / {len(catalog.tests)} tests)")
         return 0
 
-    artifact = artifact_for(catalog, args.policy, source, ())
+    artifact = artifact_for(
+        catalog, args.policy, source, (), target_job=args.target_job
+    )
     if args.output:
         write_json(Path(args.output), artifact.to_dict())
     if artifact.status != "ready" or artifact.plan is None:

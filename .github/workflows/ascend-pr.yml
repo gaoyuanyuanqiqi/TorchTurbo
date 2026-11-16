@@ -18,6 +18,10 @@ on:
         required: false
         default: 'pr'
         type: string
+      target_job:
+        required: false
+        default: ''
+        type: string
   workflow_dispatch:
     inputs:
       mode:
@@ -28,6 +32,11 @@ on:
         options:
           - pr
           - full
+      target_job:
+        description: 'optional exact Plan job id; empty runs the full mode'
+        required: false
+        default: ''
+        type: string
 
 concurrency:
   group: ci-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || format('full-{0}', github.run_id) }}${{ startsWith(github.event.label.name || '', 'ci:manual:') && '-manual-label' || '' }}
@@ -41,6 +50,7 @@ permissions:
 env:
   # run_tests.sh treats MODE as cpu/npu, so keep this variable name distinct.
   CI_MODE: ${{ github.event_name == 'pull_request' && 'pr' || inputs.mode }}
+  CI_TARGET_JOB: ${{ inputs.target_job || '' }}
 
 jobs:
   plan:
@@ -109,6 +119,9 @@ jobs:
             --source-ref "$GITHUB_REF"
             --source-sha "$GITHUB_SHA"
           )
+          if [ -n "$CI_TARGET_JOB" ]; then
+            COMMON+=(--target-job "$CI_TARGET_JOB")
+          fi
           if [ "$LINT_OUTCOME" != success ]; then
             python3 scripts/ci/planner.py "${COMMON[@]}" \
               --fail-code lint --fail-path scripts/ci/lint_select/lint_check.py \
@@ -183,6 +196,15 @@ jobs:
             --output "$RUNNER_TEMP/ci-result/job-result.json" \
             --summary "$GITHUB_STEP_SUMMARY"
 
+      - name: verify result
+        if: always()
+        run: |
+          result="$RUNNER_TEMP/ci-result/job-result.json"
+          if [ ! -s "$result" ]; then
+            echo "::error::executor exited without writing $result"
+            exit 1
+          fi
+
       - name: upload result
         if: always()
         uses: actions/upload-artifact@v4
@@ -235,6 +257,15 @@ jobs:
             --output "$RUNNER_TEMP/ci-result/job-result.json" \
             --summary "$GITHUB_STEP_SUMMARY"
 
+      - name: verify result
+        if: always()
+        run: |
+          result="$RUNNER_TEMP/ci-result/job-result.json"
+          if [ ! -s "$result" ]; then
+            echo "::error::executor exited without writing $result"
+            exit 1
+          fi
+
       - name: upload result
         if: always()
         uses: actions/upload-artifact@v4
@@ -280,6 +311,15 @@ jobs:
             --skip-message "fork PR has no SWR secrets" \
             --output "$RUNNER_TEMP/ci-result/job-result.json" \
             --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: verify result
+        if: always()
+        run: |
+          result="$RUNNER_TEMP/ci-result/job-result.json"
+          if [ ! -s "$result" ]; then
+            echo "::error::executor exited without writing $result"
+            exit 1
+          fi
 
       - name: upload result
         if: always()

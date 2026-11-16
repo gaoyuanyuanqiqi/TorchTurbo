@@ -47,7 +47,7 @@ marker。
 
 | 路径 | 回答的问题 | 子命令 |
 |---|---|---|
-| `planner.py` | Catalog + Policy 这轮要跑什么？ | `--policy` / `--verify` / `--github-output` / `--image-ref` |
+| `planner.py` | Catalog + Policy 这轮要跑什么？ | `--policy` / `--verify` / `--github-output` / `--image-ref` / `--target-job` |
 | `executor.py` | Plan 中一个 Job 怎么执行并留下证据？ | `--plan + --job-id` / `--dry-run` / `--record-skip` |
 | `gate.py` | Plan 与 JobResult 是否完整且一致？ | `--plan` / `--results` / `--summary` |
 | `lint_select/select_tests.py` | 这次改动该跑什么？ | `--explain` / `--coverage` / `--verify` / `--changed-from git` / `--mode pr\|full --labels …` |
@@ -125,6 +125,7 @@ python3 scripts/ci/local_lint_select_test.py --only docker
 ascend-pr.yml       唯一入口  plan{lint,image,Planner} -> {cpu,npu matrix} -> gate
                     mode=pr（core pytest + 2 model guards）
                     mode=full（全量 pytest + 全量 E2E）；可被 nightly 复用
+                    target_job=<job-id> 只保留一个 Job，供单点诊断
 ascend-manual.yml   手动单泳道（dispatch 或 ci:manual:<lane> 标签）
 ascend-image.yml    构建基础镜像（**只手动 dispatch**）
 ascend-nightly.yml  全量 nightly 入口（schedule 暂注释，只支持手动 dispatch）
@@ -172,6 +173,8 @@ yaml 里只留「输什么、调哪个脚本」，超过 10 行的 bash 一律�
   `$GITHUB_OUTPUT`，或者直接 `source`。
 * 事实写进**文件**，不写进 step outputs。step outputs 在步骤失败时是空的，
   而失败的 run 恰恰是唯一会被人翻出来看的那种。
+* JobResult 在测试开始前先写一份 `infra_error` 占位结果，结束时原子覆盖；
+  即使 executor 被外部杀掉，Gate 也能看到明确的 `executor-incomplete`。
 * 跳过必须带原因，而且原因必须在 Plan 的 allowlist 内。JobResult 缺结果、
   原因不合法或跳过却带步骤证据，Gate 都判红。
 
@@ -189,6 +192,11 @@ bash -n scripts/ci/bin/* scripts/ci/unit_tests/*.sh scripts/ci/e2e_tests/*.sh
 
 # 生成 PlanArtifact 与平台 matrix（不需要网络）
 python3 scripts/ci/planner.py --policy pull_request --output /tmp/plan.json \
+  --github-output /tmp/github-output
+
+# 单点诊断：Plan 只保留一个 Job，其他平台 matrix 为空
+python3 scripts/ci/planner.py --policy pull_request --output /tmp/plan.json \
+  --target-job pytest-core-npu-npu-default-default \
   --github-output /tmp/github-output
 
 # 只看一个 Job 的执行边界，不安装依赖

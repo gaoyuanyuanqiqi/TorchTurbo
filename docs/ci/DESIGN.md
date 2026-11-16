@@ -343,6 +343,8 @@ job = (image, device, stage, work_id)
 - 每个 e2e job 使用独立超时和 cleanup；
 - e2e 的 `fetch_timeout` / `case_timeout` 统一由 `lanes.yml` 的 `e2e_defaults` 提供；
 - NPU job 超时或取消后必须执行 environment cleanup，释放卡和子进程；
+- Executor 在第一个 step 前写入 `infra_error` 占位 JobResult，结束时原子覆盖；
+  进程被外部杀掉时，Gate 看到的是 `executor-incomplete`，不是缺失结果；
 - 容量不足是 plan fail，不允许静默使用更大/更小 lane。
 
 ---

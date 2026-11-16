@@ -332,6 +332,36 @@ def _write_result(result: JobResult, output_dir: Path) -> Path:
     return path
 
 
+def _provisional_result(
+    plan: Plan,
+    job: Job,
+    *,
+    output_dir: Path,
+    started_at: str,
+    log_path: Path,
+    merged_junit: Path,
+) -> JobResult:
+    """Write a parseable result before execution can be killed externally."""
+    return JobResult(
+        schema_version=1,
+        plan_id=plan.plan_id,
+        job_id=job.id,
+        kind=job.kind,
+        status="infra_error",
+        started_at=started_at,
+        finished_at=started_at,
+        duration_seconds=0,
+        runtime=job.runtime,
+        items=_evidence(job, 0, merged_junit),
+        steps=(),
+        failure={
+            "code": "executor-incomplete",
+            "message": "executor did not finalize JobResult",
+        },
+        artifacts={"log": log_path.name} if log_path.is_file() else {},
+    )
+
+
 def execute(
     plan: Plan,
     job_id: str,
@@ -349,10 +379,21 @@ def execute(
     venv_root = Path(os.environ.get(
         "CI_VENV_ROOT", Path(os.environ.get("RUNNER_TEMP", "/tmp")) / "turbo-ci-venv"
     ))
+    log_path.write_text("", encoding="utf-8")
     started_at = _now()
     started = time.monotonic()
+    _write_result(
+        _provisional_result(
+            plan,
+            job,
+            output_dir=output_dir,
+            started_at=started_at,
+            log_path=log_path,
+            merged_junit=merged_junit,
+        ),
+        output_dir,
+    )
     deadline = started + job.timeout_minutes * 60
-    log_path.write_text("", encoding="utf-8")
     venv: Venv | None = None
     status = "passed"
     failure: dict[str, Any] | None = None

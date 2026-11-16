@@ -76,6 +76,30 @@ def test_missing_result_fails(pr_plan) -> None:
     assert "missing-result" in {failure["code"] for failure in decision.failures}
 
 
+def test_incomplete_executor_result_is_infra_error(pr_plan) -> None:
+    results = _results(pr_plan)
+    index = next(
+        i for i, job in enumerate(pr_plan.jobs)
+        if job.id == "pytest-core-npu-npu-default-default"
+    )
+    results[index] = replace(
+        results[index],
+        status="infra_error",
+        steps=(),
+        failure={
+            "code": "executor-incomplete",
+            "message": "executor did not finalize JobResult",
+        },
+    )
+
+    decision = decide(pr_plan, results)
+    codes = {failure["code"] for failure in decision.failures}
+    assert decision.status == "failed"
+    assert "job-infra_error" in codes
+    assert "missing-result" not in codes
+    assert decision.summary["failed"] == 1
+
+
 def test_duplicate_result_fails(pr_plan) -> None:
     results = _results(pr_plan)
     decision = decide(pr_plan, [*results, results[0]])
