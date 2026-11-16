@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from contracts import (
+from scripts.ci.contracts.artifacts import (
     Issue,
     JobResult,
     ModelE2EEvidence,
@@ -14,9 +14,9 @@ from contracts import (
     read_json,
     write_json,
 )
-import gate
-from gate import decide, decide_artifact
-from planner import build
+from scripts.ci.consumer import gate
+from scripts.ci.consumer.gate import decide, decide_artifact
+from scripts.ci.producer.planner import build
 
 
 def _result_for(plan, job, status: str = "passed") -> JobResult:
@@ -261,7 +261,9 @@ def test_planner_issue_path_is_not_a_step_id(pr_plan) -> None:
 def _write_cli_inputs(tmp_path, plan, results):
     plan_path = tmp_path / "plan.json"
     results_dir = tmp_path / "results"
-    write_json(plan_path, plan.to_dict())
+    write_json(plan_path, build_plan_artifact(
+        policy=plan.policy, source=plan.source, plan=plan
+    ).to_dict())
     for result in results:
         write_json(results_dir / result.job_id / "job-result.json", result.to_dict())
     write_json(results_dir / "diagnostics" / "torch-before.json", {"torch_ok": True})

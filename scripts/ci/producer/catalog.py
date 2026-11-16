@@ -5,14 +5,14 @@ from __future__ import annotations
 
 import argparse
 import sys
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable
 
 import yaml
 
-import test_scan
-from contracts import (
+from . import scan as test_scan
+from ..contracts.artifacts import (
     DEVICES,
     SCHEMA_VERSION,
     ImageRef,
@@ -47,14 +47,6 @@ class CatalogImage:
     def as_ref(self) -> ImageRef:
         return ImageRef(name=self.name, kind=self.kind, ref=self.ref)
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "device": self.device,
-            "kind": self.kind,
-            "ref": self.ref,
-            "default": self.default,
-        }
-
 
 @dataclass(frozen=True)
 class CatalogLane:
@@ -65,26 +57,10 @@ class CatalogLane:
     runner_variable: str
     runner: str
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "device": self.device,
-            "image": self.image_name,
-            "capacity_slots": self.capacity_slots,
-            "runner_variable": self.runner_variable,
-            "runner": self.runner,
-        }
-
-
 @dataclass(frozen=True)
 class TestOverride:
     venv: str
     image: str | None = None
-
-    def to_dict(self) -> dict[str, str]:
-        value = {"venv": self.venv}
-        if self.image:
-            value["image"] = self.image
-        return value
 
 
 @dataclass(frozen=True)
@@ -96,19 +72,6 @@ class PytestWorkload:
     combo_venvs: dict[str, str]
     overrides: dict[str, TestOverride]
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "defaults": {
-                "job_timeout_minutes": dict(sorted(self.job_timeout_minutes.items())),
-                "step_timeout_seconds": dict(sorted(self.step_timeout_seconds.items())),
-            },
-            "model_venvs": dict(sorted(self.model_venvs.items())),
-            "framework_venvs": dict(sorted(self.framework_venvs.items())),
-            "combo_venvs": dict(sorted(self.combo_venvs.items())),
-            "overrides": {key: value.to_dict() for key, value in sorted(self.overrides.items())},
-        }
-
-
 @dataclass(frozen=True)
 class ModelE2EDefaults:
     job_timeout_minutes: int
@@ -116,16 +79,6 @@ class ModelE2EDefaults:
     case_timeout_seconds: int
     seq_len: int
     finetuning_type: str
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "job_timeout_minutes": self.job_timeout_minutes,
-            "fetch_timeout_seconds": self.fetch_timeout_seconds,
-            "case_timeout_seconds": self.case_timeout_seconds,
-            "seq_len": self.seq_len,
-            "finetuning_type": self.finetuning_type,
-        }
-
 
 @dataclass(frozen=True)
 class TestEntry:
@@ -139,21 +92,6 @@ class TestEntry:
     image_name: str | None
     venv_name: str
     process_group: str
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "path": self.path,
-            "suite": self.suite,
-            "frameworks": list(self.frameworks),
-            "model_families": list(self.model_families),
-            "tags": list(self.tags),
-            "devices": list(self.devices),
-            "ranks_by_device": dict(sorted(self.ranks_by_device.items())),
-            "image_name": self.image_name,
-            "venv_name": self.venv_name,
-            "process_group": self.process_group,
-        }
-
 
 @dataclass(frozen=True)
 class ModelE2ECase:
@@ -178,31 +116,6 @@ class ModelE2ECase:
     timeout_seconds: int
     seq_len: int
     finetuning_type: str
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "case_id": self.case_id,
-            "model": self.model,
-            "framework": self.framework,
-            "device": self.device,
-            "venv": self.venv_name,
-            "image": self.image_name,
-            "run_dir": self.run_dir,
-            "workdir": self.workdir,
-            "install_script": self.install_script,
-            "train_script": self.train_script,
-            "install_args": list(self.install_args),
-            "train_args": list(self.train_args),
-            "hf_repo": self.hf_repo,
-            "layers": self.layers,
-            "dataset": self.dataset,
-            "ranks": self.ranks,
-            "parallelism": {"sp": self.sp, "ep": self.ep},
-            "timeout_seconds": self.timeout_seconds,
-            "seq_len": self.seq_len,
-            "finetuning_type": self.finetuning_type,
-        }
-
 
 @dataclass(frozen=True)
 class Catalog:
@@ -261,15 +174,15 @@ class Catalog:
     def dump_payload(self) -> dict[str, Any]:
         return {
             "schema_version": self.schema_version,
-            "images": {key: value.to_dict() for key, value in sorted(self.images.items())},
+            "images": {key: asdict(value) for key, value in sorted(self.images.items())},
             "venvs": {key: value.to_dict() for key, value in sorted(self.venvs.items())},
-            "lanes": {key: value.to_dict() for key, value in sorted(self.lanes.items())},
-            "pytest": self.pytest.to_dict(),
+            "lanes": {key: asdict(value) for key, value in sorted(self.lanes.items())},
+            "pytest": asdict(self.pytest),
             "model_e2e": {
-                "defaults": self.model_e2e_defaults.to_dict(),
-                "cases": [case.to_dict() for case in self.cases],
+                "defaults": asdict(self.model_e2e_defaults),
+                "cases": [asdict(case) for case in self.cases],
             },
-            "tests": [entry.to_dict() for entry in self.tests],
+            "tests": [asdict(entry) for entry in self.tests],
             "registered_models": list(self.registered_models),
         }
 
@@ -289,6 +202,12 @@ def _unknown_keys(value: dict[str, Any], allowed: set[str], path: str,
                   issues: list[Issue]) -> None:
     for key in sorted(set(value) - allowed):
         issues.append(_issue(f"{path}.{key}", "unknown field"))
+
+
+def _row(value: Any, path: str, allowed: set[str], issues: list[Issue]) -> dict[str, Any]:
+    row = _mapping(value, path, issues)
+    _unknown_keys(row, allowed, path, issues)
+    return row
 
 
 def _strings(value: Any, path: str, issues: list[Issue]) -> tuple[str, ...]:
@@ -314,17 +233,17 @@ def _load_images(raw: Any, image_refs: dict[str, str], root: Path,
     rows = _mapping(raw, "resources.images", issues)
     images: dict[str, CatalogImage] = {}
     for name, value in rows.items():
-        row = _mapping(value, f"resources.images.{name}", issues)
-        _unknown_keys(row, {"device", "kind", "ref", "default"}, f"resources.images.{name}", issues)
+        where = f"resources.images.{name}"
+        row = _row(value, where, {"device", "kind", "ref", "default"}, issues)
         device = str(row.get("device") or "")
         kind = str(row.get("kind") or "")
         ref = str(image_refs.get(name) or row.get("ref") or "")
         if device not in DEVICES:
-            issues.append(_issue(f"resources.images.{name}.device", "unknown device"))
+            issues.append(_issue(f"{where}.device", "unknown device"))
         if kind not in {"host", "container"}:
-            issues.append(_issue(f"resources.images.{name}.kind", "must be host or container"))
+            issues.append(_issue(f"{where}.kind", "must be host or container"))
         if not ref:
-            issues.append(_issue(f"resources.images.{name}.ref", "image ref is required"))
+            issues.append(_issue(f"{where}.ref", "image ref is required"))
         images[name] = CatalogImage(
             name=name,
             device=device,
@@ -361,23 +280,18 @@ def _load_venvs(raw: Any, root: Path, issues: list[Issue]) -> dict[str, VenvSpec
     rows = _mapping(raw, "resources.venvs", issues)
     local_venvs: dict[str, VenvSpec] = {}
     for name, value in rows.items():
-        row = _mapping(value, f"resources.venvs.{name}", issues)
-        _unknown_keys(
-            row,
-            {"python", "requirements", "overrides", "extends", "constraints"},
-            f"resources.venvs.{name}",
-            issues,
-        )
+        where = f"resources.venvs.{name}"
+        row = _row(value, where, {"python", "requirements", "overrides", "extends", "constraints"}, issues)
         python = str(row.get("python") or "")
-        requirements = _strings(row.get("requirements"), f"resources.venvs.{name}.requirements", issues)
-        overrides = _strings(row.get("overrides"), f"resources.venvs.{name}.overrides", issues)
+        requirements = _strings(row.get("requirements"), f"{where}.requirements", issues)
+        overrides = _strings(row.get("overrides"), f"{where}.overrides", issues)
         extends = str(row.get("extends") or "") or None
         constraints = str(row.get("constraints") or "auto")
         if not python:
-            issues.append(_issue(f"resources.venvs.{name}.python", "python version is required"))
+            issues.append(_issue(f"{where}.python", "python version is required"))
         for relative in (*requirements, *overrides):
             if not (root / relative).is_file():
-                issues.append(_issue(f"resources.venvs.{name}", f"missing file {relative!r}"))
+                issues.append(_issue(where, f"missing file {relative!r}"))
         local_venvs[name] = VenvSpec(
             name=name,
             python=python,
@@ -435,51 +349,40 @@ def _load_lanes(raw: Any, images: dict[str, CatalogImage], issues: list[Issue]) 
     rows = _mapping(raw, "resources.lanes", issues)
     lanes: dict[str, CatalogLane] = {}
     for name, value in rows.items():
-        row = _mapping(value, f"resources.lanes.{name}", issues)
-        _unknown_keys(
-            row,
-            {"device", "image", "capacity_slots", "runner_variable", "runner"},
-            f"resources.lanes.{name}",
-            issues,
-        )
+        where = f"resources.lanes.{name}"
+        row = _row(value, where, {"device", "image", "capacity_slots", "runner_variable", "runner"}, issues)
         device = str(row.get("device") or "")
         image_name = str(row.get("image") or "")
         image = images.get(image_name)
         if device not in DEVICES:
-            issues.append(_issue(f"resources.lanes.{name}.device", "unknown device"))
+            issues.append(_issue(f"{where}.device", "unknown device"))
         if image is None:
-            issues.append(_issue(f"resources.lanes.{name}.image", "unknown image"))
+            issues.append(_issue(f"{where}.image", "unknown image"))
         elif image.device != device:
-            issues.append(_issue(f"resources.lanes.{name}", "image and lane devices differ"))
+            issues.append(_issue(where, "image and lane devices differ"))
         lane = CatalogLane(
             name=name,
             device=device,
             image_name=image_name,
-            capacity_slots=_int(row.get("capacity_slots"), f"resources.lanes.{name}.capacity_slots", issues, 1),
+            capacity_slots=_int(row.get("capacity_slots"), f"{where}.capacity_slots", issues, 1),
             runner_variable=str(row.get("runner_variable") or ""),
             runner=str(row.get("runner") or ""),
         )
         if not lane.runner_variable or not lane.runner:
-            issues.append(_issue(f"resources.lanes.{name}", "runner_variable and runner are required"))
+            issues.append(_issue(where, "runner_variable and runner are required"))
         lanes[name] = lane
     return lanes
 
 
 def _load_pytest(raw: Any, venvs: dict[str, VenvSpec], root: Path,
                  issues: list[Issue]) -> PytestWorkload:
-    row = _mapping(raw, "workloads.pytest", issues)
-    _unknown_keys(
-        row,
-        {"defaults", "model_venvs", "framework_venvs", "combo_venvs", "overrides"},
-        "workloads.pytest",
-        issues,
+    row = _row(
+        raw, "workloads.pytest",
+        {"defaults", "model_venvs", "framework_venvs", "combo_venvs", "overrides"}, issues,
     )
-    defaults = _mapping(row.get("defaults"), "workloads.pytest.defaults", issues)
-    _unknown_keys(
-        defaults,
-        {"job_timeout_minutes", "step_timeout_seconds"},
-        "workloads.pytest.defaults",
-        issues,
+    defaults = _row(
+        row.get("defaults"), "workloads.pytest.defaults",
+        {"job_timeout_minutes", "step_timeout_seconds"}, issues,
     )
     job_timeout = _mapping(defaults.get("job_timeout_minutes"), "workloads.pytest.defaults.job_timeout_minutes", issues)
     step_timeout = _mapping(defaults.get("step_timeout_seconds"), "workloads.pytest.defaults.step_timeout_seconds", issues)
@@ -505,14 +408,14 @@ def _load_pytest(raw: Any, venvs: dict[str, VenvSpec], root: Path,
 
     overrides: dict[str, TestOverride] = {}
     for path, value in overrides_raw.items():
-        override = _mapping(value, f"workloads.pytest.overrides.{path}", issues)
-        _unknown_keys(override, {"venv", "image"}, f"workloads.pytest.overrides.{path}", issues)
+        where = f"workloads.pytest.overrides.{path}"
+        override = _row(value, where, {"venv", "image"}, issues)
         venv = str(override.get("venv") or "")
         image = str(override.get("image") or "") or None
         if venv not in venvs:
-            issues.append(_issue(f"workloads.pytest.overrides.{path}.venv", "unknown venv"))
+            issues.append(_issue(f"{where}.venv", "unknown venv"))
         if not (root / path).is_file():
-            issues.append(_issue(f"workloads.pytest.overrides.{path}", "test file is missing"))
+            issues.append(_issue(where, "test file is missing"))
         overrides[path] = TestOverride(venv=venv, image=image)
 
     return PytestWorkload(
@@ -526,12 +429,9 @@ def _load_pytest(raw: Any, venvs: dict[str, VenvSpec], root: Path,
 
 
 def _load_model_e2e_defaults(raw: Any, issues: list[Issue]) -> ModelE2EDefaults:
-    row = _mapping(raw, "workloads.model_e2e.defaults", issues)
-    _unknown_keys(
-        row,
-        {"job_timeout_minutes", "fetch_timeout", "case_timeout", "seq_len", "finetuning_type"},
-        "workloads.model_e2e.defaults",
-        issues,
+    row = _row(
+        raw, "workloads.model_e2e.defaults",
+        {"job_timeout_minutes", "fetch_timeout", "case_timeout", "seq_len", "finetuning_type"}, issues,
     )
     fetch_timeout = _int(row.get("fetch_timeout"), "workloads.model_e2e.defaults.fetch_timeout", issues, 1)
     case_timeout = _int(row.get("case_timeout"), "workloads.model_e2e.defaults.case_timeout", issues, 1)
@@ -556,75 +456,72 @@ def _load_model_e2e_cases(raw: Any, root: Path, defaults: ModelE2EDefaults,
     cases: list[ModelE2ECase] = []
     seen: set[str] = set()
     for model, value in models.items():
-        row = _mapping(value, f"workloads.model_e2e.models.{model}", issues)
-        _unknown_keys(row, {"run_dir", "cases"}, f"workloads.model_e2e.models.{model}", issues)
+        where = f"workloads.model_e2e.models.{model}"
+        row = _row(value, where, {"run_dir", "cases"}, issues)
         run_dir = str(row.get("run_dir") or "")
         workdir = f"scripts/runs/{run_dir}"
         if not run_dir or not (root / workdir).is_dir():
-            issues.append(_issue(f"workloads.model_e2e.models.{model}.run_dir", "run_dir is missing"))
+            issues.append(_issue(f"{where}.run_dir", "run_dir is missing"))
         raw_cases = row.get("cases") or []
         if not isinstance(raw_cases, list):
-            issues.append(_issue(f"workloads.model_e2e.models.{model}.cases", "must be a list"))
+            issues.append(_issue(f"{where}.cases", "must be a list"))
             continue
         for index, item in enumerate(raw_cases):
-            where = f"workloads.model_e2e.models.{model}.cases[{index}]"
-            case_row = _mapping(item, where, issues)
-            _unknown_keys(
-                case_row,
+            case_where = f"{where}.cases[{index}]"
+            case_row = _row(
+                item,
+                case_where,
                 {
                     "id", "device", "framework", "venv", "image", "install", "train",
                     "install_args", "train_args", "download", "dataset", "ranks",
                     "parallelism", "timeout_seconds", "seq_len", "finetuning_type",
                 },
-                where,
                 issues,
             )
             case_id = str(case_row.get("id") or "")
             if not case_id:
-                issues.append(_issue(f"{where}.id", "case id is required"))
+                issues.append(_issue(f"{case_where}.id", "case id is required"))
                 continue
             if case_id in seen:
-                issues.append(_issue(f"{where}.id", f"duplicate case id {case_id!r}"))
+                issues.append(_issue(f"{case_where}.id", f"duplicate case id {case_id!r}"))
             seen.add(case_id)
             device = str(case_row.get("device") or "npu")
             framework = str(case_row.get("framework") or "")
             venv = str(case_row.get("venv") or "")
             image_name = str(case_row.get("image") or "") or None
             if device not in DEVICES:
-                issues.append(_issue(f"{where}.device", "unknown device"))
+                issues.append(_issue(f"{case_where}.device", "unknown device"))
             if framework not in FRAMEWORKS:
-                issues.append(_issue(f"{where}.framework", "must be lf or swift"))
+                issues.append(_issue(f"{case_where}.framework", "must be lf or swift"))
             if venv not in venvs:
-                issues.append(_issue(f"{where}.venv", "unknown venv"))
+                issues.append(_issue(f"{case_where}.venv", "unknown venv"))
             if image_name and image_name not in images:
-                issues.append(_issue(f"{where}.image", "unknown image"))
+                issues.append(_issue(f"{case_where}.image", "unknown image"))
             install_name = str(case_row.get("install") or "")
             train_name = str(case_row.get("train") or "")
             install_script = f"{workdir}/{install_name}" if install_name else ""
             train_script = f"{workdir}/{train_name}" if train_name else ""
             if not install_script or not (root / install_script).is_file():
-                issues.append(_issue(f"{where}.install", "install script is missing"))
+                issues.append(_issue(f"{case_where}.install", "install script is missing"))
             if not train_script or not (root / train_script).is_file():
-                issues.append(_issue(f"{where}.train", "train script is missing"))
+                issues.append(_issue(f"{case_where}.train", "train script is missing"))
 
-            download = _mapping(case_row.get("download"), f"{where}.download", issues)
-            _unknown_keys(download, {"hf_repo", "layers"}, f"{where}.download", issues)
+            download = _row(case_row.get("download"), f"{case_where}.download", {"hf_repo", "layers"}, issues)
             hf_repo = str(download.get("hf_repo") or "")
-            layers = _int(download.get("layers", 0), f"{where}.download.layers", issues)
+            layers = _int(download.get("layers", 0), f"{case_where}.download.layers", issues)
             if not hf_repo:
-                issues.append(_issue(f"{where}.download.hf_repo", "hf_repo is required"))
+                issues.append(_issue(f"{case_where}.download.hf_repo", "hf_repo is required"))
 
-            ranks = _int(case_row.get("ranks"), f"{where}.ranks", issues, 1)
-            parallelism = _mapping(case_row.get("parallelism"), f"{where}.parallelism", issues)
-            _unknown_keys(parallelism, {"sp", "ep"}, f"{where}.parallelism", issues)
-            sp = _int(parallelism.get("sp"), f"{where}.parallelism.sp", issues, 1)
-            ep = _int(parallelism.get("ep"), f"{where}.parallelism.ep", issues, 1)
+            ranks = _int(case_row.get("ranks"), f"{case_where}.ranks", issues, 1)
+            parallelism = _row(case_row.get("parallelism"), f"{case_where}.parallelism", {"sp", "ep"}, issues)
+            sp = _int(parallelism.get("sp"), f"{case_where}.parallelism.sp", issues, 1)
+            ep = _int(parallelism.get("ep"), f"{case_where}.parallelism.ep", issues, 1)
             if ranks % sp or (ranks // sp) % ep:
-                issues.append(_issue(where, "ranks/sp/ep do not form a valid parallel plan"))
+                issues.append(_issue(case_where, "ranks/sp/ep do not form a valid parallel plan"))
 
             dataset = str(case_row.get("dataset") or "")
             if not dataset:
-                issues.append(_issue(f"{where}.dataset", "dataset is required"))
+                issues.append(_issue(f"{case_where}.dataset", "dataset is required"))
             cases.append(ModelE2ECase(
                 case_id=case_id,
                 model=model,
@@ -636,8 +533,8 @@ def _load_model_e2e_cases(raw: Any, root: Path, defaults: ModelE2EDefaults,
                 workdir=workdir,
                 install_script=install_script,
                 train_script=train_script,
-                install_args=_strings(case_row.get("install_args"), f"{where}.install_args", issues),
-                train_args=_strings(case_row.get("train_args"), f"{where}.train_args", issues),
+                install_args=_strings(case_row.get("install_args"), f"{case_where}.install_args", issues),
+                train_args=_strings(case_row.get("train_args"), f"{case_where}.train_args", issues),
                 hf_repo=hf_repo,
                 layers=layers,
                 dataset=dataset,
@@ -646,13 +543,13 @@ def _load_model_e2e_cases(raw: Any, root: Path, defaults: ModelE2EDefaults,
                 ep=ep,
                 timeout_seconds=_int(
                     case_row.get("timeout_seconds", defaults.case_timeout_seconds),
-                    f"{where}.timeout_seconds",
+                    f"{case_where}.timeout_seconds",
                     issues,
                     1,
                 ),
                 seq_len=_int(
                     case_row.get("seq_len", defaults.seq_len),
-                    f"{where}.seq_len",
+                    f"{case_where}.seq_len",
                     issues,
                     1,
                 ),
@@ -671,10 +568,8 @@ def classify_test(path: str, frameworks: Iterable[str], families: Iterable[str],
     parts = Path(path).parts
     if path.startswith("tests/adapters/") or framework_set:
         return "adapter"
-    if parts[:2] == ("tests", "models"):
-        if len(parts) == 3:
-            return "core"
-        if len(parts) >= 3 and parts[2] == "modules":
+    if parts[:2] == ("tests", "models") and len(parts) >= 3:
+        if len(parts) == 3 or parts[2] == "modules":
             return "core"
         if len(parts) >= 4 and parts[2] in registered_models and parts[2] not in MODEL_PACKAGES:
             return "model"
@@ -742,18 +637,16 @@ def _scan_tests(root: Path, registered: set[str], venvs: dict[str, VenvSpec],
 def load(root: Path, *, image_refs: dict[str, str] | None = None) -> Catalog:
     """Load catalog.yml, scan tests, and validate all cross references."""
     issues: list[Issue] = []
-    path = root / "scripts" / "ci" / "catalog.yml"
+    path = root / "scripts" / "ci" / "config" / "catalog.yml"
     try:
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
-        raise CatalogError([_issue("scripts/ci/catalog.yml", str(exc))]) from exc
-    document = _mapping(raw, "catalog", issues)
-    _unknown_keys(document, {"schema_version", "resources", "workloads"}, "catalog", issues)
+        raise CatalogError([_issue("scripts/ci/config/catalog.yml", str(exc))]) from exc
+    document = _row(raw, "catalog", {"schema_version", "resources", "workloads"}, issues)
     if document.get("schema_version") != SCHEMA_VERSION:
         issues.append(_issue("schema_version", f"expected {SCHEMA_VERSION}"))
 
-    resources = _mapping(document.get("resources"), "resources", issues)
-    _unknown_keys(resources, {"images", "venvs", "lanes"}, "resources", issues)
+    resources = _row(document.get("resources"), "resources", {"images", "venvs", "lanes"}, issues)
     images = _load_images(resources.get("images"), image_refs or {}, root, issues)
     venvs = _load_venvs(resources.get("venvs"), root, issues)
     lanes = _load_lanes(resources.get("lanes"), images, issues)
@@ -769,11 +662,9 @@ def load(root: Path, *, image_refs: dict[str, str] | None = None) -> Catalog:
                            for lane in lanes.values()):
                     issues.append(_issue("resources.lanes", f"device {device} has no lane for its default image"))
 
-    workloads = _mapping(document.get("workloads"), "workloads", issues)
-    _unknown_keys(workloads, {"pytest", "model_e2e"}, "workloads", issues)
+    workloads = _row(document.get("workloads"), "workloads", {"pytest", "model_e2e"}, issues)
     pytest_workload = _load_pytest(workloads.get("pytest"), venvs, root, issues)
-    model_row = _mapping(workloads.get("model_e2e"), "workloads.model_e2e", issues)
-    _unknown_keys(model_row, {"defaults", "models"}, "workloads.model_e2e", issues)
+    model_row = _row(workloads.get("model_e2e"), "workloads.model_e2e", {"defaults", "models"}, issues)
     defaults = _load_model_e2e_defaults(model_row.get("defaults"), issues)
     cases = _load_model_e2e_cases(
         model_row.get("models"), root, defaults, venvs, images, issues
@@ -830,7 +721,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--output", default="")
     parser.add_argument("--image-ref", action="append", default=[], metavar="NAME=REF")
     args = parser.parse_args(argv)
-    root = Path(args.root).resolve() if args.root else Path(__file__).resolve().parents[2]
+    root = Path(args.root).resolve() if args.root else Path(__file__).resolve().parents[3]
     image_refs: dict[str, str] = {}
     for value in args.image_ref:
         name, separator, ref = value.partition("=")

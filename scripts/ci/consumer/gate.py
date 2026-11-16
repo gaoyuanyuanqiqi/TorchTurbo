@@ -4,13 +4,12 @@
 from __future__ import annotations
 
 import argparse
-import re
 import sys
 from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable
 
-from contracts import (
+from ..contracts.artifacts import (
     ContractError,
     Decision,
     JOB_RESULT_FILENAME,
@@ -25,9 +24,7 @@ from contracts import (
     canonical_json,
     digest,
     load_job_result,
-    load_plan,
     load_plan_artifact,
-    read_json,
     write_json,
 )
 
@@ -57,38 +54,20 @@ def _plan_failures(plan: Plan) -> list[dict[str, Any]]:
     job_ids: set[str] = set()
     step_ids: set[str] = set()
     test_routes: set[tuple[str, str]] = set()
-    pytest_files: dict[str, set[str]] = {
-        "core": set(),
-        "model": set(),
-        "adapter": set(),
-    }
+    pytest_files = {"core": set(), "model": set(), "adapter": set()}
     pytest_routes: Counter[str] = Counter()
     e2e_cases: list[str] = []
     for job in plan.jobs:
         if job.id in job_ids:
             failures.append(_failure("duplicate-job", "duplicate job id", job_id=job.id))
         job_ids.add(job.id)
-        if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", job.id):
-            failures.append(_failure("invalid-job-id", "job id format is invalid", job_id=job.id))
-        if job.kind not in {"pytest", "model_e2e"}:
-            failures.append(_failure("job-kind", f"unknown job kind {job.kind!r}", job_id=job.id))
         if not job.steps:
             failures.append(_failure("empty-job", "job has no steps", job_id=job.id))
-        if any(not reason for reason in job.allowed_skip_reasons):
-            failures.append(_failure("empty-skip-reason", "skip reason must not be empty", job_id=job.id))
-        if job.runtime.ranks < max((step.ranks for step in job.steps), default=0):
-            failures.append(_failure("job-ranks", "runtime ranks are smaller than a step", job_id=job.id))
         for step in job.steps:
             if step.id in step_ids:
                 failures.append(_failure("duplicate-step", "duplicate step id", step_id=step.id))
             step_ids.add(step.id)
-            if step.kind != job.kind:
-                failures.append(_failure("step-kind", "step kind differs from job kind", job_id=job.id, step_id=step.id))
-            if step.ranks > job.runtime.ranks:
-                failures.append(_failure("step-ranks", "step ranks exceed runtime", job_id=job.id, step_id=step.id))
             if isinstance(step.spec, PytestSpec):
-                if job.kind != "pytest":
-                    failures.append(_failure("step-spec-kind", "model_e2e job has pytest spec", job_id=job.id))
                 if step.spec.suite not in pytest_files:
                     failures.append(_failure("pytest-suite", "unknown pytest suite", step_id=step.id))
                     continue
@@ -99,14 +78,8 @@ def _plan_failures(plan: Plan) -> list[dict[str, Any]]:
                     test_routes.add(route)
                     pytest_files[step.spec.suite].add(path)
                     pytest_routes[step.spec.suite] += 1
-            elif isinstance(step.spec, ModelE2ESpec):
-                if job.kind != "model_e2e":
-                    failures.append(_failure("step-spec-kind", "pytest job has model_e2e spec", job_id=job.id))
-                if len(job.steps) != 1:
-                    failures.append(_failure("e2e-steps", "model_e2e job must have one step", job_id=job.id))
-                e2e_cases.append(step.spec.case_id)
             else:
-                failures.append(_failure("step-spec", "unsupported step spec", step_id=step.id))
+                e2e_cases.append(step.spec.case_id)
 
     coverage = plan.coverage
     if coverage.get("jobs") != len(plan.jobs):
@@ -126,10 +99,8 @@ def _plan_failures(plan: Plan) -> list[dict[str, Any]]:
     e2e_coverage = coverage.get("model_e2e")
     if not isinstance(e2e_coverage, dict):
         failures.append(_failure("coverage-e2e", "coverage model_e2e is invalid"))
-    else:
-        covered = e2e_coverage.get("cases")
-        if not isinstance(covered, list) or sorted(covered) != sorted(e2e_cases):
-            failures.append(_failure("coverage-e2e", "coverage E2E cases differ from jobs"))
+    elif sorted(e2e_coverage.get("cases") or []) != sorted(e2e_cases):
+        failures.append(_failure("coverage-e2e", "coverage E2E cases differ from jobs"))
     return failures
 
 
@@ -347,17 +318,6 @@ def decide_artifact(artifact: PlanArtifact) -> Decision:
     )
 
 
-def _load_input(path: Path) -> tuple[Plan | None, PlanArtifact | None]:
-    try:
-        value = read_json(path)
-    except (OSError, ValueError) as exc:
-        raise ContractError(f"cannot read {path}: {exc}") from exc
-    if isinstance(value, dict) and "status" in value and "plan" in value:
-        artifact = load_plan_artifact(path)
-        return (artifact.plan if artifact.status == "ready" else None), artifact
-    return load_plan(path), None
-
-
 def _load_results(path: Path | None) -> list[JobResult]:
     if path is None:
         return []
@@ -402,13 +362,16 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--summary", default="")
     args = parser.parse_args(argv)
     try:
-        plan, artifact = _load_input(Path(args.plan))
-        if artifact is not None and artifact.status != "ready":
+        artifact = load_plan_artifact(Path(args.plan))
+        if artifact.status != "ready":
             decision = decide_artifact(artifact)
         else:
-            if plan is None:
+            if artifact.plan is None:
                 raise ContractError("ready plan artifact has no plan")
-            decision = decide(plan, _load_results(Path(args.results) if args.results else None))
+            decision = decide(
+                artifact.plan,
+                _load_results(Path(args.results) if args.results else None),
+            )
     except (ContractError, OSError) as exc:
         print(f"::error::{exc}", file=sys.stderr)
         return 2

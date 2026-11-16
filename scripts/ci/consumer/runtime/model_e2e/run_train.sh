@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # NPU E2E job:
-#   environment check      - workflow: env_pod.py probe
+#   environment check      - executor: runtime/env.py probe
 #   training orchestration - this script: install -> prepare -> train -> report
-#   environment cleanup    - workflow: env_pod.py cleanup
+#   environment cleanup    - executor: runtime/env.py cleanup
 #
 # Training stages:
 #   1. install    - install torchturbo and model dependencies
@@ -12,8 +12,10 @@
 
 set -uo pipefail
 
-CI_SCRIPTS="${CI_SCRIPTS:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-MODEL_HELPER="$CI_SCRIPTS/e2e_tests/prepare_model.py"
+RUNTIME_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CI_ROOT="$(cd "$RUNTIME_DIR/../.." && pwd)"
+REPO_ROOT="$(cd "$CI_ROOT/../.." && pwd)"
+MODEL_HELPER="$RUNTIME_DIR/model_e2e/prepare_model.py"
 RESULT_JSON="${RESULT_JSON:-/tmp/ci-result.json}"
 GITHUB_OUTPUT="${GITHUB_OUTPUT:-/dev/null}"
 
@@ -32,7 +34,7 @@ export HF_HUB_ETAG_TIMEOUT="${HF_HUB_ETAG_TIMEOUT:-30}"
 export HF_HUB_DOWNLOAD_TIMEOUT="${HF_HUB_DOWNLOAD_TIMEOUT:-120}"
 export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
 
-result() { python3 "$CI_SCRIPTS/report/report_result.py" "$@"; }
+result() { python3 "$CI_ROOT/tools/report.py" "$@"; }
 
 parse_kv() {  # parse_kv <KEY=value lines>
   local key value
@@ -70,7 +72,7 @@ for name in "torch torch_npu numpy triton fla fla_npu transformers llamafactory 
 PROBE
   cat /tmp/after.txt
   if [ "$rc" -eq 0 ]; then
-    python3 "$CI_SCRIPTS/common/env_pod.py" check --file "$TORCH_BEFORE" || rc=1
+    python3 "$CI_ROOT/consumer/runtime/env.py" check --file "$TORCH_BEFORE" || rc=1
   fi
   result phase --file "$RESULT_JSON" --name "$name" \
     --seconds "$(( $(date +%s) - start ))" --rc "$rc"
@@ -84,7 +86,7 @@ cmd_install() {
   # Model install scripts must not mutate shared caches. Strip destructive
   # commands here, in place -- the checkout is disposable, and the script's
   # own relative paths stay valid.
-  python3 "$CI_SCRIPTS/e2e_tests/patch_run_scripts.py" install --src "$INSTALL_SCRIPT" \
+  python3 "$RUNTIME_DIR/model_e2e/patch_run_scripts.py" install --src "$INSTALL_SCRIPT" \
     || return 1
   pip_step "模型依赖 \`${INSTALL_SCRIPT}\`" "$INSTALL_SCRIPT" "$INSTALL_ARGS"
 }
@@ -128,7 +130,7 @@ cmd_prepare() {
       echo "::error::Plan 里 ${CASE_ID} 没有 cards/sp/ep，无法确定卡数与并行策略"
       return 1 ;;
   esac
-  if ! configured=$(python3 "$CI_SCRIPTS/e2e_tests/patch_run_scripts.py" config \
+  if ! configured=$(python3 "$RUNTIME_DIR/model_e2e/patch_run_scripts.py" config \
       --src "$TRAIN_SCRIPT" --cards "$PLAN_CARDS" --layers "${LAYERS:-0}" \
       --sp "$PLAN_SP" --ep "$PLAN_EP"); then
     echo "::error::引擎配置改写失败（cards=$PLAN_CARDS sp=$PLAN_SP ep=$PLAN_EP）"
@@ -246,7 +248,7 @@ run_supervised() {  # run_supervised <launch script> <log> [launch args]
 
 prefer_cached_dataset() {
   local root cache hub key hit
-  root=$(cd "$CI_SCRIPTS/../.." && pwd)
+  root="$REPO_ROOT"
   cache="${HF_DATASETS_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}/datasets}"
   hub=$(python3 - "$root/dataset/dataset_info.json" "$DATASET" <<'PY'
 import json
@@ -274,7 +276,7 @@ cmd_train() {
     SEQ_LEN FINETUNING_TYPE TT_CONFIG="$PREP_TT_CONFIG"
   # A smoke run must not fill the pod's overlay with checkpoints or tb events.
   # Runs after preprocess, which reads the unpatched launcher for TT_CONFIG.
-  python3 "$CI_SCRIPTS/e2e_tests/patch_run_scripts.py" train --src "$TRAIN_SCRIPT" \
+  python3 "$RUNTIME_DIR/model_e2e/patch_run_scripts.py" train --src "$TRAIN_SCRIPT" \
     || return 1
   run_supervised "$TRAIN_SCRIPT" /tmp/train.log "$TRAIN_ARGS"
   local rc=$? elapsed="$TRAIN_ELAPSED" last_loss="$TRAIN_LAST_LOSS"

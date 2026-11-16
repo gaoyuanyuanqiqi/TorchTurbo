@@ -1,214 +1,175 @@
-# CI 辅助脚本
+# CI 架构与本地校验
 
-原来塞在 workflow heredoc 里的逻辑都搬到了这里。每个文件都能在本机直接跑——
-这正是目的：之前的写法只能靠 push 上去、等一个 NPU pod 才能验证。
+CI 只保留一条数据流：
 
-目录按 CI 阶段划分，公共能力单独下沉：
+```text
+lint -> Producer -> PlanArtifact -> Consumer -> JobResult -> Gate
+```
+
+对应的代码边界：
+
+```text
+Planner (Catalog + Policy) -> PlanArtifact
+Executor (one Job)         -> JobResult
+Gate (Plan + JobResults)   -> Decision
+```
+
+Planner 负责选择工作，Executor 不读取 Catalog/Policy，Gate 不重新选测。所有跨阶段
+输入都是带有 `schema_version` 和内容摘要的 JSON artifact。
+
+## 目录
 
 ```text
 scripts/ci/
-  lint_select/   lint 阶段
-  e2e_tests/     NPU 模型用例：取模型、并行策略、训练监督
-  image/         基础镜像构建
-  common/        pod 环境
-  report/        结果汇总与计时
-  bin/           venv 内训练脚本使用的工具 wrapper
-  catalog.yml    images / venvs / lanes / workloads 的静态事实
-  policies.yml   pull_request / nightly 的运行范围
-  contracts.py   Plan / JobResult / Decision 的可序列化契约
-  catalog.py     Catalog loader 与 test/E2E facts 扫描
-  test_scan.py   pytest AST 事实扫描（marker / device / rank / env family）
-  policy.py      Policy loader 与跨 Catalog 校验
-  change_scope.py  文档/文本变更分类
-  planner.py     Catalog + Policy -> PlanArtifact
-  executor.py    Plan 中的一个 Job -> JobResult
-  gate.py        Plan + JobResult -> Decision
-  venv_manager.py  按 Plan 中自包含的 venv 规格复用环境
-  tests/         Planner / Executor / Gate / Catalog 契约测试
+  config/
+    catalog.yml       镜像、venv、runner lane、pytest 与 E2E 静态事实
+    policies.yml      pull_request / nightly 的工作范围
+    envs/             Python 依赖清单
+  contracts/
+    artifacts.py      PlanArtifact / JobResult / Decision 契约与编解码
+  producer/
+    catalog.py        Catalog loader、测试扫描与 E2E case 解析
+    policy.py         Policy loader 与配置引用校验
+    planner.py        Catalog + Policy -> PlanArtifact
+    scan.py           pytest AST 事实：device、rank、framework、model family
+    change_scope.py   文档变更分类
+  consumer/
+    executor.py       执行 Plan 中的一个 Job -> JobResult
+    gate.py           Plan + JobResult -> Decision
+    runtime/
+      env.py          CPU/NPU/GPU 环境探针、torch guard、清理
+      venv.py         Plan 中自包含 venv 的创建与复用
+      bin/torchrun    训练脚本使用的 torchrun wrapper
+      model_e2e/      模型准备、脚本修补、训练 orchestration
+  tools/
+    lint.py           通用 linter + 仓库级 CI 契约检查
+    image.py          基础镜像判断、构建、校验、发布与解析
+    report.py         CI 计时与模型 E2E summary
+  tests/              contracts / planner / executor / gate / catalog 测试
 ```
 
-正式路径只有一条：`lint -> Planner -> PlanArtifact -> Executor -> JobResult -> Gate`。
-Planner 读取 `catalog.yml` + `policies.yml`，生成按 CPU/NPU/GPU 聚合的 matrix；
-Executor 只消费 Plan 中的一个 Job，不读取 Catalog 或 Policy；Gate 只消费
-Plan + JobResult，不重新选测。PR 固定跑全量 core pytest 加一个模型 guard，
-nightly 跑所有 pytest suite 和所有 E2E case。
+## 各阶段职责
 
-纯文档 PR（`docs/**`、`*.md`、`*.rst`、`*.adoc`、`LICENSE`、`NOTICE`）
-会生成合法的零 Job Plan：跳过 lint、镜像解析、pytest 和模型 Job，只保留
-Plan/Gate 这两个轻量步骤，让必过检查仍然能给出明确结论。分类失败或无法读取
-diff 时按代码变更处理。
+| 阶段 | 输入 | 输出 | 不做什么 |
+|---|---|---|---|
+| lint | 源码、workflow、Catalog | exit code + annotations | 不选择用例 |
+| Planner | Catalog、Policy、change scope、镜像覆盖 | `plan.json` PlanArtifact | 不安装环境、不执行用例 |
+| Executor | PlanArtifact + 一个 `job_id` | `job-result.json` | 不读取 Catalog/Policy |
+| Gate | PlanArtifact + 全部 JobResult | `decision.json` | 不重新选测 |
 
-通用规则交给 Ruff（Python）、`shellcheck`、`actionlint` 和 `hadolint`；自定义
-检查只保留通用工具看不到的仓库契约：job 依赖图、Catalog 事实和 pytest marker。
+Planner 会按 CPU/NPU/GPU 输出 matrix。matrix 项只包含执行所需字段：
+`job_id`、`image_ref`、`runner_variable`、`runner`、`timeout_minutes`，不嵌入完整 Job。
 
-**按阶段划分，一个入口回答一个阶段的问题**：
+Executor 在真正执行前先写一份 `infra_error/executor-incomplete` 占位结果，结束时原子
+覆盖。即使进程被外部杀死，Gate 仍能区分“缺结果”和“执行未完成”。
 
-| 路径 | 回答的问题 | 子命令 |
-|---|---|---|
-| `planner.py` | Catalog + Policy 这轮要跑什么？ | `--policy` / `--verify` / `--github-output` / `--image-ref` / `--target-job` |
-| `executor.py` | Plan 中一个 Job 怎么执行并留下证据？ | `--plan + --job-id` / `--dry-run` / `--record-skip` |
-| `gate.py` | Plan 与 JobResult 是否完整且一致？ | `--plan` / `--results` / `--summary` |
-| `lint_select/lint_check.py` | 静态体检总入口；通用检查先跑，Turbo 契约后跑 | 无参数 = 全跑 / `--only NAME` |
-| `venv_manager.py` | env 依赖装在哪、何时复用？ | 被 `executor.py` 调用 |
-| `e2e_tests/prepare_model.py` | 模型是否完整、能否取到减层权重？ | `fetch` / `probe` |
-| `e2e_tests/run_train.sh` | 一个已解析的模型 Job 怎么执行？ | `case`（内部 `run`） |
-| `common/env_pod.py` | 这台 pod 现在是什么状态？ | `probe` / `check` / `cleanup` |
-| `image/build_image.py` | 基础镜像该不该建 / 怎么建 / 发什么引用 / SWR 上传链路是否可用 | `env` / `tag` / `build` / `verify` / `selftest` / `publish` / `resolve` / `hadolint` / `summary` / `cleanup` |
-| `report/report_gate.py` | 本轮 CI 排队和执行了多久？ | `timing` |
-| `report/report_result.py` | 模型 E2E 事实 → 人看的摘要 | `init` / `set` / `phase` / `report` / `notice` |
+Gate 校验结果完整性、runtime/spec 摘要、pytest 证据、E2E case 证据和 skip allowlist。
+缺少结果、重复结果、额外结果或伪造的 spec 都会判红。
 
-### lint：通用工具先行，Turbo 契约后置
+## 运行范围
 
-每个检查返回 `list[Problem]`，问题带 `path` / `line` / `message`。驱动器按顺序
-跑完**全部**检查再汇总，所以前一项失败不会掩盖后面的结果；本地和 CI 调的是同一个
-入口。检查之间不 import 本仓代码，只有少数跨文件契约会主动调用脚本。
+范围只由 `config/policies.yml` 决定：
 
-`lint_check.py` 只负责 CLI 和汇总；`lint_common_check.py` 依次跑 Ruff、shellcheck、
-actionlint、hadolint；`lint_turbo_check.py` 再跑 `contract`、`catalog`、`markers`。
-通用规则不在这里重新实现。
+- `pull_request`：所有 core pytest，一个模型 guard；模型 pytest 和 adapter pytest 不跑。
+- `nightly`：所有 pytest suite 和所有 E2E case。
+- 纯文档变更：生成零 Job Plan，不进入 pytest、NPU 或模型执行。
 
-`CHECKS` 是 `Check(name, description, function)` 的元组。加一个 Turbo 检查 = 写函数 +
-在 `lint_turbo_check.py` 的 `CHECKS` 里加一行：
+纯文档包括 `docs/**`、`*.md`、`*.rst`、`*.adoc`、`LICENSE`、`NOTICE`。空 diff、
+分类失败或读取失败一律按代码变更处理。
 
-```python
-def check_tabs() -> list[Problem]:
-    return [Problem("src", "tab in indentation", line)
-            for line in range(1, 2)]
+## 扩展点
 
+### 增加镜像或 runner lane
 
-# Then add one row to the CHECKS tuple:
-Check("tabs", "indentation uses spaces", check_tabs)
-```
+在 `config/catalog.yml` 的 `resources.images` 与 `resources.lanes` 增加条目。同一个
+device 只能有一个 default image；Planner 根据 `device + image + ranks` 选择容量最小
+且足够的 lane，因此 2/4/8/16 卡资源不需要在 consumer 中写分支。
 
-`--list` 和 `--only` 都从 `CHECKS` 读；`--only` 可重复。
+### 增加 venv
 
-```bash
-python3 scripts/ci/lint_select/lint_check.py --only ruff
-```
+在 `resources.venvs` 增加 Python 版本和 requirements 文件；需要继承时使用 `extends`。
+Catalog 会解析继承链、检查循环引用，并把依赖文件内容计入 venv digest。
 
-输出是编译器格式，可以直接点进编辑器；GitHub Actions 里同时发 annotation：
+### 增加 pytest suite 或 adapter
+
+pytest 文件的事实由 `producer/scan.py` 从源码静态扫描，不需要 import 测试模块。suite
+分类、family/framework venv 选择和显式 override 位于 `producer/catalog.py`；Policy 只
+决定 `all` 或 `none`。新增 adapter 时同时补 marker/device 事实和所需 override。
+
+### 增加模型 E2E case
+
+在 `workloads.model_e2e.models.<model>.cases` 增加 case，声明 framework、venv、安装脚本、
+训练脚本、模型仓库、数据集、rank 与 SP/EP。PR 默认只选
+`bailing_hybrid-lf-sft`；nightly 自动选择全部 case。新增 case 不修改 Executor。
+
+一个 case 的步骤仍是：
 
 ```text
-src/torchturbo/utils/torch_utils.py:133: invalid syntax
+install -> prepare model/config -> train -> report
 ```
 
-退出码：`0` 通过 / `1` 有问题 / `2` 参数用错或工具下载失败。
-
-外部工具（actionlint / hadolint / shellcheck）优先走 PATH、`/tmp` 或
-`TORCHTURBO_LINT_TOOLS`；缺失时按文件里固定的版本从 release 下载，不使用
-`curl | bash`。Ruff 由 CI 的 pip 步骤固定版本安装。
-
-### 契约自检
-
-Catalog、Policy、Planner、Executor 和 Gate 的行为由 `scripts/ci/tests` 固定：
+## 常用命令
 
 ```bash
+# 配置与测试扫描事实
+python3 -m scripts.ci.producer.catalog check
+python3 -m scripts.ci.producer.policy check
+
+# PR / nightly / docs-only Plan 均可构建
+python3 -m scripts.ci.producer.planner --verify
+
+# 静态检查
+python3 -m scripts.ci.tools.lint
+python3 -m scripts.ci.tools.lint --only contract
+python3 -m scripts.ci.tools.lint --only shellcheck
+
+# 生成 PlanArtifact 和平台 matrix
+python3 -m scripts.ci.producer.planner \
+  --policy pull_request \
+  --output /tmp/plan.json \
+  --github-output /tmp/github-output
+
+# 单 Job 诊断：Plan 中只保留一个 Job
+python3 -m scripts.ci.producer.planner \
+  --policy pull_request \
+  --target-job pytest-core-npu-npu-default-default \
+  --output /tmp/plan.json \
+  --github-output /tmp/github-output
+
+# 执行一个 Job
+python3 -m scripts.ci.consumer.executor \
+  --plan /tmp/plan.json \
+  --job-id <job-id> \
+  --output /tmp/ci-result/job-result.json
+
+# 平台维护窗口：写入结构化 skip 结果
+python3 -m scripts.ci.consumer.executor \
+  --plan /tmp/plan.json \
+  --job-id <job-id> \
+  --record-skip maintenance \
+  --skip-message "NPU maintenance window" \
+  --output /tmp/ci-result/job-result.json
+
+# 判定完整 Plan
+python3 -m scripts.ci.consumer.gate \
+  --plan /tmp/plan.json \
+  --results /tmp/ci-results \
+  --output /tmp/decision.json \
+  --summary /tmp/summary.md
+
+# 环境与模型目录诊断
+python3 -m scripts.ci.consumer.runtime.env probe --device cpu --file /tmp/torch.json
+python3 -m scripts.ci.consumer.runtime.model_e2e.prepare_model probe \
+  --dir /root/.cache/models/<repo> [--layers N]
+
+# 全部 CI 单元与契约测试
 python3 -m pytest scripts/ci/tests -q
 ```
 
-模型 job 分为 `environment check -> training orchestration -> environment cleanup`。
-训练编排只消费 Planner 已解析的单个 `ModelE2ESpec`，依次执行
-`install -> prepare -> train -> report`；资源 lane、镜像和并行参数都来自 Plan。
-
-被下面这些 workflow 调用，`.github/workflows` 里的入口只负责声明输入：
-
-```
-ascend-pr.yml       唯一入口  plan{lint,image,Planner} -> {cpu,npu matrix} -> gate
-                    mode=pr（core pytest + 1 model guard）
-                    mode=full（全量 pytest + 全量 E2E）；可被 nightly 复用
-                    target_job=<job-id> 只保留一个 Job，供单点诊断
-ascend-manual.yml   手动单 Job：复用主 workflow，Planner 只保留 target_job
-ascend-image.yml    构建基础镜像（**只手动 dispatch**）
-ascend-nightly.yml  全量 nightly 入口（schedule 暂注释，只支持手动 dispatch）
-catalog.yml         images / venvs / lanes / pytest / E2E 的静态事实
-policies.yml        pull_request / nightly 的选择范围
-pytest.ini          测试根 / 导入路径 / marker 契约
-```
-
-`plan / cpu / npu / gate` 四个 job **内联**在 `ascend-pr.yml`。
-`cpu` 与 `npu` 各自按 Plan 的 matrix 展开；NPU pytest 与模型 E2E 使用同一套
-Executor，不再复制 job wiring。`ascend-nightly.yml` 只调用这个入口，不复制 job。
-
-yaml 里只留「输什么、调哪个脚本」，超过 10 行的 bash 一律下沉到这里。
-除语法高亮之外的好处是 **shellcheck / actionlint 能看**，而且改一行能在本机验。
-
-### 合并与不合并的边界
-
-合并前先问一句：**它们是不是在回答同一个问题？**
-
-| 合并 | 原来的问题 |
-|---|---|
-| `model_cache.sh` + `hf_fetch.py` + `flash_trim.py` → `prepare_model.py fetch` | 三个都在回答「模型能不能用」，拆开后 probe 与 fetch 对「什么算完整」各写一遍 |
-| `plan_parallel.py` → Plan runtime | 卡数与 sp/ep 由 Catalog/Planner 固化，不再从 runner 标签或 yaml 推断 |
-| `supervise_train.sh` → `run_train.sh` 的 `run_supervised()` | 监督逻辑只服务一次训练启动，独立文件增加参数与临时 `KEY=value` 往返 |
-| `verify_env.py` + `torch_guard.sh` + `npu_cleanup.sh` → `env_pod.py` | 三个都在回答「pod 现在什么状态」（体检 / 防破坏 / 复原） |
-| `lint_checks.py` + `lint.sh` → `lint_check.py` + 两个检查模块 | 通用工具和仓库契约分开，入口只做汇总 |
-
-反过来，下面这些**不合并**，因为它们回答的是不同的问题：
-
-* `planner.py`（选什么）与 `gate.py`（算不算过）—— 选错和判错是两类故障，
-  合一起会让门禁自己变成黑盒。
-* `report_result.py`（事实 → 文字）—— 其他脚本都向它写事实，它不该反过来依赖任何人。
-
-生产路径的范围语义只放在 `policies.yml`：`mode=pr|full` 只负责选择 policy，
-不再根据 diff 或标签改选测集合。Manual 使用同一份 policy，再通过
-`target_job` 缩减为一个 Job，不维护第二套选测规则。
-
 ## 约定
 
-* 人看的日志走 **stderr**，机器读的 `KEY=value` 走 `--output`。调用方把它追加到
-  `$GITHUB_OUTPUT`，或者直接 `source`。
-* 事实写进**文件**，不写进 step outputs。step outputs 在步骤失败时是空的，
-  而失败的 run 恰恰是唯一会被人翻出来看的那种。
-* JobResult 在测试开始前先写一份 `infra_error` 占位结果，结束时原子覆盖；
-  即使 executor 被外部杀掉，Gate 也能看到明确的 `executor-incomplete`。
-* 跳过必须带原因，而且原因必须在 Plan 的 allowlist 内。JobResult 缺结果、
-  原因不合法或跳过却带步骤证据，Gate 都判红。
-
-## 本机校验
-
-```bash
-python3 scripts/ci/lint_select/lint_check.py           # 全项静态体检
-python3 scripts/ci/lint_select/lint_check.py --only contract # 只查 job 图与输出契约
-python3 scripts/ci/lint_select/lint_check.py --only shellcheck   # 只查 shell
-python3 scripts/ci/catalog.py check                    # 配置与扫描事实一致
-python3 scripts/ci/planner.py --verify                 # PR/nightly Plan 均可构建
-python3 scripts/ci/planner.py --policy pull_request --change-scope docs_only \
-  --output /tmp/docs-plan.json                         # 零 Job Plan
-python3 -m pytest scripts/ci/tests -q                  # 契约/Planner/Executor/Gate
-
-bash -n scripts/ci/bin/* scripts/ci/e2e_tests/*.sh
-
-# 生成 PlanArtifact 与平台 matrix（不需要网络）
-python3 scripts/ci/planner.py --policy pull_request --output /tmp/plan.json \
-  --github-output /tmp/github-output
-
-# 单点诊断：Plan 只保留一个 Job，其他平台 matrix 为空
-python3 scripts/ci/planner.py --policy pull_request --output /tmp/plan.json \
-  --target-job pytest-core-npu-npu-default-default \
-  --github-output /tmp/github-output
-
-# 只看一个 Job 的执行边界，不安装依赖
-python3 scripts/ci/executor.py --plan /tmp/plan.json --job-id <job-id> --dry-run
-
-# 核心 pytest 会创建 venv 并安装依赖；模型 Job 会启动训练
-python3 scripts/ci/executor.py --plan /tmp/plan.json --job-id <job-id> \
-  --output /tmp/ci-result/job-result.json
-
-# 汇总 Plan 与所有 JobResult
-python3 scripts/ci/gate.py --plan /tmp/plan.json --results /tmp/ci-results \
-  --output /tmp/decision.json --summary /tmp/summary.md
-
-# 装依赖前后 torch 有没有被换掉
-python3 scripts/ci/common/env_pod.py probe --device cpu --file /tmp/t.json
-python3 scripts/ci/common/env_pod.py check --device cpu --file /tmp/t.json
-
-# 模型目录完不完整（不需要网络；--layers N 同时校验减层结果）
-python3 scripts/ci/e2e_tests/prepare_model.py probe --dir /root/.cache/models/<repo> \
-  [--layers N]
-
-# 全量小模型 / 减层大模型（0 = 全量；N = 只保留前 N 层）
-python3 scripts/ci/e2e_tests/prepare_model.py fetch --repo Qwen/Qwen3.5-2B --layers 0
-python3 scripts/ci/e2e_tests/prepare_model.py fetch --repo Qwen/Qwen3.5-35B-A3B --layers 4
-
-```
+- 人读日志走 stderr；机器读取的 `KEY=value` 走文件或显式输出。
+- 事实写入文件，不依赖 step output；失败运行时 step output 往往为空。
+- skip 必须带原因，且原因必须出现在 Plan 的 `allowed_skip_reasons` 中。
+- 静态检查先跑通用工具，再跑仓库契约：`ruff`、`shellcheck`、`actionlint`、
+  `hadolint`、workflow 拓扑、Catalog、pytest marker。

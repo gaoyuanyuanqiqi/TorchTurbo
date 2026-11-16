@@ -1,20 +1,20 @@
 from __future__ import annotations
 
-import json
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
-import executor
-from contracts import (
+from scripts.ci.consumer import executor
+from scripts.ci.contracts.artifacts import (
     ModelE2ESpec,
     PytestSpec,
     build_plan,
+    build_plan_artifact,
     load_job_result,
     write_json,
 )
-from venv_manager import Venv
+from scripts.ci.consumer.runtime.venv import Venv
 
 
 def _fake_venv(tmp_path: Path, job) -> Venv:
@@ -272,22 +272,6 @@ def test_pytest_command_uses_only_plan_evidence(tmp_path: Path, pr_plan) -> None
     assert spec.marker in command
 
 
-def test_cli_dry_run_prints_job_description(tmp_path: Path, capsys, pr_plan) -> None:
-    plan_path = tmp_path / "plan.json"
-    write_json(plan_path, pr_plan.to_dict())
-    job = pr_plan.jobs[0]
-
-    assert executor.main([
-        "--plan", str(plan_path), "--job-id", job.id, "--dry-run",
-    ]) == 0
-
-    value = json.loads(capsys.readouterr().out)
-    assert value["plan_id"] == pr_plan.plan_id
-    assert value["job_id"] == job.id
-    assert value["kind"] == job.kind
-    assert len(value["steps"]) == len(job.steps)
-
-
 def test_cli_record_skip_writes_result_file(tmp_path: Path, pr_plan) -> None:
     plan_path = tmp_path / "plan.json"
     output_path = tmp_path / "artifacts" / "job-result.json"
@@ -297,7 +281,9 @@ def test_cli_record_skip_writes_result_file(tmp_path: Path, pr_plan) -> None:
         if item.runtime.device == "npu" and item.kind == "pytest"
     )
     plan = _plan_with_allowed_skip(pr_plan, job.id, "maintenance")
-    write_json(plan_path, plan.to_dict())
+    write_json(plan_path, build_plan_artifact(
+        policy=plan.policy, source=plan.source, plan=plan
+    ).to_dict())
 
     assert executor.main([
         "--plan", str(plan_path),

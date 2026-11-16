@@ -22,7 +22,7 @@ INSTALL_SCHEMA = "2"
 class VenvDefinition(Protocol):
     name: str
     python: str
-    requirements: str | tuple[str, ...]
+    requirements: tuple[str, ...]
     overrides: tuple[str, ...]
     extends: str | None
     constraints: str
@@ -50,16 +50,11 @@ class VenvManager:
     """Build or reuse one venv per (env definition, device) pair."""
 
     def __init__(self, root: Path, cache_root: Path, device: str,
-                 log_path: Path,
-                 specs: Mapping[str, VenvDefinition] | None = None) -> None:
+                 log_path: Path, specs: Mapping[str, VenvDefinition]) -> None:
         self.root = root
         self.cache_root = cache_root
         self.device = device
         self.log_path = log_path
-        if specs is None:
-            from catalog import load as load_catalog
-
-            specs = load_catalog(root).envs
         self.specs = dict(specs)
         self._memory: dict[str, Venv] = {}
 
@@ -109,8 +104,8 @@ class VenvManager:
         # dependency changes.
         for relative in (
             Path("pyproject.toml"),
-            Path("scripts/ci/venv_manager.py"),
-            Path("scripts/ci/common/env_pod.py"),
+            Path("scripts/ci/consumer/runtime/venv.py"),
+            Path("scripts/ci/consumer/runtime/env.py"),
         ):
             path = self.root / relative
             digest.update(f"file={relative.as_posix()}\n".encode())
@@ -151,7 +146,7 @@ class VenvManager:
         if self.device == "cpu":
             self._pip(venv, ["install", f"torch=={CPU_TORCH_VERSION}"])
         self._run(
-            [str(venv.python), str(self.root / "scripts/ci/common/env_pod.py"),
+            [str(venv.python), str(self.root / "scripts/ci/consumer/runtime/env.py"),
              "probe", "--device", self.device,
              "--file", str(target / "torch-before.json")],
             cwd=self.root, environment=environment,
@@ -169,7 +164,7 @@ class VenvManager:
         self._pip(venv, ["install", "--no-build-isolation", "--no-deps",
                          "-e", str(self.root)])
         self._run(
-            [str(venv.python), str(self.root / "scripts/ci/common/env_pod.py"),
+            [str(venv.python), str(self.root / "scripts/ci/consumer/runtime/env.py"),
              "check", "--device", self.device,
              "--file", str(target / "torch-before.json")],
             cwd=self.root, environment=environment,
@@ -251,13 +246,5 @@ def _requirement_files(path: Path) -> list[Path]:
 
 
 def _requirement_paths(spec: VenvDefinition) -> tuple[str, ...]:
-    values = (spec.requirements, *spec.overrides)
-    paths: list[str] = []
-    for value in values:
-        if isinstance(value, str):
-            if value:
-                paths.append(value)
-        else:
-            paths.extend(value)
-    return tuple(paths)
+    return (*spec.requirements, *spec.overrides)
 

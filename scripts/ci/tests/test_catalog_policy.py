@@ -6,8 +6,12 @@ from pathlib import Path
 import pytest
 import yaml
 
-from catalog import Catalog, counts
-from policy import PolicyError, load as load_policy, validate as validate_policy
+from scripts.ci.producer.catalog import Catalog, counts
+from scripts.ci.producer.policy import (
+    PolicyError,
+    load as load_policy,
+    validate as validate_policy,
+)
 
 
 def test_catalog_snapshot(catalog: Catalog) -> None:
@@ -68,10 +72,9 @@ def test_extends_is_expanded_for_plan_execution(catalog: Catalog) -> None:
     venv = catalog.venvs["qwen4_exp_swift"]
     assert venv.extends == "swift"
     assert venv.requirements == (
-        "scripts/ci/envs/swift.txt",
-        "scripts/ci/envs/qwen4_exp_swift.txt",
+        "scripts/ci/config/envs/swift.txt",
     )
-    assert venv.overrides == ("scripts/ci/envs/swift_overrides.txt",)
+    assert venv.overrides == ("scripts/ci/config/envs/swift_overrides.txt",)
 
 
 def test_pull_request_policy_is_fixed_scope(pr_policy) -> None:

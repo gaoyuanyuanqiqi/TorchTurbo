@@ -6,14 +6,13 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
-CI_DIR = ROOT / "scripts" / "ci"
-if str(CI_DIR) not in sys.path:
-    sys.path.insert(0, str(CI_DIR))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from catalog import Catalog, load as load_catalog  # noqa: E402
-from contracts import Source  # noqa: E402
-from planner import build, source_for  # noqa: E402
-from policy import Policy, load as load_policy  # noqa: E402
+from scripts.ci.contracts.artifacts import Source  # noqa: E402
+from scripts.ci.producer.catalog import Catalog, load as load_catalog  # noqa: E402
+from scripts.ci.producer.planner import build, source_for  # noqa: E402
+from scripts.ci.producer.policy import Policy, load as load_policy  # noqa: E402
 
 
 @pytest.fixture(scope="session")
@@ -37,7 +36,7 @@ def source(repo_root: Path) -> Source:
 
 
 def _policy(name: str) -> Policy:
-    return load_policy(CI_DIR / "policies.yml", name)
+    return load_policy(ROOT / "scripts" / "ci" / "config" / "policies.yml", name)
 
 
 @pytest.fixture(scope="session")

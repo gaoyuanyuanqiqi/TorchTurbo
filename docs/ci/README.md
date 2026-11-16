@@ -1,19 +1,18 @@
 # TorchTurbo CI
 
-The current CI architecture and local validation commands live in
+Current architecture and local validation commands:
 [`scripts/ci/README.md`](../../scripts/ci/README.md).
 
 The execution path is:
 
 ```text
-lint -> Planner -> PlanArtifact -> Executor -> JobResult -> Gate
+lint -> Producer -> PlanArtifact -> Consumer -> JobResult -> Gate
 ```
 
-- `scripts/ci/catalog.yml` declares images, venvs, lanes, pytest suites, and
-  model E2E cases.
-- `scripts/ci/policies.yml` selects the pull-request or nightly scope.
-- `.github/workflows/ascend-pr.yml` is the main PR/workflow-call entry.
-- `.github/workflows/ascend-manual.yml` runs one exact Plan job through the
-  same reusable workflow.
+- `scripts/ci/config/catalog.yml` declares images, venvs, runner lanes, pytest
+  facts, and model E2E cases.
+- `scripts/ci/config/policies.yml` selects the pull-request or nightly scope.
+- `.github/workflows/ascend-pr.yml` is the main PR and reusable workflow entry.
+- `.github/workflows/ascend-manual.yml` reduces the normal Plan to one exact job.
 - `.github/workflows/ascend-nightly.yml` reuses the main workflow with the
   nightly policy.

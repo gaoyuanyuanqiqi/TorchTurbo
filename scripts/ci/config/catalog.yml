@@ -16,25 +16,24 @@ resources:
   venvs:
     default:
       python: "3.11"
-      requirements: [scripts/ci/envs/default.txt]
+      requirements: [scripts/ci/config/envs/default.txt]
       constraints: auto
     qwen4_exp:
       python: "3.11"
-      requirements: [scripts/ci/envs/qwen4_exp.txt]
+      requirements: [scripts/ci/config/envs/qwen4_exp.txt]
       constraints: auto
     lf:
       python: "3.11"
-      requirements: [scripts/ci/envs/lf.txt]
+      requirements: [scripts/ci/config/envs/lf.txt]
       constraints: auto
     swift:
       python: "3.11"
-      requirements: [scripts/ci/envs/swift.txt]
-      overrides: [scripts/ci/envs/swift_overrides.txt]
+      requirements: [scripts/ci/config/envs/swift.txt]
+      overrides: [scripts/ci/config/envs/swift_overrides.txt]
       constraints: auto
     qwen4_exp_swift:
       python: "3.11"
       extends: swift
-      requirements: [scripts/ci/envs/qwen4_exp_swift.txt]
       constraints: auto
 
   lanes:

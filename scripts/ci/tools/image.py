@@ -4,7 +4,7 @@
 
 为什么全在这里而不是写在 yaml 里：这些判断有过实测依据（见每段注释），
 写在 `run: |` 里既不能本地跑、也过不了 shellcheck，而改一行 yaml 就要推一次
-才能验证。搬出来之后 `python3 scripts/ci/image/build_image.py tag --dry-run` 就能复现。
+才能验证。搬出来之后 `python3 -m scripts.ci.tools.image tag --dry-run` 就能复现。
 
 子命令（对应 workflow 的步骤）：
 
@@ -12,7 +12,6 @@
     tag       ③ 内容 tag = `base-<年周>-c<8位哈希>`；同时回答「要不要建」
     build     ⑥ 构建并推送，产出 digest
     verify    ⑦ 回读 manifest，确认是 Docker v2s2 而不是 OCI
-    selftest  手动验证 SWR 凭证、blob 上传和 manifest 格式
     publish   ⑧ 把引用写成 artifact（PR 侧靠它找镜像）
     resolve   被 PR/nightly 调用：override → artifact → 回退
     summary   ⑨ 汇总到 Job Summary
@@ -27,9 +26,6 @@ tag 为什么是内容派生：同一个 Dockerfile 永远算出同一个 tag，
 from __future__ import annotations
 
 import argparse
-import base64
-import getpass
-import gzip
 import hashlib
 import io
 import json
@@ -37,9 +33,7 @@ import os
 import shutil
 import subprocess
 import sys
-import time
 import urllib.error
-import urllib.parse
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -138,128 +132,6 @@ def _manifest(registry: str, repo: str, tag: str) -> dict | None:
         return None
     except (urllib.error.URLError, ValueError, OSError):
         return None
-
-
-# ---------------------------------------------------------------- SWR selftest
-def _http(method: str, url: str, *, token: str = "", data: bytes | None = None,
-          headers: dict | None = None, timeout: int = 60):
-    hdrs = dict(headers or {})
-    if token:
-        hdrs["Authorization"] = f"Bearer {token}"
-    req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.status, resp.headers, resp.read()
-    except urllib.error.HTTPError as exc:
-        return exc.code, exc.headers, exc.read()
-    except (urllib.error.URLError, OSError) as exc:
-        return 0, {}, str(exc).encode()
-
-
-def _token(host: str, repo: str, auth: str) -> str:
-    url = (f"https://{host}/swr/auth/v2/registry/auth/?service=dockyard"
-           f"&scope=repository:{repo}:push,pull")
-    status, _, body = _http("GET", url, headers={"Authorization": f"Basic {auth}"})
-    try:
-        return json.loads(body or b"{}").get("token", "") if status == 200 else ""
-    except ValueError:
-        return ""
-
-
-def _upload(host: str, repo: str, token: str, media: str, data: bytes) -> dict:
-    digest = f"sha256:{hashlib.sha256(data).hexdigest()}"
-    base = f"https://{host}/v2/{repo}"
-    start = time.monotonic()
-    status, headers, body = _http("POST", f"{base}/blobs/uploads/", token=token)
-    if status != 202 or not headers.get("Location"):
-        raise RuntimeError(f"start upload failed: HTTP {status} {body[:160]!r}")
-    location = urllib.parse.urljoin(f"https://{host}", headers["Location"])
-    status, headers, body = _http(
-        "PATCH", location, token=token, data=data, timeout=600,
-        headers={"Content-Type": "application/octet-stream"},
-    )
-    if status not in (202, 204):
-        raise RuntimeError(f"upload failed: HTTP {status} {body[:160]!r}")
-    location = urllib.parse.urljoin(f"https://{host}", headers.get("Location") or location)
-    sep = "&" if "?" in location else "?"
-    status, _, body = _http(
-        "PUT", f"{location}{sep}{urllib.parse.urlencode({'digest': digest})}",
-        token=token, timeout=600, headers={"Content-Type": "application/octet-stream"},
-    )
-    if status not in (201, 204):
-        raise RuntimeError(f"finalize upload failed: HTTP {status} {body[:160]!r}")
-    print(f"  {digest}: {len(data)} bytes in {time.monotonic() - start:.1f}s")
-    return {"mediaType": media, "size": len(data), "digest": digest}
-
-
-def cmd_selftest(repo: str, tag: str, auth_only: bool, mib: int) -> int:
-    """Manual SWR v2 push probe; not part of the automated image job."""
-    if "/" not in repo or (mib < 1 and not auth_only):
-        return fail("selftest needs <registry>/<repo> and a positive --mib", 2)
-    host, path = repo.split("/", 1)
-    user = env("SWR_USERNAME") or env("SWR_USER")
-    password = env("SWR_PASSWORD") or env("SWR_PASS")
-    if not user:
-        user = input("SWR username: ")
-    if not password:
-        password = getpass.getpass("SWR password: ")
-    auth = base64.b64encode(f"{user}:{password}".encode()).decode()
-    token = _token(host, path, auth)
-    if not token:
-        return fail("SWR auth failed or the account cannot push")
-    note(f"SWR auth ok: {repo}:{tag}")
-    if auth_only:
-        return 0
-
-    base = f"https://{host}/v2/{path}"
-    manifest_url = f"{base}/manifests/{tag}"
-    status, _, _ = _http("GET", manifest_url, token=token, headers={"Accept": ACCEPT})
-    if status == 200:
-        return fail(f"tag already exists, refusing to overwrite: {tag}")
-    if status != 404:
-        return fail(f"tag lookup failed: HTTP {status}")
-
-    config = json.dumps({"architecture": "arm64", "os": "linux", "config": {},
-                         "rootfs": {"type": "layers", "diff_ids": []}},
-                        separators=(",", ":")).encode()
-    layer = gzip.compress(os.urandom(mib << 20), mtime=0)
-
-    try:
-        cfg = _upload(host, path, token,
-                      "application/vnd.docker.container.image.v1+json", config)
-        lay = _upload(host, path, token,
-                      "application/vnd.docker.image.rootfs.diff.tar.gzip", layer)
-    except RuntimeError as exc:
-        return fail(str(exc), 2)
-
-    manifest = {"schemaVersion": 2, "mediaType": DOCKER_V2,
-                "config": cfg, "layers": [lay]}
-    body = json.dumps(manifest, separators=(",", ":")).encode()
-    status, headers, response = _http(
-        "PUT", manifest_url, token=token, data=body,
-        headers={"Content-Type": DOCKER_V2},
-    )
-    if status not in (200, 201):
-        return fail(f"manifest PUT failed: HTTP {status} {response[:200]!r}", 2)
-    digest = headers.get("Docker-Content-Digest") or f"sha256:{hashlib.sha256(body).hexdigest()}"
-    note(f"manifest written: {digest}")
-
-    status, _, response = _http("GET", manifest_url, token=token, headers={"Accept": ACCEPT})
-    try:
-        doc = json.loads(response or b"{}") if status == 200 else {}
-    except ValueError:
-        doc = {}
-    fmt = doc.get("mediaType", "")
-    valid = fmt == DOCKER_V2 and doc.get("layers") == [lay]
-    print(f"  readback: mediaType={fmt or '<empty>'} layer_match={valid}")
-    rc = 0 if valid else 2
-
-    status, _, _ = _http("DELETE", f"{base}/manifests/{digest}", token=token)
-    left, _, _ = _http("GET", manifest_url, token=token, headers={"Accept": ACCEPT})
-    note(f"cleanup: DELETE HTTP {status}, readback HTTP {left}")
-    if left != 404:
-        warn(f"tag still exists, remove manually: {repo}:{tag}")
-    return rc
 
 
 # ---------------------------------------------------------------- env
@@ -603,7 +475,7 @@ def cmd_summary() -> int:
         f"| manifest 格式 | `{env('MEDIA_TYPE', 'n/a')}` |\n"
         f"| 构建耗时 | `{env('ELAPSED', 'n/a')}` s |\n\n"
         "### 消费方式\n\n"
-        "PR / nightly 不写死地址，由 `scripts/ci/image/build_image.py resolve` 从最新一份\n"
+        "PR / nightly 不写死地址，由 `scripts/ci/tools/image.py resolve` 从最新一份\n"
         "`base-image-ref` artifact 里读；人工覆盖走仓库变量 `BASE_IMAGE_TAG`。\n\n"
         "> tag 是名字、digest 是内容。需要「永远不变」的引用就写 `repo@sha256:...`。\n"
     )
@@ -633,11 +505,6 @@ def main(argv: list[str]) -> int:
 
     sub.add_parser("build")
     sub.add_parser("verify")
-    p_self = sub.add_parser("selftest")
-    p_self.add_argument("--auth-only", action="store_true")
-    p_self.add_argument("--mib", type=int, default=1)
-    p_self.add_argument("--repo", default="")
-    p_self.add_argument("--tag", default="")
     sub.add_parser("summary")
     sub.add_parser("cleanup")
 
@@ -662,13 +529,6 @@ def main(argv: list[str]) -> int:
         return cmd_build()
     if args.cmd == "verify":
         return cmd_verify()
-    if args.cmd == "selftest":
-        repo = args.repo or env("SWR_REPO") or (
-            f"{env('REGISTRY', 'swr.cn-north-12.myhuaweicloud.com')}/"
-            f"{env('REPOSITORY', 'ascend/torchturbo_npu')}"
-        )
-        return cmd_selftest(repo, args.tag or env("SWR_TAG", "selftest"),
-                            args.auth_only, args.mib)
     if args.cmd == "summary":
         return cmd_summary()
     if args.cmd == "cleanup":

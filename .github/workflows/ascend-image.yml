@@ -4,7 +4,7 @@ run-name: Ascend-Image-CI ${{ inputs.runner || 'ubuntu-22.04-arm' }}
 # Build the L1 base image and publish it to SWR.
 # Manual dispatch only: one build can take 4-5 hours and many GB of bandwidth.
 # Image tags are content-addressed: base-<year-week>-c<content-hash>.
-# All logic lives in scripts/ci/image/ so it can run locally and pass shellcheck.
+# All logic lives in scripts/ci/tools/image.py so it can run locally.
 
 on:
   # Disabled for now. Uncomment to restore the nightly build.
@@ -74,14 +74,14 @@ jobs:
       - name: Check runner
         env:
           RUNNER_LABEL: ${{ inputs.runner || 'ubuntu-22.04-arm' }}
-        run: python3 scripts/ci/image/build_image.py env
+        run: python3 -m scripts.ci.tools.image env
 
       - name: Resolve content tag
         id: tag
         env:
           FORCE: ${{ inputs.force_rebuild }}
           SHOULD_PUSH: ${{ inputs.should_push }}
-        run: python3 scripts/ci/image/build_image.py tag
+        run: python3 -m scripts.ci.tools.image tag
 
       - name: Log in to SWR
         if: steps.tag.outputs.build == 'true' && steps.tag.outputs.should_push == 'true'
@@ -130,7 +130,7 @@ jobs:
           SHOULD_PUSH: ${{ steps.tag.outputs.should_push }}
           USE_CACHE: ${{ inputs.use_cache }}
           BUILDER: ${{ steps.builder.outputs.name }}
-        run: python3 scripts/ci/image/build_image.py build
+        run: python3 -m scripts.ci.tools.image build
 
       - name: Upload build log
         if: always() && steps.tag.outputs.build == 'true'
@@ -147,7 +147,7 @@ jobs:
         if: steps.tag.outputs.build == 'true' && steps.tag.outputs.should_push == 'true'
         env:
           TAG_IMM: ${{ steps.tag.outputs.immutable }}
-        run: python3 scripts/ci/image/build_image.py verify
+        run: python3 -m scripts.ci.tools.image verify
 
       # Publish the current image reference for PR jobs.
       - name: Publish image reference
@@ -155,7 +155,7 @@ jobs:
         env:
           TAG_IMM: ${{ steps.tag.outputs.immutable }}
           DIGEST: ${{ steps.build.outputs.digest }}
-        run: python3 scripts/ci/image/build_image.py publish
+        run: python3 -m scripts.ci.tools.image publish
 
       - name: Upload image reference
         if: always() && steps.tag.outputs.should_push == 'true'
@@ -180,11 +180,11 @@ jobs:
           DIGEST: ${{ steps.build.outputs.digest }}
           MEDIA_TYPE: ${{ steps.verify.outputs.media_type }}
           ELAPSED: ${{ steps.build.outputs.elapsed }}
-        run: python3 scripts/ci/image/build_image.py summary
+        run: python3 -m scripts.ci.tools.image summary
 
       - name: Cleanup
         if: always()
         continue-on-error: true
         env:
           BUILDER: ${{ steps.builder.outputs.name }}
-        run: python3 scripts/ci/image/build_image.py cleanup
+        run: python3 -m scripts.ci.tools.image cleanup

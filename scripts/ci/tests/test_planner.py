@@ -5,9 +5,9 @@ from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 
-from catalog import Catalog
-from contracts import ImageRef, Plan, load_plan_artifact, plan_digest, write_json
-from planner import (
+from scripts.ci.contracts.artifacts import ImageRef, Plan, load_plan_artifact, plan_digest, write_json
+from scripts.ci.producer.catalog import Catalog
+from scripts.ci.producer.planner import (
     artifact_for,
     build,
     main,
@@ -15,7 +15,7 @@ from planner import (
     source_for,
     validate_plan,
 )
-from policy import Policy
+from scripts.ci.producer.policy import Policy
 
 
 def _with_plan_id(plan: Plan) -> Plan:
@@ -97,7 +97,7 @@ def test_cli_writes_failed_artifact_for_precondition(tmp_path: Path, repo_root: 
         "--root", str(repo_root),
         "--output", str(output),
         "--fail-code", "lint",
-        "--fail-path", "scripts/ci/lint_select/lint_check.py",
+        "--fail-path", "scripts/ci/tools/lint.py",
         "--fail-message", "lint failed",
     ]) == 1
 
@@ -243,7 +243,7 @@ def test_missing_job_is_rejected(catalog: Catalog, pr_policy: Policy, pr_plan: P
         jobs=tuple(job for job in pr_plan.jobs if job.id != missing),
     ))
     codes = {issue.code for issue in validate_plan(broken, catalog, pr_policy)}
-    assert "missing-test" in codes
+    assert "plan-mismatch" in codes
 
 
 def test_tampered_image_is_rejected(catalog: Catalog, pr_policy: Policy, pr_plan: Plan) -> None:
@@ -254,8 +254,8 @@ def test_tampered_image_is_rejected(catalog: Catalog, pr_policy: Policy, pr_plan
         pr_plan,
         jobs=(replace(job, runtime=bad_runtime), *pr_plan.jobs[1:]),
     ))
-    messages = [issue.message for issue in validate_plan(broken, catalog, pr_policy)]
-    assert "image does not match Catalog" in messages
+    codes = {issue.code for issue in validate_plan(broken, catalog, pr_policy)}
+    assert "plan-mismatch" in codes
 
 
 def test_tampered_venv_is_rejected(catalog: Catalog, pr_policy: Policy, pr_plan: Plan) -> None:
@@ -266,8 +266,8 @@ def test_tampered_venv_is_rejected(catalog: Catalog, pr_policy: Policy, pr_plan:
         pr_plan,
         jobs=(replace(job, runtime=bad_runtime), *pr_plan.jobs[1:]),
     ))
-    messages = [issue.message for issue in validate_plan(broken, catalog, pr_policy)]
-    assert "venv does not match Catalog" in messages
+    codes = {issue.code for issue in validate_plan(broken, catalog, pr_policy)}
+    assert "plan-mismatch" in codes
 
 
 def test_tampered_coverage_is_rejected(catalog: Catalog, pr_policy: Policy, pr_plan: Plan) -> None:
@@ -279,8 +279,8 @@ def test_tampered_coverage_is_rejected(catalog: Catalog, pr_policy: Policy, pr_p
         },
     }
     broken = _with_plan_id(replace(pr_plan, coverage=coverage))
-    messages = [issue.message for issue in validate_plan(broken, catalog, pr_policy)]
-    assert "expected {'mode': 'all', 'files': 86, 'routes': 88}" in messages
+    codes = {issue.code for issue in validate_plan(broken, catalog, pr_policy)}
+    assert "plan-mismatch" in codes
 
 
 def test_test_outside_catalog_is_rejected(
@@ -295,8 +295,8 @@ def test_test_outside_catalog_is_rejected(
         pr_plan,
         jobs=tuple(bad_job if job.id == pytest_job.id else job for job in pr_plan.jobs),
     ))
-    messages = [issue.message for issue in validate_plan(broken, catalog, pr_policy)]
-    assert "plan contains a test outside Catalog" in messages
+    codes = {issue.code for issue in validate_plan(broken, catalog, pr_policy)}
+    assert "plan-mismatch" in codes
 
 
 def test_tampered_e2e_spec_is_rejected(
@@ -311,5 +311,5 @@ def test_tampered_e2e_spec_is_rejected(
         pr_plan,
         jobs=tuple(bad_job if job.id == e2e_job.id else job for job in pr_plan.jobs),
     ))
-    messages = [issue.message for issue in validate_plan(broken, catalog, pr_policy)]
-    assert "E2E spec does not match Catalog" in messages
+    codes = {issue.code for issue in validate_plan(broken, catalog, pr_policy)}
+    assert "plan-mismatch" in codes

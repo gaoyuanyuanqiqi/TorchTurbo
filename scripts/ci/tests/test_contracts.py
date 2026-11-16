@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from contracts import (
+from scripts.ci.contracts.artifacts import (
     ContractError,
     JobResult,
     ModelE2EEvidence,

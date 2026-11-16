@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from change_scope import classify_paths, is_docs_path, main
+from scripts.ci.producer.change_scope import classify_paths, is_docs_path, main
 
 
 def test_docs_paths_are_documentation_only() -> None:
@@ -18,14 +18,14 @@ def test_code_and_config_paths_are_not_documentation_only() -> None:
     assert not is_docs_path("requirements.txt")
     assert not is_docs_path("pyproject.toml")
     assert not is_docs_path(".github/workflows/ascend-pr.yml")
-    assert not is_docs_path("scripts/ci/planner.py")
+    assert not is_docs_path("scripts/ci/producer/planner.py")
     assert not is_docs_path("pytest.ini")
 
 
 def test_classify_paths_fails_open() -> None:
     assert classify_paths([]) == "code"
     assert classify_paths(["docs/design.md", "README.md"]) == "docs_only"
-    assert classify_paths(["docs/design.md", "scripts/ci/planner.py"]) == "code"
+    assert classify_paths(["docs/design.md", "scripts/ci/producer/planner.py"]) == "code"
     assert classify_paths(["requirements.txt"]) == "code"
 
 
