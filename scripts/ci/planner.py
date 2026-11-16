@@ -284,9 +284,31 @@ def _build_model_e2e_jobs(catalog: Catalog, policy: Policy,
     }
 
 
-def build(catalog: Catalog, policy: Policy, source: Source) -> Plan:
+def _plan_inputs(catalog: Catalog, policy: Policy, change_scope: str) -> dict[str, str]:
+    return {
+        "catalog_digest": catalog.digest,
+        "policy_digest": policy.digest,
+        "image_refs_digest": digest({
+            name: image.ref for name, image in sorted(catalog.images.items())
+        }),
+        "change_scope": change_scope,
+    }
+
+
+def build(
+    catalog: Catalog,
+    policy: Policy,
+    source: Source,
+    *,
+    change_scope: str = "code",
+) -> Plan:
     """Build a ready plan or raise PlanError with structured issues."""
+    if change_scope == "docs_only":
+        return _build_docs_only_plan(catalog, policy, source)
+    if change_scope != "code":
+        raise ValueError(f"unknown change scope {change_scope!r}")
     issues = validate_policy(policy, catalog)
+    inputs = _plan_inputs(catalog, policy, change_scope)
     pytest_jobs, pytest_coverage = _build_pytest_jobs(catalog, policy, issues)
     e2e_jobs, e2e_coverage = _build_model_e2e_jobs(catalog, policy, issues)
     jobs = sorted((*pytest_jobs, *e2e_jobs), key=lambda job: job.id)
@@ -297,19 +319,34 @@ def build(catalog: Catalog, policy: Policy, source: Source) -> Plan:
         "model_e2e": e2e_coverage,
         "jobs": len(jobs),
     }
-    inputs = {
-        "catalog_digest": catalog.digest,
-        "policy_digest": policy.digest,
-        "image_refs_digest": digest({
-            name: image.ref for name, image in sorted(catalog.images.items())
-        }),
-    }
     return build_plan(
         policy=policy.name,
         source=source,
         inputs=inputs,
         coverage=coverage,
         jobs=jobs,
+    )
+
+
+def _build_docs_only_plan(catalog: Catalog, policy: Policy, source: Source) -> Plan:
+    issues = validate_policy(policy, catalog)
+    if issues:
+        raise PlanError(issues)
+    inputs = _plan_inputs(catalog, policy, "docs_only")
+    coverage = {
+        "pytest": {
+            suite: {"mode": "none", "files": 0, "routes": 0}
+            for suite in ("core", "model", "adapter")
+        },
+        "model_e2e": {"mode": "none", "cases": []},
+        "jobs": 0,
+    }
+    return build_plan(
+        policy=policy.name,
+        source=source,
+        inputs=inputs,
+        coverage=coverage,
+        jobs=(),
     )
 
 
@@ -363,6 +400,7 @@ def _target_plan(plan: Plan, target_job: str) -> Plan:
 def validate_plan(plan: Plan, catalog: Catalog, policy: Policy) -> list[Issue]:
     """Validate a plan against the catalog and policy that produced it."""
     issues: list[Issue] = []
+    change_scope = plan.inputs.get("change_scope", "code")
     if plan.schema_version != SCHEMA_VERSION:
         issues.append(_issue("plan.schema_version", f"expected {SCHEMA_VERSION}"))
     if plan.policy != policy.name:
@@ -379,9 +417,27 @@ def validate_plan(plan: Plan, catalog: Catalog, policy: Policy) -> list[Issue]:
         "image_refs_digest": digest({
             name: image.ref for name, image in sorted(catalog.images.items())
         }),
+        "change_scope": change_scope,
     }
     if plan.inputs != expected_inputs:
         issues.append(_issue("plan.inputs", "inputs do not match Catalog and Policy"))
+    if change_scope == "docs_only":
+        if plan.jobs:
+            issues.append(_issue("plan.jobs", "docs-only plan must not contain jobs"))
+        expected_coverage = {
+            "pytest": {
+                suite: {"mode": "none", "files": 0, "routes": 0}
+                for suite in ("core", "model", "adapter")
+            },
+            "model_e2e": {"mode": "none", "cases": []},
+            "jobs": 0,
+        }
+        if plan.coverage != expected_coverage:
+            issues.append(_issue("plan.coverage", "docs-only plan must have zero coverage"))
+        return issues
+    if change_scope != "code":
+        issues.append(_issue("plan.inputs.change_scope", f"unknown scope {change_scope!r}"))
+        return issues
 
     entries_by_path = {entry.path: entry for entry in catalog.tests}
     cases_by_id = {case.case_id: case for case in catalog.cases}
@@ -582,14 +638,20 @@ def validate_plan(plan: Plan, catalog: Catalog, policy: Policy) -> list[Issue]:
     return issues
 
 
-def artifact_for(catalog: Catalog | None, policy_name: str, source: Source,
-                 issues: Iterable[Issue], target_job: str = "") -> PlanArtifact:
+def artifact_for(
+    catalog: Catalog | None,
+    policy_name: str,
+    source: Source,
+    issues: Iterable[Issue],
+    target_job: str = "",
+    change_scope: str = "code",
+) -> PlanArtifact:
     values = tuple(issues)
     if catalog is None or values:
         return build_plan_artifact(policy=policy_name, source=source, errors=values)
     try:
         policy = load_policy(catalog.root / "scripts" / "ci" / "policies.yml", policy_name)
-        plan = build(catalog, policy, source)
+        plan = build(catalog, policy, source, change_scope=change_scope)
         plan_issues = validate_plan(plan, catalog, policy)
         if not plan_issues and target_job:
             plan = _target_plan(plan, target_job)
@@ -648,6 +710,12 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--fail-path", default="planner")
     parser.add_argument("--fail-message", default="")
     parser.add_argument(
+        "--change-scope",
+        choices=("code", "docs_only"),
+        default="code",
+        help="docs_only emits a valid zero-job plan",
+    )
+    parser.add_argument(
         "--target-job", default="",
         help="reduce a validated plan to one exact job for a manual run",
     )
@@ -656,6 +724,8 @@ def main(argv: list[str]) -> int:
 
     if args.verify and args.target_job:
         parser.error("--target-job cannot be combined with --verify")
+    if args.target_job and args.change_scope == "docs_only":
+        parser.error("--target-job cannot be combined with a docs-only plan")
 
     root = Path(args.root).resolve() if args.root else Path(__file__).resolve().parents[2]
     source = source_for(
@@ -698,8 +768,11 @@ def main(argv: list[str]) -> int:
             try:
                 policy = load_policy(root / "scripts" / "ci" / "policies.yml", policy_name)
                 plan = build(catalog, policy, source)
+                docs_plan = build(catalog, policy, source, change_scope="docs_only")
                 failures.extend(validate_plan(plan, catalog, policy))
+                failures.extend(validate_plan(docs_plan, catalog, policy))
                 print(f"{policy_name}: {len(plan.jobs)} jobs / {len(catalog.tests)} tests")
+                print(f"{policy_name} docs-only: {len(docs_plan.jobs)} jobs")
             except (PolicyError, PlanError) as exc:
                 failures.extend(exc.issues)
         if failures:
@@ -709,7 +782,12 @@ def main(argv: list[str]) -> int:
         return 0
 
     artifact = artifact_for(
-        catalog, args.policy, source, (), target_job=args.target_job
+        catalog,
+        args.policy,
+        source,
+        (),
+        target_job=args.target_job,
+        change_scope=args.change_scope,
     )
     if args.output:
         write_json(Path(args.output), artifact.to_dict())

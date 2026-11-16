@@ -16,6 +16,7 @@ from contracts import (
 )
 import gate
 from gate import decide, decide_artifact
+from planner import build
 
 
 def _result_for(plan, job, status: str = "passed") -> JobResult:
@@ -82,6 +83,23 @@ def test_all_jobs_pass(pr_plan) -> None:
     assert decision.summary["expected_jobs"] == 3
     assert decision.summary["passed"] == 3
     assert decision.failures == ()
+
+
+def test_docs_only_plan_passes_without_results(catalog, pr_policy, source) -> None:
+    plan = build(catalog, pr_policy, source, change_scope="docs_only")
+    decision = decide(plan, [])
+
+    assert decision.status == "passed"
+    assert decision.summary == {
+        "expected_jobs": 0,
+        "reported_jobs": 0,
+        "passed": 0,
+        "failed": 0,
+        "skipped": 0,
+        "missing": 0,
+        "unexpected": 0,
+    }
+    assert all(check["status"] == "passed" for check in decision.checks)
 
 
 def test_missing_result_fails(pr_plan) -> None:

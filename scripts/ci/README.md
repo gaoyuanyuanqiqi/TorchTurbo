@@ -19,6 +19,7 @@ scripts/ci/
   contracts.py   Plan / JobResult / Decision 的可序列化契约
   catalog.py     Catalog loader 与 test/E2E facts 扫描
   policy.py      Policy loader 与跨 Catalog 校验
+  change_scope.py  文档/文本变更分类
   planner.py     Catalog + Policy -> PlanArtifact
   executor.py    Plan 中的一个 Job -> JobResult
   gate.py        Plan + JobResult -> Decision
@@ -31,8 +32,13 @@ scripts/ci/
 正式路径只有一条：`lint -> Planner -> PlanArtifact -> Executor -> JobResult -> Gate`。
 Planner 读取 `catalog.yml` + `policies.yml`，生成按 CPU/NPU/GPU 聚合的 matrix；
 Executor 只消费 Plan 中的一个 Job，不读取 Catalog 或 Policy；Gate 只消费
-Plan + JobResult，不重新选测。PR 固定跑全量 core pytest 加两个模型 guard，
+Plan + JobResult，不重新选测。PR 固定跑全量 core pytest 加一个模型 guard，
 nightly 跑所有 pytest suite 和所有 E2E case。
+
+纯文档 PR（`docs/**`、`*.md`、`*.rst`、`*.adoc`、`LICENSE`、`NOTICE`）
+会生成合法的零 Job Plan：跳过 lint、镜像解析、pytest 和模型 Job，只保留
+Plan/Gate 这两个轻量步骤，让必过检查仍然能给出明确结论。分类失败或无法读取
+diff 时按代码变更处理。
 
 `manual_plan.py`、`run_job.py` 是迁移期兼容入口，只供 manual workflow 和回滚使用。
 `unit_tests/run_tests.sh` 只保留给本机回退。
@@ -186,6 +192,8 @@ python3 scripts/ci/lint_select/lint_check.py --only contract # 只查 job 图与
 python3 scripts/ci/lint_select/lint_check.py --only shellcheck   # 只查 shell
 python3 scripts/ci/catalog.py check                    # 配置与扫描事实一致
 python3 scripts/ci/planner.py --verify                 # PR/nightly Plan 均可构建
+python3 scripts/ci/planner.py --policy pull_request --change-scope docs_only \
+  --output /tmp/docs-plan.json                         # 零 Job Plan
 python3 -m pytest scripts/ci/tests -q                  # 契约/Planner/Executor/Gate
 
 bash -n scripts/ci/bin/* scripts/ci/unit_tests/*.sh scripts/ci/e2e_tests/*.sh

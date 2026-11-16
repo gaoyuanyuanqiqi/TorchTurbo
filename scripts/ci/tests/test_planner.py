@@ -54,6 +54,27 @@ def test_pull_request_scope(catalog: Catalog, pr_policy: Policy, pr_plan: Plan) 
     assert pytest_suites == {"core"}
 
 
+def test_docs_only_scope_has_no_jobs(catalog: Catalog, pr_policy: Policy, source) -> None:
+    plan = build(catalog, pr_policy, source, change_scope="docs_only")
+    assert plan.jobs == ()
+    assert plan.inputs["change_scope"] == "docs_only"
+    assert plan.coverage == {
+        "pytest": {
+            suite: {"mode": "none", "files": 0, "routes": 0}
+            for suite in ("core", "model", "adapter")
+        },
+        "model_e2e": {"mode": "none", "cases": []},
+        "jobs": 0,
+    }
+    assert validate_plan(plan, catalog, pr_policy) == []
+    matrices = matrix_outputs(plan, catalog)
+    assert {key: len(value) for key, value in matrices.items()} == {
+        "cpu_jobs": 0,
+        "npu_jobs": 0,
+        "gpu_jobs": 0,
+    }
+
+
 def test_nightly_scope(catalog: Catalog, nightly_policy: Policy, nightly_plan: Plan) -> None:
     assert Counter(job.kind for job in nightly_plan.jobs) == {
         "pytest": 9,

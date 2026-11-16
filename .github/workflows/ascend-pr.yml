@@ -68,12 +68,41 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: classify changes
+        id: changes
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+        run: |
+          set -uo pipefail
+          scope=code
+          output=""
+          if [ "$EVENT_NAME" = pull_request ] && [ -n "$BASE_SHA" ]; then
+            changed="$RUNNER_TEMP/ci-changed-files.txt"
+            if git diff --name-only --no-renames "$BASE_SHA...HEAD" > "$changed"; then
+              if output=$(python3 scripts/ci/change_scope.py --changed-files "$changed"); then
+                scope=${output#change_scope=}
+              else
+                echo "::warning::change scope classification failed; running code scope"
+              fi
+            else
+              echo "::warning::cannot compute changed files; running code scope"
+            fi
+          fi
+          case "$scope" in
+            code|docs_only) ;;
+            *) scope=code ;;
+          esac
+          echo "change_scope=$scope" >> "$GITHUB_OUTPUT"
+          echo "change scope: $scope" >> "$GITHUB_STEP_SUMMARY"
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: lint
         id: lint
+        if: steps.changes.outputs.change_scope != 'docs_only'
         env:
           PYTHONUNBUFFERED: '1'
         run: |
@@ -84,7 +113,7 @@ jobs:
 
       - name: resolve image
         id: image
-        if: always()
+        if: always() && steps.changes.outputs.change_scope != 'docs_only'
         env:
           OVERRIDE: ${{ vars.BASE_IMAGE_TAG }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -106,6 +135,7 @@ jobs:
           LINT_OUTCOME: ${{ steps.lint.outcome }}
           IMAGE_OUTCOME: ${{ steps.image.outcome }}
           IMAGE_REF: ${{ steps.image.outputs.image }}
+          CHANGE_SCOPE: ${{ steps.changes.outputs.change_scope || 'code' }}
         run: |
           set -uo pipefail
           mkdir -p "$RUNNER_TEMP/ci-plan"
@@ -118,25 +148,28 @@ jobs:
             --source-repository "$GITHUB_REPOSITORY"
             --source-ref "$GITHUB_REF"
             --source-sha "$GITHUB_SHA"
+            --change-scope "$CHANGE_SCOPE"
           )
           if [ -n "$CI_TARGET_JOB" ]; then
             COMMON+=(--target-job "$CI_TARGET_JOB")
           fi
-          if [ "$LINT_OUTCOME" != success ]; then
-            python3 scripts/ci/planner.py "${COMMON[@]}" \
-              --fail-code lint --fail-path scripts/ci/lint_select/lint_check.py \
-              --fail-message "lint failed"
-            exit 1
-          fi
-          if [ "$IMAGE_OUTCOME" != success ]; then
-            python3 scripts/ci/planner.py "${COMMON[@]}" \
-              --fail-code image-resolve --fail-path scripts/ci/image/build_image.py \
-              --fail-message "image resolution failed"
-            exit 1
+          if [ "$CHANGE_SCOPE" != docs_only ]; then
+            if [ "$LINT_OUTCOME" != success ]; then
+              python3 scripts/ci/planner.py "${COMMON[@]}" \
+                --fail-code lint --fail-path scripts/ci/lint_select/lint_check.py \
+                --fail-message "lint failed"
+              exit 1
+            fi
+            if [ "$IMAGE_OUTCOME" != success ]; then
+              python3 scripts/ci/planner.py "${COMMON[@]}" \
+                --fail-code image-resolve --fail-path scripts/ci/image/build_image.py \
+                --fail-message "image resolution failed"
+              exit 1
+            fi
+            COMMON+=(--image-ref "npu-default=$IMAGE_REF")
           fi
           MATRIX_OUTPUT="$RUNNER_TEMP/matrix-output"
           if ! python3 scripts/ci/planner.py "${COMMON[@]}" \
-            --image-ref "npu-default=$IMAGE_REF" \
             --github-output "$MATRIX_OUTPUT"; then
             exit 1
           fi
