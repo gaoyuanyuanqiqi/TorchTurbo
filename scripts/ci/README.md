@@ -123,7 +123,7 @@ python3 scripts/ci/local_lint_select_test.py --only docker
 
 ```
 ascend-pr.yml       唯一入口  plan{lint,image,Planner} -> {cpu,npu matrix} -> gate
-                    mode=pr（core pytest + 2 model guards）
+                    mode=pr（core pytest + 1 model guard）
                     mode=full（全量 pytest + 全量 E2E）；可被 nightly 复用
                     target_job=<job-id> 只保留一个 Job，供单点诊断
 ascend-manual.yml   手动单泳道（dispatch 或 ci:manual:<lane> 标签）

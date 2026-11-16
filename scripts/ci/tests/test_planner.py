@@ -25,7 +25,7 @@ def _with_plan_id(plan: Plan) -> Plan:
 def test_pull_request_scope(catalog: Catalog, pr_policy: Policy, pr_plan: Plan) -> None:
     assert Counter(job.kind for job in pr_plan.jobs) == {
         "pytest": 2,
-        "model_e2e": 2,
+        "model_e2e": 1,
     }
     assert pr_plan.coverage["pytest"] == {
         "core": {"mode": "all", "files": 86, "routes": 88},
@@ -34,10 +34,16 @@ def test_pull_request_scope(catalog: Catalog, pr_policy: Policy, pr_plan: Plan) 
     }
     assert pr_plan.coverage["model_e2e"] == {
         "mode": "explicit",
-        "cases": ["qwen3_5-lf-text-sft", "bailing_hybrid-lf-flash-sft"],
+        "cases": ["bailing_hybrid-lf-sft"],
     }
-    assert pr_plan.coverage["jobs"] == 4
+    assert pr_plan.coverage["jobs"] == 3
     assert validate_plan(pr_plan, catalog, pr_policy) == []
+
+    npu_pytest_jobs = [
+        job for job in pr_plan.jobs
+        if job.kind == "pytest" and job.runtime.device == "npu"
+    ]
+    assert len(npu_pytest_jobs) == 1
 
     pytest_suites = {
         step.spec.suite
@@ -102,7 +108,7 @@ def test_matrix_adapter_only_exposes_platform_fields(
     matrices = matrix_outputs(pr_plan, catalog)
     assert {key: len(value) for key, value in matrices.items()} == {
         "cpu_jobs": 1,
-        "npu_jobs": 3,
+        "npu_jobs": 2,
         "gpu_jobs": 0,
     }
     expected_fields = {

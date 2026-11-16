@@ -9,8 +9,7 @@ policies:
     model_e2e:
       mode: explicit
       cases:
-        - qwen3_5-lf-text-sft
-        - bailing_hybrid-lf-flash-sft
+        - bailing_hybrid-lf-sft
 
   nightly:
     pytest:

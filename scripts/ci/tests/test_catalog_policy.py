@@ -62,8 +62,7 @@ def test_pull_request_policy_is_fixed_scope(pr_policy) -> None:
     assert pr_policy.pytest == {"core": "all", "model": "none", "adapter": "none"}
     assert pr_policy.model_e2e_mode == "explicit"
     assert pr_policy.model_e2e_cases == (
-        "qwen3_5-lf-text-sft",
-        "bailing_hybrid-lf-flash-sft",
+        "bailing_hybrid-lf-sft",
     )
     assert pr_policy.allow_skip == {}
 

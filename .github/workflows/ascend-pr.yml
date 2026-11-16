@@ -5,7 +5,7 @@ run-name: Ascend-PR-CI ${{ github.event.pull_request.number && format('#{0}', gi
 #
 #   lint -> Planner -> PlanArtifact -> Executor matrix -> JobResult -> Gate
 #
-# PR runs all core pytest plus two model guards. Nightly runs every pytest suite
+# PR runs all core pytest plus one model guard. Nightly runs every pytest suite
 # and every E2E case. The workflow only moves artifacts; selection lives in
 # scripts/ci/policies.yml and execution lives in scripts/ci/executor.py.
 
@@ -25,7 +25,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'pr = core pytest + model guards; full = nightly scope'
+        description: 'pr = core pytest + one model guard; full = nightly scope'
         required: true
         default: 'pr'
         type: choice
