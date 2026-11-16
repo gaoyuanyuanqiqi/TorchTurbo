@@ -27,6 +27,8 @@ MAP="${MAP:-.github/workflows/model_map.json}"
 : "${SEQ_LEN:=1024}"; : "${FINETUNING_TYPE:=full}"; : "${DATASET_IN:=gsm8k}"; : "${DATASET:=${DATASET_IN}}"
 : "${FETCH_TIMEOUT:=1800}"; : "${CASE_TIMEOUT:=7200}"; : "${E2E_CASES:=[]}"
 : "${INSTALL_SCRIPT:=}"; : "${TRAIN_SCRIPT:=}"; : "${HF_REPO:=}"
+: "${INSTALL_ARGS:=}"; : "${TRAIN_ARGS:=}"
+: "${TORCH_BEFORE:=/tmp/torch-before.json}"
 
 export HF_MODULES_CACHE="${HF_MODULES_CACHE:-/tmp/hf-modules}"
 export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
@@ -83,15 +85,17 @@ cmd_plan() {
 
 # ---------------------------------------------------------------- Stage 2: install
 # Install torchturbo and model dependencies, then verify torch was not replaced.
-pip_step() {  # pip_step <name> [install script]
-  local name="$1" script="${2:-}" log start rc
+pip_step() {  # pip_step <name> [install script] [install args]
+  local name="$1" script="${2:-}" extra="${3:-}" log start rc
   log="/tmp/$(echo "$name" | tr -cd '[:alnum:]' | head -c 20).log"
   start=$(date +%s)
+  local -a extra_args=()
+  [ -n "$extra" ] && read -r -a extra_args <<< "$extra"
   python -m pip config list 2>/dev/null || true
   env | grep -iE '^(PIP_|.*_PROXY=)' || true
   if [ -n "$script" ]; then
     test -f "$script" || { echo "::error::缺少 $script"; return 1; }
-    bash "$script" 2>&1 | tee "$log"
+    bash "$script" "${extra_args[@]}" 2>&1 | tee "$log"
   else
     python -m pip install --no-cache-dir --no-build-isolation -e ".[dev]" 2>&1 | tee "$log"
   fi
@@ -108,7 +112,7 @@ for name in "torch torch_npu numpy triton fla fla_npu transformers llamafactory 
 PROBE
   cat /tmp/after.txt
   if [ "$rc" -eq 0 ]; then
-    python3 "$CI_SCRIPTS/common/env_pod.py" check --file /tmp/torch-before.json || rc=1
+    python3 "$CI_SCRIPTS/common/env_pod.py" check --file "$TORCH_BEFORE" || rc=1
   fi
   result phase --file "$RESULT_JSON" --name "$name" \
     --seconds "$(( $(date +%s) - start ))" --rc "$rc"
@@ -124,7 +128,7 @@ cmd_install() {
   # own relative paths stay valid.
   python3 "$CI_SCRIPTS/e2e_tests/patch_run_scripts.py" install --src "$INSTALL_SCRIPT" \
     || return 1
-  pip_step "模型依赖 \`${INSTALL_SCRIPT}\`" "$INSTALL_SCRIPT"
+  pip_step "模型依赖 \`${INSTALL_SCRIPT}\`" "$INSTALL_SCRIPT" "$INSTALL_ARGS"
 }
 
 # ---------------------------------------------------------------- Stage 3: prepare
@@ -240,8 +244,10 @@ supervisor_cleanup() {
   return "$rc"
 }
 
-run_supervised() {  # run_supervised <launch script> <log>
-  local script="$1" log="$2" start stuck=0 busy=0 child rc elapsed last_loss stalled=no watchdog=no
+run_supervised() {  # run_supervised <launch script> <log> [launch args]
+  local script="$1" log="$2" extra="${3:-}" start stuck=0 busy=0 child rc elapsed last_loss stalled=no watchdog=no
+  local -a extra_args=()
+  [ -n "$extra" ] && read -r -a extra_args <<< "$extra"
   : > "$log"
   SUP_TRAIN_PID=""
   SUP_TAIL_PID=""
@@ -249,10 +255,10 @@ run_supervised() {  # run_supervised <launch script> <log>
   trap 'supervisor_cleanup; exit 130' INT
   trap 'supervisor_cleanup; exit 143' TERM
   if command -v setsid >/dev/null 2>&1 && command -v pgrep >/dev/null 2>&1; then
-    setsid bash "$script" >"$log" 2>&1 &
+    setsid bash "$script" "${extra_args[@]}" >"$log" 2>&1 &
     watchdog=yes
   else
-    bash "$script" >"$log" 2>&1 &
+    bash "$script" "${extra_args[@]}" >"$log" 2>&1 &
   fi
   SUP_TRAIN_PID=$!
   tail -f "$log" &
@@ -317,7 +323,7 @@ cmd_train() {
   # Runs after preprocess, which reads the unpatched launcher for TT_CONFIG.
   python3 "$CI_SCRIPTS/e2e_tests/patch_run_scripts.py" train --src "$TRAIN_SCRIPT" \
     || return 1
-  run_supervised "$TRAIN_SCRIPT" /tmp/train.log
+  run_supervised "$TRAIN_SCRIPT" /tmp/train.log "$TRAIN_ARGS"
   local rc=$? elapsed="$TRAIN_ELAPSED" last_loss="$TRAIN_LAST_LOSS"
   echo "::notice::训练 rc=${rc} 用时 ${elapsed}s；hit=${PREP_HIT}；${last_loss:-无 loss 记录}"
   local output_dir="${OUTPUT_DIR:-/tmp/tblf-sft/$(basename "$PREP_MODEL")}"
@@ -342,10 +348,42 @@ cmd_report() {
   result notice --file "$RESULT_JSON" --model-type "${MODEL_TYPE:-}" || true
 }
 
+cmd_case_report() {
+  result report --file "$RESULT_JSON" --train-log /tmp/train.log \
+    --versions /tmp/after.txt >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+  result notice --file "$RESULT_JSON" --model-type "${MODEL_TYPE:-}" || true
+}
+
 # Run stages 3-4 for one E2E case; orchestration lives outside the stage bodies.
 cmd_run() {
   cmd_prepare || return $?
   cmd_train
+}
+
+# Run one fully resolved ModelE2ESpec supplied by executor.py. Unlike `lane`,
+# this path does not read model_map.json and does not select cases.
+cmd_case() {
+  local rc=0
+  : "${MODEL_TYPE:?MODEL_TYPE is required}"
+  : "${CASE_ID:?CASE_ID is required}"
+  : "${FRAMEWORK:?FRAMEWORK is required}"
+  : "${ENV_NAME:?ENV_NAME is required}"
+  : "${INSTALL_SCRIPT:?INSTALL_SCRIPT is required}"
+  : "${TRAIN_SCRIPT:?TRAIN_SCRIPT is required}"
+  : "${RUN_DIR:?RUN_DIR is required}"
+  : "${PLAN_CARDS:?PLAN_CARDS is required}"
+  result init --file "$RESULT_JSON" \
+    kind=train model_type="$MODEL_TYPE" case_id="$CASE_ID" framework="$FRAMEWORK" env="$ENV_NAME" \
+    runner_label="$RUNNER_LABEL" image="$IMAGE" layers="$LAYERS" dataset="$DATASET_IN"
+  if ! cmd_install; then
+    rc=1
+  else
+    ( GITHUB_OUTPUT=/dev/null timeout --foreground --kill-after=30s \
+        "$CASE_TIMEOUT" bash "$0" run )
+    rc=$?
+  fi
+  cmd_case_report || true
+  return "$rc"
 }
 
 # Training orchestration, not a stage: run stages 1-5 for every selected E2E case.
@@ -397,6 +435,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     run) cmd_run ;;
     report) cmd_report ;;
     lane) cmd_lane ;;
-    *) echo "用法：$0 {plan|install|run|report|lane}" >&2; exit 2 ;;
+    case) cmd_case ;;
+    *) echo "用法：$0 {plan|install|run|report|lane|case}" >&2; exit 2 ;;
   esac
 fi

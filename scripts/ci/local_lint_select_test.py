@@ -292,6 +292,9 @@ def step_contract() -> None:
     print("\n[4/5] selector <-> workflow contract")
     text = (WORKFLOWS / "ascend-pr.yml").read_text(encoding="utf-8")
     block = job_block(text, "select")
+    if not block and "planner.py" in text:
+        print("  legacy select job is not part of the Planner workflow; skip")
+        return
     declared = set(re.findall(r"^      ([a-z0-9_]+): \$\{\{ steps\.", block, re.M))
     # Outputs the selector itself must fill; `image` and `failed_step` come from
     # other steps in the same job, so they are counted separately.

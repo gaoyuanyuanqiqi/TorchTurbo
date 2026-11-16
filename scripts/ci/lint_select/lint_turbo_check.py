@@ -98,6 +98,11 @@ def check_contract() -> list[Problem]:
     for path, doc in docs.items():
         rel = relative(path)
         jobs = {str(name): job for name, job in (doc.get("jobs") or {}).items()}
+        plan_jobs = [name for name, job in jobs.items()
+                     if "planner.py" in _job_run_text(job)]
+        if plan_jobs:
+            problems.extend(_check_planner_v2(rel, jobs, yaml.safe_dump(doc, allow_unicode=True)))
+            continue
         planner_names = [name for name, job in jobs.items()
                          if "select_tests.py" in _job_run_text(job)]
         if not planner_names:
@@ -164,6 +169,62 @@ def check_contract() -> list[Problem]:
         missing = sorted({planner_name, *lanes} - reachable)
         if missing:
             problems.append(Problem(rel, f"terminal job {terminal!r} does not reach {missing}"))
+    return problems
+
+
+def _check_planner_v2(rel: str, jobs: dict, dumped: str) -> list[Problem]:
+    """Validate the Planner -> Executor -> Gate topology."""
+    problems: list[Problem] = []
+    planners = [name for name, job in jobs.items()
+                if "planner.py" in _job_run_text(job)]
+    if len(planners) != 1:
+        return [Problem(rel, f"expected one Planner job; found {sorted(planners)}")]
+    planner_name = planners[0]
+    planner = jobs[planner_name]
+    planner_body = _job_run_text(planner)
+    if "lint_check.py" not in planner_body:
+        problems.append(Problem(rel, "Planner job must also run lint_check.py"))
+    if "select_tests.py" in planner_body:
+        problems.append(Problem(rel, "Planner job must not run the legacy selector"))
+
+    declared = set((planner.get("outputs") or {}).keys())
+    output_pattern = rf"needs\.{re.escape(planner_name)}\.outputs\.([A-Za-z0-9_-]+)"
+    used = set(re.findall(output_pattern, dumped))
+    for name in sorted(used - declared):
+        problems.append(Problem(
+            rel,
+            f"reads needs.{planner_name}.outputs.{name} but the Planner does not declare it",
+        ))
+    for name in sorted(declared - used):
+        problems.append(Problem(rel, f"Planner output {name!r} has no consumer"))
+
+    needed = {dependency for job in jobs.values() for dependency in _job_needs(job)}
+    terminals = sorted(set(jobs) - needed)
+    lanes = sorted({
+        name for name, job in jobs.items()
+        if planner_name in _job_needs(job)
+    } - set(terminals))
+    if not lanes:
+        problems.append(Problem(rel, "Planner must feed at least one Executor lane"))
+    for name in lanes:
+        body = _job_run_text(jobs[name])
+        if "executor.py" not in body:
+            problems.append(Problem(rel, f"lane {name!r} does not invoke executor.py"))
+    if len(terminals) != 1:
+        problems.append(Problem(
+            rel, f"Planner workflow must have exactly one terminal job; found {terminals}"
+        ))
+        return problems
+    terminal = terminals[0]
+    terminal_body = _job_run_text(jobs[terminal])
+    if "gate.py" not in terminal_body:
+        problems.append(Problem(rel, f"terminal job {terminal!r} does not invoke gate.py"))
+    if "download-artifact" not in yaml.safe_dump(jobs[terminal], allow_unicode=True):
+        problems.append(Problem(rel, f"terminal job {terminal!r} does not download results"))
+    reachable = _job_closure(jobs, terminal)
+    missing = sorted({planner_name, *lanes} - reachable)
+    if missing:
+        problems.append(Problem(rel, f"terminal job {terminal!r} does not reach {missing}"))
     return problems
 
 

@@ -19,5 +19,4 @@ jobs:
     uses: ./.github/workflows/ascend-pr.yml
     with:
       mode: full
-      with_e2e: true
     secrets: inherit

@@ -1,9 +1,13 @@
 name: Ascend-PR-CI
 run-name: Ascend-PR-CI ${{ github.event.pull_request.number && format('#{0}', github.event.pull_request.number) || github.ref_name }}
 
-# Sole entry point: mode=pr (gate a PR on the diff) or mode=full.
-# Lanes are inlined -- a `uses:` job renders as "caller / callee" on the graph.
-# l1_/l2_/l3_ prefixes pin the order (jobs sort by key, not by position).
+# One entry point for both PR and nightly scope.
+#
+#   lint -> Planner -> PlanArtifact -> Executor matrix -> JobResult -> Gate
+#
+# PR runs all core pytest plus two model guards. Nightly runs every pytest suite
+# and every E2E case. The workflow only moves artifacts; selection lives in
+# scripts/ci/policies.yml and execution lives in scripts/ci/executor.py.
 
 on:
   pull_request:
@@ -14,48 +18,17 @@ on:
         required: false
         default: 'pr'
         type: string
-      force_all:
-        required: false
-        default: false
-        type: boolean
-      with_e2e:
-        required: false
-        default: false
-        type: boolean
-      test_path:
-        required: false
-        default: '-'
-        type: string
   workflow_dispatch:
     inputs:
       mode:
-        description: 'pr = select from the diff, full = run everything'
+        description: 'pr = core pytest + model guards; full = nightly scope'
         required: true
         default: 'pr'
         type: choice
         options:
           - pr
           - full
-      force_all:
-        description: 'pr only: run everything (same as the ci:full label)'
-        required: false
-        default: false
-        type: boolean
-      with_e2e:
-        description: 'pr: path-selected E2E cases; full: every nightly E2E case'
-        required: false
-        default: false
-        type: boolean
-      test_path:
-        description: "unit lanes only: dir / file / node id; '-' = normal selection"
-        required: false
-        default: '-'
-        type: string
 
-# A shared group with cancel-in-progress: false still cancels *pending* jobs and
-# once wedged this queue. So: PRs cancel per PR, full runs never queue.
-# ci:manual:* labels are ascend-manual.yml's triggers; a separate group keeps the
-# resulting no-op run from cancelling a real CI run.
 concurrency:
   group: ci-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || format('full-{0}', github.run_id) }}${{ startsWith(github.event.label.name || '', 'ci:manual:') && '-manual-label' || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -63,20 +36,15 @@ concurrency:
 permissions:
   contents: read
   pull-requests: read
-  actions: read          # gate timing reads created_at / run_started_at
+  actions: read
 
 env:
-  # Not MODE: run_tests.sh reads MODE as cpu/npu.
+  # run_tests.sh treats MODE as cpu/npu, so keep this variable name distinct.
   CI_MODE: ${{ github.event_name == 'pull_request' && 'pr' || inputs.mode }}
 
 jobs:
-  select:
-    name: Ascend-PR-Lint-Select
-    # Lint and selection are strictly serial and together take seconds, so they
-    # share one runner and one full checkout. Keep them in separate steps: a lint
-    # failure then naturally prevents a plan, without another `needs` edge.
-    # ci:manual:* exists to run one lane via ascend-manual.yml. Without this guard a
-    # manual label also starts a full CI run, which is both slow and confusing.
+  plan:
+    name: Ascend-PR-Plan
     if: ${{ !startsWith(github.event.label.name || '', 'ci:manual:') }}
     runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
     timeout-minutes: 20
@@ -85,22 +53,15 @@ jobs:
       cpu_job_count: ${{ steps.plan.outputs.cpu_job_count || '0' }}
       npu_jobs: ${{ steps.plan.outputs.npu_jobs || '[]' }}
       npu_job_count: ${{ steps.plan.outputs.npu_job_count || '0' }}
-      image: ${{ steps.image.outputs.image }}
-      summary: ${{ steps.select.outputs.summary }}
-      failed_step: ${{ steps.failed_step.outputs.failed_step }}
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0          # merge-base needs history
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      # Generic linters run first, then TorchTurbo contracts. Keeping both in
-      # one driver makes every finding visible in one pass; `--verify` for the
-      # selector also runs here. Only ruff and PyYAML need installing up front;
-      # shellcheck, actionlint and hadolint bootstrap themselves.
       - name: lint
         id: lint
         env:
@@ -113,12 +74,12 @@ jobs:
 
       - name: resolve image
         id: image
+        if: always()
         env:
           OVERRIDE: ${{ vars.BASE_IMAGE_TAG }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # --repo enables the artifact lookup published by ascend-image.yml.
           REF=$(python3 scripts/ci/image/build_image.py resolve --override "$OVERRIDE" \
             --repo "$GITHUB_REPOSITORY" \
             --fallback 'swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:base-latest')
@@ -126,70 +87,68 @@ jobs:
           echo "image=$REF" >> "$GITHUB_OUTPUT"
           echo "image: $REF"
 
-      # Labels -> flags live in select_tests.py; a copy here would be a second
-      # definition of what ci:e2e means.
-      - name: select
-        id: select
-        env:
-          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
-          WITH_E2E: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && inputs.with_e2e }}
-          FORCE_INPUT: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && inputs.force_all }}
-          BASE_REF: origin/${{ github.base_ref || 'main' }}
-        run: |
-          set -uo pipefail
-          # Empty diff (no history / no info) -> full run: fail-open on purpose.
-          python3 scripts/ci/lint_select/select_tests.py --changed-from git \
-            --base-ref "$BASE_REF" \
-            --dump-changed /tmp/changed.txt \
-            --mode "$CI_MODE" --labels "$LABELS" \
-            --with-e2e "$WITH_E2E" --force-all "$FORCE_INPUT" \
-            --explain --output /tmp/sel.json --github-output "$GITHUB_OUTPUT" \
-            --summary-file "$GITHUB_STEP_SUMMARY" \
-            --image-ref '${{ steps.image.outputs.image }}'
-
-      # The plan aggregates work by (image, device), then chooses one capacity
-      # lane for that device. Matrices therefore grow by image/device, not rank.
+      # Always publish a PlanArtifact, including lint/image failures. Gate is a
+      # consumer of contracts, not of shell exit codes.
       - name: plan
         id: plan
-        if: ${{ success() }}
-        run: |
-          set -euo pipefail
-          python3 scripts/ci/plan.py --selection /tmp/sel.json \
-            --output /tmp/plan.json --summary-file "$GITHUB_STEP_SUMMARY" \
-            --test-path "${{ inputs.test_path }}" \
-            --github-output "$GITHUB_OUTPUT"
-
-      # Last and always(): outputs are still published when the job fails.
-      - name: record failed step
-        id: failed_step
         if: always()
         env:
-          JOB_STATUS: ${{ job.status }}
           LINT_OUTCOME: ${{ steps.lint.outcome }}
           IMAGE_OUTCOME: ${{ steps.image.outcome }}
-          SELECT_OUTCOME: ${{ steps.select.outcome }}
-          PLAN_OUTCOME: ${{ steps.plan.outcome }}
-        run: python3 scripts/ci/report/report_gate.py failed-step
+          IMAGE_REF: ${{ steps.image.outputs.image }}
+        run: |
+          set -uo pipefail
+          mkdir -p "$RUNNER_TEMP/ci-plan"
+          POLICY=pull_request
+          if [ "$CI_MODE" = full ]; then POLICY=nightly; fi
+          COMMON=(
+            --root "$GITHUB_WORKSPACE"
+            --policy "$POLICY"
+            --output "$RUNNER_TEMP/ci-plan/plan.json"
+            --source-repository "$GITHUB_REPOSITORY"
+            --source-ref "$GITHUB_REF"
+            --source-sha "$GITHUB_SHA"
+          )
+          if [ "$LINT_OUTCOME" != success ]; then
+            python3 scripts/ci/planner.py "${COMMON[@]}" \
+              --fail-code lint --fail-path scripts/ci/lint_select/lint_check.py \
+              --fail-message "lint failed"
+            exit 1
+          fi
+          if [ "$IMAGE_OUTCOME" != success ]; then
+            python3 scripts/ci/planner.py "${COMMON[@]}" \
+              --fail-code image-resolve --fail-path scripts/ci/image/build_image.py \
+              --fail-message "image resolution failed"
+            exit 1
+          fi
+          python3 scripts/ci/planner.py "${COMMON[@]}" \
+            --image-ref "npu-default=$IMAGE_REF" \
+            --github-output "$GITHUB_OUTPUT"
 
-  # One matrix entry per CPU image from the plan. Dependencies are
-  # isolated inside the job by venv, so model and framework count do not add boxes.
-  l1_cpu_unit:
-    name: Ascend-PR-CPU-Unit (${{ matrix.id }})
-    needs: select
+      - name: upload plan
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-plan
+          path: ${{ runner.temp }}/ci-plan
+          if-no-files-found: warn
+          retention-days: 7
+
+  cpu:
+    name: Ascend-PR-CPU (${{ matrix.job_id }})
+    needs: plan
     if: |
-      always() && needs.select.result == 'success' &&
-      needs.select.outputs.cpu_job_count != '0'
+      always() && needs.plan.result == 'success' &&
+      needs.plan.outputs.cpu_job_count != '0'
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(needs.select.outputs.cpu_jobs) }}
+        include: ${{ fromJSON(needs.plan.outputs.cpu_jobs) }}
     runs-on: ${{ vars[matrix.runner_variable] || matrix.runner }}
-    timeout-minutes: 40
-
+    timeout-minutes: ${{ matrix.timeout_minutes }}
     defaults:
       run:
         shell: bash
-
     steps:
       - uses: actions/checkout@v4
 
@@ -199,131 +158,156 @@ jobs:
           cache: pip
           cache-dependency-path: |
             pyproject.toml
-            scripts/ci/envs.toml
+            scripts/ci/catalog.yml
             scripts/ci/envs/*.txt
 
-      - name: execute plan
+      - uses: actions/download-artifact@v4
+        with:
+          name: ci-plan
+          path: ${{ runner.temp }}/ci-plan
+
+      - name: execute
         env:
-          JOB: ${{ toJSON(matrix) }}
           RUNNER_LABEL: ${{ vars[matrix.runner_variable] || matrix.runner }}
-          RESULT_JSON: ${{ runner.temp }}/ci-result.json
-          CI_JOB_LOG: ${{ runner.temp }}/turbo-ci.log
-          JUNIT_OUT: ${{ runner.temp }}/pytest.xml
-          VERSIONS_OUT: ${{ runner.temp }}/versions.txt
           CI_VENV_ROOT: ${{ runner.temp }}/turbo-ci-venv
-        run: python3 scripts/ci/run_job.py --job-json "$JOB"
-
-      - name: summary
-        if: always()
-        env:
-          RESULT_JSON: ${{ runner.temp }}/ci-result.json
         run: |
-          set -uo pipefail
-          python3 scripts/ci/report/report_result.py report --file "$RESULT_JSON" \
-            --train-log "${{ runner.temp }}/turbo-ci.log" \
-            --versions "${{ runner.temp }}/versions.txt" \
-            --junit "${{ runner.temp }}/pytest.xml" >> "$GITHUB_STEP_SUMMARY" || true
-          python3 scripts/ci/report/report_result.py notice --file "$RESULT_JSON" \
-            --model-type pytest-cpu-unit || true
+          python3 scripts/ci/executor.py \
+            --plan "$RUNNER_TEMP/ci-plan/plan.json" \
+            --job-id "${{ matrix.job_id }}" \
+            --output "$RUNNER_TEMP/ci-result/job-result.json" \
+            --summary "$GITHUB_STEP_SUMMARY"
 
-  # NPU unit and E2E are separate matrix entries. Each entry selects the
-  # smallest lane that can hold its own process/card requirement.
-  l2_npu:
-    name: Ascend-PR-NPU-Unit (${{ matrix.id }})
-    needs: select
-    # Fork PRs get no secrets, and handing secrets to fork code is RCE.
+      - name: upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-result-${{ matrix.job_id }}
+          path: ${{ runner.temp }}/ci-result
+          if-no-files-found: warn
+          retention-days: 7
+
+  npu:
+    name: Ascend-PR-NPU (${{ matrix.job_id }})
+    needs: plan
     if: |
-      always() && needs.select.result == 'success' &&
-      needs.select.outputs.npu_job_count != '0' &&
+      always() && needs.plan.result == 'success' &&
+      needs.plan.outputs.npu_job_count != '0' &&
       (github.event_name != 'pull_request' ||
        github.event.pull_request.head.repo.full_name == github.repository)
     strategy:
       fail-fast: false
-      # Each matrix entry is a separate job and pod. Two at most run together;
-      # E2E cases never share a pod, so model state cannot leak across cases.
       max-parallel: 2
       matrix:
-        include: ${{ fromJSON(needs.select.outputs.npu_jobs) }}
+        include: ${{ fromJSON(needs.plan.outputs.npu_jobs) }}
     runs-on: ${{ vars[matrix.runner_variable] || matrix.runner }}
-    timeout-minutes: 360
-    outputs:
-      skip_reason: ${{ steps.execute.outputs.skip_reason }}
-
+    timeout-minutes: ${{ matrix.timeout_minutes }}
     container:
-      image: ${{ needs.select.outputs.image }}
+      image: ${{ matrix.image_ref }}
       credentials:
         username: ${{ secrets.SWR_USERNAME }}
         password: ${{ secrets.SWR_PASSWORD }}
       options: --user root
-
     defaults:
       run:
         shell: bash
-
     steps:
       - uses: actions/checkout@v4
 
-      - name: preflight
+      - uses: actions/download-artifact@v4
+        with:
+          name: ci-plan
+          path: ${{ runner.temp }}/ci-plan
+
+      - name: execute
         env:
-          RESULT_JSON: /tmp/ci-result.json
-        run: |
-          set -uo pipefail
-          python3 scripts/ci/report/report_result.py init --file "$RESULT_JSON" \
-            kind=pytest model_type=pytest-npu-unit mode=npu job_id="${{ matrix.id }}" \
-            runner_label="${{ vars[matrix.runner_variable] || matrix.runner }}" \
-            image="${{ needs.select.outputs.image }}"
-
-          uname -m; nproc; free -h | head -2; df -h / | tail -1; python -V
-
-      - name: environment check
-        run: python3 scripts/ci/common/env_pod.py probe --file /tmp/torch-before.json
-
-      - name: execute plan
-        id: execute
-        env:
-          JOB: ${{ toJSON(matrix) }}
           RUNNER_LABEL: ${{ vars[matrix.runner_variable] || matrix.runner }}
-          IMAGE: ${{ needs.select.outputs.image }}
-          RESULT_JSON: /tmp/ci-result.json
-          CI_JOB_LOG: /tmp/turbo-ci.log
-          JUNIT_OUT: /tmp/pytest.xml
-          VERSIONS_OUT: /tmp/versions.txt
           CI_VENV_ROOT: /tmp/turbo-ci-venv
-          SEQ_LEN: '4096'
-          DATASET_IN: 'gsm8k'
-          FINETUNING_TYPE: 'full'
-        run: python3 scripts/ci/run_job.py --job-json "$JOB"
-
-      - name: summary
-        if: always()
-        env:
-          RESULT_JSON: /tmp/ci-result.json
         run: |
-          set -uo pipefail
-          python3 scripts/ci/report/report_result.py report --file "$RESULT_JSON" \
-            --train-log /tmp/turbo-ci.log --versions /tmp/versions.txt \
-            --junit /tmp/pytest.xml >> "$GITHUB_STEP_SUMMARY" || true
-          python3 scripts/ci/report/report_result.py notice --file "$RESULT_JSON" \
-            --model-type pytest-npu-unit || true
+          python3 scripts/ci/executor.py \
+            --plan "$RUNNER_TEMP/ci-plan/plan.json" \
+            --job-id "${{ matrix.job_id }}" \
+            --output "$RUNNER_TEMP/ci-result/job-result.json" \
+            --summary "$GITHUB_STEP_SUMMARY"
 
-      # timeout-minutes only kills the process; children would keep the cards.
-      - name: environment cleanup
+      - name: upload result
         if: always()
-        continue-on-error: true
-        run: python3 scripts/ci/common/env_pod.py cleanup
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-result-${{ matrix.job_id }}
+          path: ${{ runner.temp }}/ci-result
+          if-no-files-found: warn
+          retention-days: 7
 
-  # Sole required check; the rules live in report_gate.py so pr/full cannot drift.
-  # select is a direct dep: a failed plan skips the lanes in seconds.
+  # Fork PRs cannot receive SWR secrets. Emit the same typed JobResults as a
+  # normal run so Gate can distinguish an allowed platform skip from a lost job.
+  npu_fork_skip:
+    name: Ascend-PR-NPU-Skip (${{ matrix.job_id }})
+    needs: plan
+    if: |
+      always() && needs.plan.result == 'success' &&
+      needs.plan.outputs.npu_job_count != '0' &&
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name != github.repository
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.npu_jobs) }}
+    runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ci-plan
+          path: ${{ runner.temp }}/ci-plan
+
+      - name: record skip
+        run: |
+          python3 scripts/ci/executor.py \
+            --plan "$RUNNER_TEMP/ci-plan/plan.json" \
+            --job-id "${{ matrix.job_id }}" \
+            --record-skip fork-pr-no-secrets \
+            --skip-message "fork PR has no SWR secrets" \
+            --output "$RUNNER_TEMP/ci-result/job-result.json" \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-result-${{ matrix.job_id }}
+          path: ${{ runner.temp }}/ci-result
+          if-no-files-found: warn
+          retention-days: 7
+
   gate:
     name: Ascend-PR-Gate
-    needs: [select, l1_cpu_unit, l2_npu]
-    # always() so lanes' results are judged even when select failed; the label
-    # guard mirrors select, or a manual-label run would judge an empty plan.
+    needs: [plan, cpu, npu, npu_fork_skip]
     if: ${{ always() && !startsWith(github.event.label.name || '', 'ci:manual:') }}
     runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+
+      - name: download plan
+        if: always()
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-plan
+          path: ${{ runner.temp }}/ci-plan
+
+      - name: download results
+        if: always()
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ci-result-*
+          path: ${{ runner.temp }}/ci-results
 
       - name: timing
         env:
@@ -332,15 +316,29 @@ jobs:
 
       - name: judge
         env:
-          R_SEL: ${{ needs.select.result }}
-          SEL_FAILED_STEP: ${{ needs.select.outputs.failed_step }}
-          R_CPU: ${{ needs.l1_cpu_unit.result }}
-          R_NPU: ${{ needs.l2_npu.result }}
-          CPU_RUN: ${{ needs.select.outputs.cpu_job_count != '0' }}
-          NPU_RUN: ${{ needs.select.outputs.npu_job_count != '0' }}
-          SKIP_REASON: ${{ needs.l2_npu.outputs.skip_reason }}
-          # Only the string is passed; report_gate.py decides what ci:e2e:strict means.
-          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
-          IS_FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
-          SUMMARY: ${{ needs.select.outputs.summary }}
-        run: python3 scripts/ci/report/report_gate.py judge --mode "$CI_MODE"
+          PLAN: ${{ runner.temp }}/ci-plan/plan.json
+          RESULTS: ${{ runner.temp }}/ci-results
+          DECISION: ${{ runner.temp }}/ci-decision/decision.json
+        run: |
+          set -uo pipefail
+          mkdir -p "$RESULTS" "$(dirname "$DECISION")"
+          if [ ! -f "$PLAN" ]; then
+            echo "::error::missing ci-plan artifact"
+            printf '## CI Gate: failed\n\n- missing-plan: ci-plan artifact is missing\n' \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 2
+          fi
+          python3 scripts/ci/gate.py \
+            --plan "$PLAN" \
+            --results "$RESULTS" \
+            --output "$DECISION" \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: upload decision
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-decision
+          path: ${{ runner.temp }}/ci-decision
+          if-no-files-found: ignore
+          retention-days: 7

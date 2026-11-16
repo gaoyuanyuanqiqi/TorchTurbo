@@ -12,19 +12,27 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-
-from facts import EnvSpec, load_catalog
+from typing import Mapping, Protocol
 
 CPU_TORCH_VERSION = os.environ.get("CI_CPU_TORCH_VERSION", "2.10.0")
 READY_FILE = ".tt-ready.json"
 INSTALL_SCHEMA = "2"
 
 
+class VenvDefinition(Protocol):
+    name: str
+    python: str
+    requirements: str | tuple[str, ...]
+    overrides: tuple[str, ...]
+    extends: str | None
+    constraints: str
+
+
 @dataclass(frozen=True)
 class Venv:
     path: Path
     python: Path
-    spec: EnvSpec
+    spec: VenvDefinition
 
     def environment(self) -> dict[str, str]:
         env = os.environ.copy()
@@ -42,18 +50,23 @@ class VenvManager:
     """Build or reuse one venv per (env definition, device) pair."""
 
     def __init__(self, root: Path, cache_root: Path, device: str,
-                 log_path: Path) -> None:
+                 log_path: Path,
+                 specs: Mapping[str, VenvDefinition] | None = None) -> None:
         self.root = root
         self.cache_root = cache_root
         self.device = device
         self.log_path = log_path
-        self.catalog = load_catalog(root)
+        if specs is None:
+            from facts import load_catalog
+
+            specs = load_catalog(root).envs
+        self.specs = dict(specs)
         self._memory: dict[str, Venv] = {}
 
     def ensure(self, env_name: str) -> Venv:
         if env_name in self._memory:
             return self._memory[env_name]
-        spec = self.catalog.envs.get(env_name)
+        spec = self.specs.get(env_name)
         if spec is None:
             raise ValueError(f"unknown environment: {env_name}")
         chain = self._environment_chain(spec)
@@ -72,19 +85,20 @@ class VenvManager:
         self._memory[env_name] = venv
         return venv
 
-    def _environment_chain(self, spec: EnvSpec) -> list[EnvSpec]:
-        chain: list[EnvSpec] = []
+    def _environment_chain(self, spec: VenvDefinition) -> list[VenvDefinition]:
+        chain: list[VenvDefinition] = []
         seen: set[str] = set()
-        current = spec
+        current: VenvDefinition | None = spec
         while current is not None:
             if current.name in seen:
                 raise ValueError(f"environment cycle at {current.name}")
             seen.add(current.name)
             chain.append(current)
-            current = self.catalog.envs.get(current.extends) if current.extends else None
+            current = self.specs.get(current.extends) if current.extends else None
         return list(reversed(chain))
 
-    def _profile_digest(self, spec: EnvSpec, chain: list[EnvSpec]) -> str:
+    def _profile_digest(self, spec: VenvDefinition,
+                        chain: list[VenvDefinition]) -> str:
         digest = hashlib.sha256()
         digest.update(f"schema={INSTALL_SCHEMA}\n".encode())
         digest.update(f"device={self.device}\n".encode())
@@ -104,9 +118,7 @@ class VenvManager:
         for item in chain:
             digest.update(f"env={item.name}\n".encode())
             digest.update(f"env-python={item.python}\n".encode())
-            for requirements in (item.requirements, *item.overrides):
-                if not requirements:
-                    continue
+            for requirements in _requirement_paths(item):
                 for path in _requirement_files(self.root / requirements):
                     name = path.relative_to(self.root).as_posix()
                     digest.update(f"file={name}\n".encode())
@@ -122,7 +134,8 @@ class VenvManager:
         except (OSError, ValueError):
             return None
 
-    def _install(self, target: Path, spec: EnvSpec, chain: list[EnvSpec]) -> None:
+    def _install(self, target: Path, spec: VenvDefinition,
+                 chain: list[VenvDefinition]) -> None:
         self.cache_root.mkdir(parents=True, exist_ok=True)
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         base_python = _base_python(spec.python)
@@ -147,9 +160,7 @@ class VenvManager:
         constraints = target / "ci-constraints.txt"
         constraints.write_text(self._constraints(venv, environment), encoding="utf-8")
         for item in chain:
-            for requirements in (item.requirements, *item.overrides):
-                if not requirements:
-                    continue
+            for requirements in _requirement_paths(item):
                 self._pip(venv, [
                     "install", "-r", str(self.root / requirements),
                     "-c", str(constraints),
@@ -237,4 +248,16 @@ def _requirement_files(path: Path) -> list[Path]:
             if value.startswith("-r "):
                 pending.append(current.parent / value[3:].strip())
     return files
+
+
+def _requirement_paths(spec: VenvDefinition) -> tuple[str, ...]:
+    values = (spec.requirements, *spec.overrides)
+    paths: list[str] = []
+    for value in values:
+        if isinstance(value, str):
+            if value:
+                paths.append(value)
+        else:
+            paths.extend(value)
+    return tuple(paths)
 
