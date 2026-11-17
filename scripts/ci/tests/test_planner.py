@@ -44,7 +44,7 @@ def test_pull_request_scope(config: CiConfig, facts: TestFacts, pr_plan: Plan) -
     }
     assert pr_plan.coverage == {
         "pytest": {
-            "core": {"mode": "all", "files": 86, "routes": 88},
+            "core": {"mode": "all", "files": 88, "routes": 90},
             "model": {"mode": "none", "files": 0, "routes": 0},
             "adapter": {"mode": "all", "files": 16, "routes": 16},
         },

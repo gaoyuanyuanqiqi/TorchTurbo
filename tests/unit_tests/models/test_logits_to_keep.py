@@ -19,6 +19,8 @@ from torchturbo.models.kimi_k25.model import TurboKimiK25ForConditionalGeneratio
 from torchturbo.models.kimi_k25.modeling_deepseek import DeepseekV3ForCausalLM
 from torchturbo.models.llada2_moe.model import TurboLLaDA2MoeForCausalLM
 
+pytestmark = pytest.mark.cpu
+
 _HIDDEN_SIZE = 3
 _VOCAB_SIZE = 7
 

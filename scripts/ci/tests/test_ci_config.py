@@ -200,10 +200,10 @@ def test_unknown_scope_is_rejected(config: CiConfig) -> None:
 
 def test_facts_snapshot(facts: TestFacts) -> None:
     assert counts(facts) == {
-        "core": 86,
+        "core": 88,
         "model": 60,
         "adapter": 16,
-        "total": 162,
+        "total": 164,
         "integration": 3,
     }
     assert [case.case_id for case in facts.integration] == [
