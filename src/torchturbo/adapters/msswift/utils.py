@@ -58,7 +58,22 @@ def build_config_from_swift_args(args: Any) -> EngineConfig:
     if vars(args).get("rlhf_type") == "dpo" and tt.moe_aux_loss_coeff == 0.0:
         tt.moe_aux_loss_coeff = args.router_aux_loss_coef
 
-    return build_from_args(tt)
+    config = build_from_args(tt)
+    if config.moe.enable_mega_moe and vars(args).get("tuner_type") == "lora":
+        logger.warning_rank0("Using native experts for LoRA instead of MegaMoE.")
+        config.moe.enable_mega_moe = False
+    if config.moe.enable_mega_moe:
+        length = (args.packing_length if args.packing else None) or args.max_length
+        if length is None or length <= 0:
+            raise ValueError("MegaMoE requires a positive packing_length or max_length in Swift.")
+        tokens = length * args.per_device_train_batch_size
+        sp = config.parallel_plan.sp_size
+        required = ((tokens + sp * 128 - 1) // (sp * 128)) * 128
+        if config.moe.local_token_capacity is None:
+            config.moe.local_token_capacity = required
+        elif config.moe.local_token_capacity < required:
+            raise ValueError(f"moe.local_token_capacity must be at least {required} for this Swift run.")
+    return config
 
 
 def build_lora_config_from_swift_args(args: Any) -> Any | None:

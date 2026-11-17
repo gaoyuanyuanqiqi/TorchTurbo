@@ -136,7 +136,10 @@ def topk_softmax_with_capacity(
     use_hash_routing: bool = False,
     hash_table: Optional[torch.Tensor] = None,
     input_ids: Optional[torch.Tensor] = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    *,
+    return_selected_probs: bool = False,
+    need_routing_map: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
     """Select fixed-top-k experts and compute their routing probabilities.
     Args:
         logits (torch.Tensor): Logits tensor.
@@ -149,7 +152,7 @@ def topk_softmax_with_capacity(
         expert_bias (torch.Tensor): The bias added to logits for expert routing.
 
     Returns:
-        Dense weights, boolean assignment mask, and the selected expert IDs.
+        Dense or selected weights, optional boolean mask, and selected expert IDs.
         Both learned and hash routing return the compact top-k IDs in their
         native order; the packed layout only needs a consistent pairing
         between expert IDs, row indices, and gathered probabilities.
@@ -223,11 +226,12 @@ def topk_softmax_with_capacity(
 
     probs = probs.type_as(logits)
 
-    # TODO Try using element-wise operations instead of scatter?
-    topk_masked_gates = torch.zeros_like(logits).scatter(1, top_indices, probs)
-    topk_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
-
-    return topk_masked_gates, topk_map, top_indices
+    if not return_selected_probs:
+        probs = torch.zeros_like(logits).scatter(1, top_indices, probs)
+    routing_map = None
+    if need_routing_map:
+        routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
+    return probs, routing_map, top_indices
 
 
 def ensure_divisibility(numerator, denominator):

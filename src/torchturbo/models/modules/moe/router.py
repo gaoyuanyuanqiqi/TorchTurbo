@@ -112,6 +112,7 @@ class TopKRouter(Router):
     ) -> None:
         """Initialize the zero token dropping router."""
         super().__init__(config=config)
+        self.return_selected_probs = False
         self.topk = self.config.moe_router_topk
         self.routing_type = self.config.moe_router_load_balancing_type
         self.score_function = self.config.moe_router_score_function
@@ -280,14 +281,14 @@ class TopKRouter(Router):
         input_ids: Optional[torch.Tensor] = None,
         padding_mask: torch.Tensor | None = None,
         accumulate_tokens_per_expert: bool = True,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
         """Top-k routing function
 
         Args:
             logits (torch.Tensor): Logits tensor after gating.
 
         Returns:
-            Dense routing weights, boolean assignment mask, and the selected
+            Dense or selected routing weights, optional assignment mask, and the selected
             expert IDs in their native top-k order.
         """
         seq_length, bsz = logits.shape[:2]
@@ -312,6 +313,8 @@ class TopKRouter(Router):
                 use_hash_routing=self.use_hash_routing,
                 hash_table=getattr(self, "tid2eid", None),
                 input_ids=input_ids,
+                return_selected_probs=self.return_selected_probs,
+                need_routing_map=not self.return_selected_probs or self.enable_expert_bias,
             )
         else:
             raise ValueError(f"Unsupported MoE routing type: {self.routing_type}")
@@ -361,12 +364,12 @@ class TopKRouter(Router):
         input_ids: Optional[torch.Tensor] = None,
         padding_mask: torch.Tensor | None = None,
         accumulate_tokens_per_expert: bool = True,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
         """
         Forward pass of the router.
 
         Returns:
-            Dense routing weights, boolean assignment mask, selected expert
+            Dense or selected routing weights, optional assignment mask, selected expert
             IDs, and the router logits.
         """
         self._maintain_float32_expert_bias()

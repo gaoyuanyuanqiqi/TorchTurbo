@@ -780,3 +780,17 @@ def test_lora_config_dora_rslora_flags():
     )
     assert lora.use_rslora is True
     assert lora.use_dora is True
+
+
+def test_mega_moe_capacity_uses_packed_per_rank_rows():
+    _set_tt(enable_mega_moe=True, sp_size=2)
+    args = _base_args(packing=True, packing_length=257, max_length=1024, per_device_train_batch_size=2)
+    assert build_config_from_swift_args(args).moe.local_token_capacity == 384
+    _set_tt(enable_mega_moe=True, sp_size=2, moe_local_token_capacity=256)
+    with pytest.raises(ValueError, match="at least 384"):
+        build_config_from_swift_args(args)
+
+
+def test_mega_moe_lora_keeps_native_experts():
+    _set_tt(enable_mega_moe=True)
+    assert not build_config_from_swift_args(_base_args(tuner_type="lora")).moe.enable_mega_moe
