@@ -49,6 +49,13 @@ Planner 从 pytest 源码派生以下事实，不手工维护测试清单：
 - 是否属于 integration 测试
 - 是否需要独立进程组
 
+设备路由采用“CPU 低摩擦、加速器 fail closed”：
+
+- 有显式 device marker 时，按 marker 路由。
+- 没有 marker 且没有 NPU/GPU 代码证据时，默认归入 `cpu`；普通 CPU 多进程测试不强制补 marker。
+- 检测到 NPU/GPU 代码证据但没有显式 marker 时，facts 扫描失败，并给出应补的 marker 示例。
+- 目录只负责 `core` / `model` / `adapter` 分类，不参与设备选择。
+
 adapter 测试依赖独立的 `swift` / `llamafactory` 环境，PR 和 nightly 均全量运行。
 
 ### 1.3 integration case

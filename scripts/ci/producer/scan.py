@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 DEVICE_MARKERS = frozenset({"cpu", "npu", "gpu"})
+ACCELERATOR_DEVICES = frozenset({"npu", "gpu"})
 MULTI_DEVICE_MARKERS = frozenset({"multi_npu", "multi_gpu"})
 MULTI_DEVICE_TARGETS = {"multi_npu": "npu", "multi_gpu": "gpu"}
 REQUIRED_MARKERS = ("cpu", "npu", "multi_npu", "gpu", "multi_gpu", "integration")
@@ -139,7 +140,7 @@ def _literal_string(node: ast.AST) -> str:
 
 
 def _normalized_device(value: str) -> str:
-    return "gpu" if value == "cuda" else value
+    return {"cuda": "gpu", "nccl": "gpu", "hccl": "npu"}.get(value, value)
 
 
 def _device_evidence(tree: ast.AST) -> set[str]:
@@ -177,6 +178,10 @@ def _device_evidence(tree: ast.AST) -> set[str]:
         name = dotted.rsplit(".", 1)[-1]
         if name in {"npu", "cuda"} and dotted.count(".") >= 1:
             devices.add(_normalized_device(name))
+        elif name == "init_process_group" and node.args:
+            backend = _normalized_device(_literal_string(node.args[0]))
+            if backend in ACCELERATOR_DEVICES:
+                devices.add(backend)
         elif name in {"to", "device", "init_device_mesh"} and node.args:
             device = _normalized_device(_literal_string(node.args[0]))
             if device in DEVICE_MARKERS:
@@ -272,6 +277,12 @@ def _process_unit(path: str, families: set[str]) -> str:
     return f"layer:{'/'.join(Path(path).parts[:-1])}"
 
 
+def _marker_hint(devices: set[str], processes: int) -> str:
+    device = sorted(devices & ACCELERATOR_DEVICES)[0]
+    marker = f"multi_{device}" if processes >= 2 else device
+    return f"@pytest.mark.{marker}"
+
+
 def scan_tests(root: Path, models: set[str]) -> tuple[dict[str, TestFacts], list[ScanError]]:
     """Scan tests/unit_tests and validate marker/runtime evidence for each file."""
     facts: dict[str, TestFacts] = {}
@@ -300,12 +311,22 @@ def scan_tests(root: Path, models: set[str]) -> tuple[dict[str, TestFacts], list
             test_multi = markers & MULTI_DEVICE_MARKERS
             test_devices.update(MULTI_DEVICE_TARGETS[name] for name in test_multi)
             integration |= "integration" in markers
+            evidence = _device_evidence(test) | module_guards
+            test_processes = _multiprocess_rank(test)
             if not test_devices:
-                errors.append(ScanError(rel, f"{test.name} has no device marker"))
+                accelerator_evidence = evidence & ACCELERATOR_DEVICES
+                if accelerator_evidence:
+                    hint = _marker_hint(accelerator_evidence, test_processes)
+                    errors.append(ScanError(
+                        rel,
+                        f"{test.name} has accelerator code evidence "
+                        f"{sorted(accelerator_evidence)} but no device marker; add {hint}",
+                    ))
+                else:
+                    test_devices = {"cpu"}
             elif "cpu" in test_devices and len(test_devices) > 1:
                 errors.append(ScanError(rel, f"{test.name} mixes cpu with accelerator markers"))
-            evidence = _device_evidence(test) | module_guards
-            if evidence and test_devices.isdisjoint(evidence):
+            if test_devices and evidence and test_devices.isdisjoint(evidence):
                 errors.append(ScanError(
                     rel,
                     f"{test.name} markers {sorted(test_devices)} disagree with "
@@ -313,7 +334,6 @@ def scan_tests(root: Path, models: set[str]) -> tuple[dict[str, TestFacts], list
                 ))
             devices |= test_devices
             multi_devices |= {MULTI_DEVICE_TARGETS[name] for name in test_multi}
-            test_processes = _multiprocess_rank(test)
             for device in test_devices:
                 device_processes[device] = max(
                     device_processes.get(device, 1), test_processes
@@ -322,7 +342,7 @@ def scan_tests(root: Path, models: set[str]) -> tuple[dict[str, TestFacts], list
             continue
         processes = _multiprocess_rank(tree)
         evidence = _device_evidence(tree)
-        if evidence and devices.isdisjoint(evidence):
+        if evidence and devices and devices.isdisjoint(evidence):
             errors.append(ScanError(
                 rel,
                 f"device markers {sorted(devices)} disagree with code evidence "

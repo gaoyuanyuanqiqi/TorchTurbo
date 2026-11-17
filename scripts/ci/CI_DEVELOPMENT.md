@@ -122,7 +122,9 @@ integration 结果上传前会删除 `training/`、`initial_checkpoint/`、`tens
 - 新增 lane：改 `resources.lanes`，lane 只绑定 target 和 runner 容量，不绑定 image。
   Planner 选择容量最小且满足 ranks 的 lane，不在 consumer 写平台分支。
 - 新增 venv：改 `resources.venvs`，可用 `extends` 复用依赖链；依赖文件内容计入 digest。
-- 新增 pytest：补 device marker 和依赖事实即可。必要时增加 `model_venvs`、
+- 新增 pytest：普通 CPU 用例无需 device marker，会自动归入 `cpu`；NPU/GPU 用例必须补
+  对应的 `pytest.mark.npu` / `pytest.mark.gpu`，多进程加速器用例补
+  `pytest.mark.multi_npu` / `pytest.mark.multi_gpu`。必要时增加 `model_venvs`、
   `framework_venvs`、`combo_venvs` 或文件 override。
 - 新增 adapter：补 framework venv 映射和测试事实。PR 是否运行由 `scopes` 决定。
 - 新增 integration case：在 suite 中增加 case；PR 使用 `explicit`，不会自动纳入。
