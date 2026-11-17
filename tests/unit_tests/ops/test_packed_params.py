@@ -91,3 +91,9 @@ def test_inference_boundaries_do_not_require_a_mutation_counter():
         assert get_packed_params(cu, 6).cu_seqlens_list == [0, 2, 5, 6]
         cu[1] = 3
         assert get_packed_params(cu, 6).cu_seqlens_list == [0, 3, 5, 6]
+
+
+def test_unmarked_cpu_test_defaults_to_cpu_route():
+    cu = torch.tensor([0, 2, 5], dtype=torch.int32)
+
+    assert get_packed_params(cu, 6).cu_seqlens_list == [0, 2, 5, 6]
