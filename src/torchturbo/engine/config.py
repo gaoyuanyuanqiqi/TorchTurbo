@@ -476,7 +476,17 @@ class MoEConfig:
     token_dispatcher: str = "alltoall"
     """Expert token dispatcher type."""
 
+    enable_mega_moe: bool = False
+    local_token_capacity: int | None = None
+
     def __post_init__(self) -> None:
+        self.enable_mega_moe = string_to_bool(self.enable_mega_moe)
+        if self.local_token_capacity is not None and (
+            type(self.local_token_capacity) is not int
+            or self.local_token_capacity <= 0
+            or self.local_token_capacity % 128
+        ):
+            raise ValueError("moe.local_token_capacity must be a positive 128-aligned integer.")
         if self.token_dispatcher != "alltoall":
             raise ValueError("moe.token_dispatcher must be 'alltoall'.")
 
@@ -1313,6 +1323,8 @@ def _build_moe_config(fields: Mapping[str, Any]) -> MoEConfig:
     """MoEConfig from the merged config dict."""
     moe_d = fields.get("moe") or {}
     return MoEConfig(
+        enable_mega_moe=moe_d.get("enable_mega_moe", False),
+        local_token_capacity=moe_d.get("local_token_capacity"),
         aux_loss_coeff=float(moe_d.get("aux_loss_coeff", 0.0)),
         z_loss_coeff=float(moe_d.get("z_loss_coeff", 0.0)),
         token_dispatcher=moe_d.get("token_dispatcher", "alltoall"),

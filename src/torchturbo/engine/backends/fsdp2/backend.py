@@ -458,6 +458,17 @@ class FSDP2Backend(BaseBackend):
         # Phase 1: Module replacement (e.g., MoE layers).
         model = self._replace_modules(model, plan)
 
+        if self.config.moe.enable_mega_moe:
+            if peft_config is not None:
+                logger.warning_rank0("Using native experts for LoRA instead of MegaMoE.")
+                self.config.moe.enable_mega_moe = False
+            else:
+                from ....models.modules.moe.mega_moe import bind_mega_moe
+
+                if self.device_runtime.device.type != "npu":
+                    raise ValueError("MegaMoE requires the Ascend NPU runtime.")
+                bind_mega_moe(model, self.get_ep_info()["ep_group"], self.config.moe.local_token_capacity)
+
         # Phase 2: Apply LoRA (after module replacement, before sharding).
         if peft_config is not None:
             from ...peft import apply_peft

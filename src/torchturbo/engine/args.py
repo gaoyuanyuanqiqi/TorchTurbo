@@ -173,6 +173,8 @@ class TorchTurboArgs:
     cpu_offload_enabled: bool | None = None
     enable_mtp: bool = False
     mtp_loss_scaling_factor: float | None = 0.1
+    enable_mega_moe: bool | None = None
+    moe_local_token_capacity: int | None = None
     moe_aux_loss_coeff: float = 0.0
     moe_z_loss_coeff: float = 0.0
     moe_token_dispatcher: str | None = None
@@ -516,6 +518,16 @@ _TURBO_ARG_SPECS: tuple[TurboArgSpec, ...] = (
         metavar="FLOAT",
         help="DeepSeek-V4 DSpark confidence-head BCE coefficient. "
         "Unset keeps the official DeepSpec default.",
+    ),
+    TurboArgSpec(
+        name="enable_mega_moe",
+        args_name="enable_mega_moe",
+        config_path="moe.enable_mega_moe",
+    ),
+    TurboArgSpec(
+        name="moe_local_token_capacity",
+        args_name="moe_local_token_capacity",
+        config_path="moe.local_token_capacity",
     ),
     TurboArgSpec(
         name="moe_token_dispatcher",

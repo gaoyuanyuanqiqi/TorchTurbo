@@ -1429,3 +1429,14 @@ def test_gbs_negative_raises():
 def test_gbs_zero_raises():
     with pytest.raises(ValueError):
         build_from_args(TorchTurboArgs(gbs=0))
+
+
+def test_mega_moe_yaml_config(tmp_path):
+    path = _write(tmp_path, "mega.yaml", _engine_config(
+        "moe:\n  enable_mega_moe: true\n  local_token_capacity: 128\n"
+    ))
+    config = _build_from_argv(["--tt_config", path])
+    assert config.moe.enable_mega_moe and config.moe.local_token_capacity == 128
+    assert not _build_from_argv([]).moe.enable_mega_moe
+    with pytest.raises(ValueError, match="128-aligned"):
+        EngineConfig.from_dict({"moe": {"local_token_capacity": 127}})
