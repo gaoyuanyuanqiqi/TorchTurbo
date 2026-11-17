@@ -18,9 +18,6 @@ from torchturbo.models.modules.moe.moe_layer import MoELayer, MoESubmodules
 from torchturbo.ops import get_or_create_ops, OpPolicy
 from torchturbo.runtime import get_device_runtime
 
-pytestmark = pytest.mark.multi_npu
-
-
 @pytest.mark.skipif(int(os.environ.get("WORLD_SIZE", 1)) not in (2, 4), reason="requires two or four torchrun ranks")
 def test_mega_moe_matches_native_expert_parallel():
     pytest.importorskip("torch_npu")
