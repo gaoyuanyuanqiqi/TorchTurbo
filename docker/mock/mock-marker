@@ -1,0 +1,2 @@
+MOCK ONLY: torchturbo CI image-pipeline orchestration fixture.
+This image contains no Ascend runtime or training environment.

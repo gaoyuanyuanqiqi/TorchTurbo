@@ -80,7 +80,7 @@ jobs:
 
   tests:
     name: Ascend-Image-Tests (${{ inputs.image }})
-    if: inputs.image_mode == 'build_if_missing'
+    if: inputs.image_mode == 'build_if_missing' && !startsWith(inputs.image, 'mock-')
     needs: build
     uses: ./.github/workflows/ascend-pr.yml
     with:
@@ -90,6 +90,78 @@ jobs:
       checkout_ref: ${{ inputs.checkout_ref }}
       image_name: ${{ inputs.image }}
       image_ref: ${{ needs.build.outputs.ref }}
+
+  mock_verify:
+    name: Ascend-Image-Mock-Verify (${{ inputs.image }})
+    if: inputs.image_mode == 'build_if_missing' && startsWith(inputs.image, 'mock-')
+    needs: build
+    runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
+    timeout-minutes: 10
+    steps:
+      - name: log in to SWR
+        env:
+          SWR_USER: ${{ secrets.SWR_USERNAME }}
+          SWR_PASS: ${{ secrets.SWR_PASSWORD }}
+          REGISTRY: ${{ vars.SWR_REGISTRY || 'swr.cn-north-12.myhuaweicloud.com' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SWR_USER:-}" ] || [ -z "${SWR_PASS:-}" ]; then
+            echo "::error::SWR_USERNAME / SWR_PASSWORD are required to verify a candidate"
+            exit 1
+          fi
+          printf '%s' "$SWR_PASS" | docker login "$REGISTRY" -u "$SWR_USER" --password-stdin
+
+      - name: verify mock candidate identity
+        env:
+          IMAGE: ${{ inputs.image }}
+          REF: ${{ needs.build.outputs.ref }}
+          CONTENT_TAG: ${{ needs.build.outputs.content_tag }}
+        run: |
+          set -euo pipefail
+          case "$IMAGE:$CONTENT_TAG" in
+            mock-*:cann*-mock-*) ;;
+            *)
+              echo "::error::refusing non-mock candidate verification for $IMAGE:$CONTENT_TAG"
+              exit 1
+              ;;
+          esac
+          docker pull "$REF" >/dev/null
+          labels=$(docker image inspect --format '{{json .Config.Labels}}' "$REF")
+          LABELS="$labels" python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          labels = json.loads(os.environ["LABELS"]) or {}
+          expected = {
+              "org.torchturbo.ci.mock": "true",
+              "org.torchturbo.ci.purpose": "image-pipeline-orchestration-only",
+          }
+          for key, value in expected.items():
+              if labels.get(key) != value:
+                  print(f"::error::mock image label {key}={labels.get(key)!r}, expected {value!r}")
+                  sys.exit(1)
+          print("MOCK ONLY: candidate identity and labels verified")
+          PY
+
+      - name: summary
+        if: always()
+        env:
+          IMAGE: ${{ inputs.image }}
+          CONTENT_TAG: ${{ needs.build.outputs.content_tag }}
+          REF: ${{ needs.build.outputs.ref }}
+        run: |
+          {
+            echo '## MOCK ONLY image verification'
+            echo ''
+            echo 'This run exercised image orchestration only. No NPU test or training was executed.'
+            echo ''
+            echo '| field | value |'
+            echo '|---|---|'
+            echo "| image | \`${IMAGE}\` |"
+            echo "| content tag | \`${CONTENT_TAG}\` |"
+            echo "| candidate ref | \`${REF}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   promote:
     name: Ascend-Image-Promote-Alias (${{ inputs.image }})

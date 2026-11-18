@@ -1,0 +1,10 @@
+# MOCK ONLY: zero-base image used solely to exercise the image pipeline.
+# It intentionally contains no training runtime and must never be used by a
+# real PR or nightly workload.
+FROM scratch
+
+LABEL org.opencontainers.image.title="torchturbo-ci-mock-npu-a3"
+LABEL org.torchturbo.ci.mock="true"
+LABEL org.torchturbo.ci.purpose="image-pipeline-orchestration-only"
+
+COPY mock-marker /torchturbo-ci-mock-image

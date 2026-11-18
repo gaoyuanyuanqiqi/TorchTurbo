@@ -26,6 +26,17 @@ resources:
         cann_version: "9.0.0"
         revision: 1
         args: {}
+    mock-npu-a3:
+      target: npu-a3
+      kind: container
+      ref: swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:cann9.0.0-mock-a3-mock-base
+      build:
+        dockerfile: docker/mock/Dockerfile_mock_npu_aarch64
+        context: docker/mock
+        platform: linux/arm64
+        cann_version: "9.0.0-mock"
+        revision: 1
+        args: {}
 
   venvs:
     default:
