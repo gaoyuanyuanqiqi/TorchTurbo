@@ -35,7 +35,8 @@ RUN pip install torch_npu==2.10.0.post2
 # Build fla-npu from upstream main at commit d77c37382aa8cf53e25005615c8c3f761fc137d2
 # for Ascend A3 (ships the fused KDA kernels npu_chunk_kda_bwd_{prepare,dhu,finalize}
 # plus the in-kernel l2norm / beta-sigmoid fusion that the ascendc_kda provider needs).
-RUN bash -c "source /usr/local/Ascend/ascend-toolkit/set_env.sh \
+# Temporary: Git 2.43's default user agent is rejected by the GitCode WAF.
+RUN GIT_HTTP_USER_AGENT=git/2.56.1 bash -c "source /usr/local/Ascend/ascend-toolkit/set_env.sh \
     && git clone https://github.com/flashserve/flash-linear-attention-npu.git /tmp/flash-linear-attention-npu \
     && git -C /tmp/flash-linear-attention-npu checkout d77c37382aa8cf53e25005615c8c3f761fc137d2 \
     && cd /tmp/flash-linear-attention-npu \
