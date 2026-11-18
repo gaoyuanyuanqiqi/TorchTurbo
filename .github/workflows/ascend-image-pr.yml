@@ -11,7 +11,7 @@ run-name: Ascend-Image-PR ${{ format('#{0}', github.event.pull_request.number) }
 on:
   pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review, labeled]
-    branches: [main]
+    branches: [main, ci/image-plan-test-base]
     paths:
       - 'docker/**/Dockerfile*'
 
