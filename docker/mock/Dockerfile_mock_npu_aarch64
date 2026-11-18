@@ -6,5 +6,6 @@ FROM scratch
 LABEL org.opencontainers.image.title="torchturbo-ci-mock-npu-a3"
 LABEL org.torchturbo.ci.mock="true"
 LABEL org.torchturbo.ci.purpose="image-pipeline-orchestration-only"
+LABEL org.torchturbo.ci.mock_revision="2"
 
 COPY mock-marker /torchturbo-ci-mock-image
