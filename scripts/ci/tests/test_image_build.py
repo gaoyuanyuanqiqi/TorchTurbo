@@ -14,6 +14,7 @@ from scripts.ci.image.build import (
     max_jobs,
     resolve_candidate,
     resolve_formal,
+    temporary_build_dockerfile,
     verify_manifest,
 )
 from scripts.ci.image.plan import plan_image
@@ -52,6 +53,21 @@ def test_build_command_uses_content_tag_not_alias(repo_root: Path) -> None:
     assert not any(value.endswith(f":{plan.alias}") for value in command)
     assert "--output=type=image,push=true,oci-mediatypes=false" in command
     assert "--build-arg=MAX_JOBS=4" in command
+    assert "--build-arg=GIT_HTTP_USER_AGENT=git/2.56.1" in command
+
+
+def test_temporary_dockerfile_injects_git_user_agent(repo_root: Path) -> None:
+    plan = plan_image(repo_root, "npu-default")
+
+    dockerfile, temporary = temporary_build_dockerfile(plan, repo_root)
+
+    try:
+        text = Path(dockerfile).read_text(encoding="utf-8")
+        assert text.count("ARG GIT_HTTP_USER_AGENT") == text.count("FROM ")
+        assert text.count("ENV GIT_HTTP_USER_AGENT=${GIT_HTTP_USER_AGENT}") == text.count("FROM ")
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def test_max_jobs_respects_memory_limit() -> None:

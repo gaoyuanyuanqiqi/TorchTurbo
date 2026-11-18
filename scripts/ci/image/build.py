@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -83,6 +84,7 @@ def build_command(
     builder: str = "",
     jobs: int = 1,
     metadata_file: str = "/tmp/build-meta.json",
+    dockerfile: str | None = None,
 ) -> list[str]:
     command = ["docker", "buildx", "build"]
     if builder:
@@ -90,7 +92,7 @@ def build_command(
     command += [
         "--progress=plain",
         f"--platform={plan.platform}",
-        f"--file={plan.dockerfile}",
+        f"--file={dockerfile or plan.dockerfile}",
         f"--build-arg=MAX_JOBS={jobs}",
     ]
     for key, value in sorted(plan.build_args.items()):
@@ -113,6 +115,40 @@ def build_command(
         command.append("--output=type=cacheonly")
     command.append(plan.context)
     return command
+
+
+def temporary_build_dockerfile(
+    plan: ImagePlan, root: Path
+) -> tuple[str, Path | None]:
+    """Return a Dockerfile that scopes the GitCode WAF UA workaround to CI builds."""
+    path = root / plan.dockerfile
+    source = path.read_text(encoding="utf-8")
+    user_agent = plan.build_args.get("GIT_HTTP_USER_AGENT", "")
+    if not user_agent:
+        return plan.dockerfile, None
+    if "GIT_HTTP_USER_AGENT" in source:
+        return plan.dockerfile, None
+    lines = source.splitlines(keepends=True)
+    injected: list[str] = []
+    found_from = False
+    for line in lines:
+        injected.append(line)
+        if line.lstrip().upper().startswith("FROM "):
+            injected.append("ARG GIT_HTTP_USER_AGENT\n")
+            injected.append("ENV GIT_HTTP_USER_AGENT=${GIT_HTTP_USER_AGENT}\n")
+            found_from = True
+    if not found_from:
+        raise BuildError(f"dockerfile has no FROM instruction: {plan.dockerfile}")
+    with tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        prefix="torchturbo-ci-Dockerfile-",
+        suffix=".tmp",
+        delete=False,
+    ) as handle:
+        handle.write("".join(injected))
+        temporary = Path(handle.name)
+    return str(temporary), temporary
 
 
 def _metadata_digest(path: str) -> str:
@@ -223,33 +259,41 @@ def ensure_candidate(
             "run the Ascend Candidate workflow with build_if_missing first"
         )
     metadata_file = "/tmp/build-meta.json"
-    command = build_command(
-        plan,
-        should_push=True,
-        use_cache=use_cache,
-        builder=builder,
-        jobs=jobs,
-        metadata_file=metadata_file,
-    )
-    started = time.monotonic()
-    process = run(command, cwd=root)
-    elapsed = int(time.monotonic() - started)
-    log = process.stdout or ""
-    Path("/tmp/build.log").write_text(log, encoding="utf-8")
-    if process.returncode != 0:
-        raise BuildError(f"image build failed (exit {process.returncode}); see /tmp/build.log")
-    digest = _metadata_digest(metadata_file)
-    if not digest:
-        digest = _inspect_digest(plan.content_ref)
-    if not digest.startswith("sha256:"):
-        raise BuildError(f"build did not publish a digest for {plan.content_ref}")
-    manifest = registry.require(plan.content_tag)
-    verify_manifest(manifest)
-    if manifest.digest != digest:
-        raise BuildError(
-            f"built digest {digest} differs from registry {manifest.digest} "
-            f"for {plan.content_tag}"
+    dockerfile, temporary = temporary_build_dockerfile(plan, root)
+    try:
+        command = build_command(
+            plan,
+            should_push=True,
+            use_cache=use_cache,
+            builder=builder,
+            jobs=jobs,
+            metadata_file=metadata_file,
+            dockerfile=dockerfile,
         )
-    return _result_from_manifest(
-        plan, manifest, built=True, reason="candidate", elapsed_seconds=elapsed
-    )
+        started = time.monotonic()
+        process = run(command, cwd=root)
+        elapsed = int(time.monotonic() - started)
+        log = process.stdout or ""
+        Path("/tmp/build.log").write_text(log, encoding="utf-8")
+        if process.returncode != 0:
+            raise BuildError(
+                f"image build failed (exit {process.returncode}); see /tmp/build.log"
+            )
+        digest = _metadata_digest(metadata_file)
+        if not digest:
+            digest = _inspect_digest(plan.content_ref)
+        if not digest.startswith("sha256:"):
+            raise BuildError(f"build did not publish a digest for {plan.content_ref}")
+        manifest = registry.require(plan.content_tag)
+        verify_manifest(manifest)
+        if manifest.digest != digest:
+            raise BuildError(
+                f"built digest {digest} differs from registry {manifest.digest} "
+                f"for {plan.content_tag}"
+            )
+        return _result_from_manifest(
+            plan, manifest, built=True, reason="candidate", elapsed_seconds=elapsed
+        )
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)

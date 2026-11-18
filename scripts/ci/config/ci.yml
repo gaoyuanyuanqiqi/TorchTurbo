@@ -25,7 +25,8 @@ resources:
         platform: linux/arm64
         cann_version: "9.0.0"
         revision: 1
-        args: {}
+        args:
+          GIT_HTTP_USER_AGENT: git/2.56.1
 
   venvs:
     default:
