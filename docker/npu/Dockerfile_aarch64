@@ -77,3 +77,5 @@ RUN if [ -f /etc/ssh/sshd_config ]; then \
         sed -i '/^[[:space:]#]*PasswordAuthentication[[:space:]]/d' /etc/ssh/sshd_config && \
         echo 'PasswordAuthentication no' >> /etc/ssh/sshd_config; \
     fi
+
+# CI single ImagePlan probe: 2026-11-18
