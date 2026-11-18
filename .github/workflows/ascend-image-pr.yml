@@ -9,7 +9,7 @@ run-name: Ascend-Image-PR ${{ format('#{0}', github.event.pull_request.number) }
 # intentionally absent, so a fast image never waits for an unrelated slow one.
 
 on:
-  pull_request_target:
+  pull_request:
     types: [opened, synchronize, reopened, ready_for_review, labeled]
     branches: [main]
     paths:
