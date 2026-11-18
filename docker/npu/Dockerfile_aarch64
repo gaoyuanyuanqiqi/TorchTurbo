@@ -1,4 +1,5 @@
 # Use the CANN 9.0.0 runtime for Ascend A3 on openEuler with Python 3.11.
+# Clean image PR validation for the ci/image-pr-base bootstrap branch.
 FROM quay.io/ascend/cann:9.0.0-a3-openeuler24.03-py3.11
 
 # Install build tools, tmux, NFS utilities, ossutil, and installation dependencies.
