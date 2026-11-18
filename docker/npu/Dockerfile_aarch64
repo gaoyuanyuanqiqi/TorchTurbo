@@ -40,7 +40,13 @@ RUN bash -c "source /usr/local/Ascend/ascend-toolkit/set_env.sh \
     && git -C /tmp/flash-linear-attention-npu checkout d77c37382aa8cf53e25005615c8c3f761fc137d2 \
     && cd /tmp/flash-linear-attention-npu \
     && python -m pip install --no-cache-dir 'setuptools>=70.1' wheel -r requirements.txt \
-    && FLA_NPU_SOC=ascend910_93 python scripts/build_wheel.py \
+    && { FLA_NPU_SOC=ascend910_93 python scripts/build_wheel.py || { \
+        echo '--- fla-npu inner log: errors ---'; \
+        grep -nEi 'error|failed|fatal|cannot|not found|killed|no space|undefined reference' \
+            dist/fla-npu-build.log | tail -120 || true; \
+        echo '--- fla-npu inner log: tail ---'; \
+        tail -200 dist/fla-npu-build.log || true; \
+        exit 1; }; } \
     && python -m pip install --force-reinstall --no-cache-dir --no-deps dist/flash_linear_attention_npu_a3-*.whl \
     && rm -rf /tmp/flash-linear-attention-npu"
 # flash-linear-attention: built in-image from the fla-org/flash-linear-attention
