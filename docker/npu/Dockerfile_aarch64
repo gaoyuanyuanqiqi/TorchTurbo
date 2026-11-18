@@ -39,6 +39,12 @@ RUN bash -c "source /usr/local/Ascend/ascend-toolkit/set_env.sh \
     && git clone https://github.com/flashserve/flash-linear-attention-npu.git /tmp/flash-linear-attention-npu \
     && git -C /tmp/flash-linear-attention-npu checkout d77c37382aa8cf53e25005615c8c3f761fc137d2 \
     && cd /tmp/flash-linear-attention-npu \
+    && mkdir -p third_party/opbase \
+    && git -C third_party/opbase init -q \
+    && git -C third_party/opbase remote add origin https://github.com/mirror-cann/opbase.git \
+    && git -C third_party/opbase fetch --depth=1 origin \
+        c8d83f3e57a63a7375e89a2d6937452c0ae2e522 \
+        c8cfc45e350d4e07cd8cab8448d3b40f9727ea4c \
     && python -m pip install --no-cache-dir 'setuptools>=70.1' wheel -r requirements.txt \
     && { FLA_NPU_SOC=ascend910_93 python scripts/build_wheel.py || { \
         echo '--- fla-npu inner log: errors ---'; \
