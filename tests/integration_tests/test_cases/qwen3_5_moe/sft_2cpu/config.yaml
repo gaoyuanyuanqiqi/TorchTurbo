@@ -48,7 +48,7 @@ MODEL_ARGS:
 TRAIN_ARGS:
   model: null
   tokenizer: assets/tokenizer/qwen3_5_moe
-  dataset: assets/sft_test/data.json
+  dataset: assets/sft_test/missing.json
   model_type: turbo_qwen3_5_moe
   template: qwen3_5
   check_model: false
