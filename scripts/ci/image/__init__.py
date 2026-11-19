@@ -1,6 +1,6 @@
 """Platform image resolution, build, and promotion."""
 
-# Non-Dockerfile image tooling change: exercises normal PR routing only.
+# Non-Dockerfile image tooling change: exercises normal PR routing and concurrency.
 
 from .recipe import ImageError
 from .registry import RegistryError
