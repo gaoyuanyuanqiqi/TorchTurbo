@@ -182,3 +182,5 @@ def test_checkpoint_export_plugin_loads_without_platform_sdk(module, tmp_path):
     assert isinstance(plugin, module.CheckpointExportPlugin)
     plugin.on_hf_export(str(tmp_path))
     assert plugin.export_dir == str(tmp_path)
+
+# V4 P1 mixed-change code probe.
