@@ -12,6 +12,8 @@ run-name: Ascend-PR-CI ${{ github.event.pull_request.number && format('#{0}', gi
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+    paths-ignore:
+      - 'docker/**/Dockerfile*'
   workflow_call:
     inputs:
       mode:

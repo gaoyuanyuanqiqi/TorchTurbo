@@ -34,6 +34,12 @@ REQUIREMENTS = "scripts/ci/config/requirements-lint.txt"
 
 # These are build-policy choices, not accidental lint debt.
 HADOLINT_IGNORES = ("DL3041", "DL3042", "DL3003", "DL3059")
+# actionlint 1.7.12 predates this checkout input. The action itself documents
+# and enforces the input, so ignore only this known metadata gap.
+ACTIONLINT_IGNORES = (
+    r'input "allow-unsafe-pr-checkout" is not defined in action '
+    r'"actions/checkout@v4"',
+)
 
 try:
     import yaml  # type: ignore[import-not-found]
@@ -244,7 +250,10 @@ def check_actionlint() -> list[Problem]:
         tool = _ensure_actionlint()
     except Exception as exc:
         return [Problem(".github/workflows", f"cannot obtain actionlint: {exc}")]
-    return _diagnostics([str(tool), "-no-color", "-oneline"], ".github/workflows", timeout=180)
+    command = [str(tool), "-no-color", "-oneline"]
+    for pattern in ACTIONLINT_IGNORES:
+        command += ["-ignore", pattern]
+    return _diagnostics(command, ".github/workflows", timeout=180)
 
 
 def check_hadolint() -> list[Problem]:

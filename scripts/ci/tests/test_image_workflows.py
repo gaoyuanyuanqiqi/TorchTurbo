@@ -50,7 +50,9 @@ def test_normal_pr_workflow_plans_runtime_images(repo_root: Path) -> None:
     assert jobs["gate"]["needs"] == ["plan", "cpu", "accelerator"]
     assert jobs["cpu"]["name"] == "CPU (${{ matrix.display_name }})"
     assert jobs["accelerator"]["name"] == "Accelerator (${{ matrix.display_name }})"
-    assert "paths-ignore" not in triggers["pull_request"]
+    assert triggers["pull_request"]["paths-ignore"] == [
+        "docker/**/Dockerfile*",
+    ]
     assert triggers["workflow_call"]["inputs"]["image_id"]["default"] == ""
     assert triggers["workflow_call"]["inputs"]["targets"]["default"] == ""
     assert "scripts.ci.image.cli build " not in dumped
@@ -223,6 +225,12 @@ def test_image_pr_approval_precedes_pr_checkout(repo_root: Path) -> None:
     assert "head.repo.full_name != github.repository" in approval["if"]
     assert "ci:image:build" in approval["if"]
     assert checkout["with"]["persist-credentials"] is False
+    assert checkout["with"]["allow-unsafe-pr-checkout"] is True
+    cpu_checkout = next(
+        step for step in document["jobs"]["cpu-tests"]["steps"]
+        if step.get("uses") == "actions/checkout@v4"
+    )
+    assert cpu_checkout["with"]["allow-unsafe-pr-checkout"] is True
 
 
 def test_image_pipeline_builds_one_candidate_and_reuses_pr_scope(
@@ -241,6 +249,15 @@ def test_image_pipeline_builds_one_candidate_and_reuses_pr_scope(
     assert document["jobs"]["build"]["steps"][0]["with"]["ref"].startswith(
         "${{ inputs.checkout_ref"
     )
+    expected_pr_checkout = (
+        "${{ startsWith(inputs.checkout_ref, 'refs/pull/') }}"
+    )
+    for job_name in ("build", "container-tests"):
+        checkout = next(
+            step for step in jobs[job_name]["steps"]
+            if step.get("uses") == "actions/checkout@v4"
+        )
+        assert checkout["with"]["allow-unsafe-pr-checkout"] == expected_pr_checkout
     assert "scripts.ci.image.cli build" in dumped
     assert "scripts.ci.image.cli resolve" not in dumped
     assert "scripts.ci.image.cli promote " not in dumped
