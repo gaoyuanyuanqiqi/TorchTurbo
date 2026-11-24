@@ -1,0 +1,3 @@
+FROM python:3.11-slim
+
+# V4 P1 unmapped Dockerfile probe.
