@@ -33,3 +33,5 @@ lint -> Planner -> PlannerOutput -> Executor -> JobResult -> Gate
   image and promotes its alias.
 - `.github/workflows/ascend-image-pipeline.yml` is the reusable single-image build and
   validation unit.
+
+V4 P0 probe: docs-only changes must not schedule execution jobs.
