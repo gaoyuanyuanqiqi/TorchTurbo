@@ -325,8 +325,10 @@ class FSDP2Backend(BaseBackend):
         nn.Module
             The model with replaced modules.
         """
-        config = model.config
+        from torchturbo.models.modules.moe.moe_layer import MoESubmodules
 
+        config = model.config
+        megakernel_cache = {}
         if plan.plan and isinstance(plan.plan, dict):
             for fqn, submodule in list(model.named_modules()):
                 if fqn == "":
@@ -334,8 +336,10 @@ class FSDP2Backend(BaseBackend):
 
                 spec = plan.match(fqn)
                 if isinstance(spec, FSDPPlanSpec) and spec.replace_module:
-                    kwargs = spec.module_kwargs
-
+                    kwargs = dict(spec.module_kwargs)
+                    submodules = kwargs.get("moe_submodules")
+                    if isinstance(submodules, MoESubmodules) and self.config.moe.mega_moe.enable:
+                        kwargs["moe_submodules"] = replace(submodules, megakernel_cache=megakernel_cache)
                     kwargs["hf_config"] = config
                     kwargs["ep_info"] = self.get_ep_info()
                     kwargs["sp_info"] = self.get_sp_info()
@@ -441,6 +445,9 @@ class FSDP2Backend(BaseBackend):
         parallel_plan: Any = None,
         peft_config: Any = None,
     ) -> nn.Module:
+        if self.config.moe.mega_moe.enable and peft_config is not None:
+            raise AssertionError("MegaMoE does not support PEFT/LoRA training.")
+
         if parallel_plan is None:
             plan = FSDPParallelPlan()
         elif not isinstance(parallel_plan, FSDPParallelPlan):
@@ -829,13 +836,12 @@ class FSDP2Backend(BaseBackend):
     def _apply_activation_checkpointing(
         self, model: nn.Module, plan: _ResolvedFSDPPlan
     ) -> nn.Module:
-        from contextlib import ExitStack, contextmanager, nullcontext
+        from collections.abc import Callable
+        from contextlib import AbstractContextManager, ExitStack, contextmanager
 
         from torch.utils.checkpoint import checkpoint
 
-        from torchturbo.models.modules.moe.moe_layer import BaseMoELayer, MoERuntimeInputs
-
-        from .activation_checkpointing import fsdp_recompute_context, restore_moe_runtime_inputs
+        from .activation_checkpointing import fsdp_recompute_context, parameter_version
 
         target_modules: list[tuple[str, nn.Module]] = []
         for fqn, submodule in model.named_modules():
@@ -873,28 +879,35 @@ class FSDP2Backend(BaseBackend):
         def recompute_context(
             module: nn.Module,
             use_reentrant: bool,
-            moe_runtime_inputs: tuple[tuple[BaseMoELayer, MoERuntimeInputs], ...],
         ) -> Iterator[None]:
-            # The recompute context is active only in backward. Expert containers
-            # can be nested FSDP units under the checkpointed layer, and their
-            # PRE_BACKWARD hook may not have fired yet when recompute calls
-            # experts.forward(). Without this guard, expert forward-prefetch
-            # edges can leak into backward.
+            # Restore the FSDP lifecycle before entering module-owned contexts.
+            # The prefetch manager controls its policy during recomputation.
             with ExitStack() as stack:
-                stack.enter_context(restore_moe_runtime_inputs(moe_runtime_inputs))
                 stack.enter_context(
-                    self.prefetch_manager.suspend_expert_forward_prefetch(model)
+                    self.prefetch_manager.recompute_context(model)
                 )
                 stack.enter_context(fsdp_recompute_context(module, use_reentrant))
                 yield
 
         def make_checkpointed_forward(module: nn.Module):
             original_forward = module.forward
-            moe_modules = tuple(
-                child for child in module.modules() if isinstance(child, BaseMoELayer)
+            use_reentrant = self.config.activation_checkpointing.use_reentrant
+            captures = tuple(
+                prepare(module, use_reentrant, parameter_version)
+                for child in module.modules()
+                if (prepare := getattr(child, "prepare_checkpoint_context", None)) is not None
             )
 
-            use_reentrant = self.config.activation_checkpointing.use_reentrant
+            @contextmanager
+            def execution_context(
+                contexts: tuple[Callable[[bool], AbstractContextManager[None]], ...], replay: bool,
+            ) -> Iterator[None]:
+                with ExitStack() as stack:
+                    if replay:
+                        stack.enter_context(recompute_context(module, use_reentrant))
+                    for context in contexts:
+                        stack.enter_context(context(replay))
+                    yield
 
             @functools.wraps(original_forward)
             def checkpointed_forward(*args, **kwargs):
@@ -915,15 +928,10 @@ class FSDP2Backend(BaseBackend):
                     checkpoint_kwargs["use_cache"] = False
 
                 base_fn = functools.partial(original_forward, **checkpoint_kwargs)
-                moe_runtime_inputs = tuple((moe, moe._runtime_inputs) for moe in moe_modules)
+                contexts = tuple(capture() for capture in captures)
 
                 def checkpoint_context_fn():
-                    # Replaying the forward must not count its router assignments again.
-                    replay_inputs = tuple(
-                        (moe, replace(inputs, accumulate_tokens_per_expert=False))
-                        for moe, inputs in moe_runtime_inputs
-                    )
-                    return nullcontext(), recompute_context(module, False, replay_inputs)
+                    return execution_context(contexts, False), execution_context(contexts, True)
 
                 if not use_reentrant:
                     return checkpoint(
@@ -934,10 +942,8 @@ class FSDP2Backend(BaseBackend):
                     )
 
                 def run_fn(*a, **kw):
-                    if torch.is_grad_enabled():
-                        with recompute_context(module, True, moe_runtime_inputs):
-                            return base_fn(*a, **kw)
-                    return base_fn(*a, **kw)
+                    with execution_context(contexts, torch.is_grad_enabled()):
+                        return base_fn(*a, **kw)
 
                 if torch.is_grad_enabled() and not any(
                     isinstance(arg, torch.Tensor) and arg.requires_grad for arg in args

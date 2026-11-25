@@ -225,7 +225,8 @@ def topk_softmax_with_capacity(
 
     # TODO Try using element-wise operations instead of scatter?
     topk_masked_gates = torch.zeros_like(logits).scatter(1, top_indices, probs)
-    topk_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
+    topk_map = torch.zeros_like(logits, dtype=torch.bool)
+    topk_map.scatter_(1, top_indices, True)
 
     return topk_masked_gates, topk_map, top_indices
 

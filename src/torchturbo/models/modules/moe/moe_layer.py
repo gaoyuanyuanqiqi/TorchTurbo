@@ -7,17 +7,28 @@
   # Modified by the TorchTurbo contributors.
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, ExitStack, contextmanager
+from functools import partial
+from dataclasses import dataclass, field, replace
 from typing import Optional, Union
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+from torchturbo.logging import get_logger
+from torchturbo.ops import ops
+
 from .moe_config import MoEConfig
 from .router import TopKRouter
 from .token_dispatcher import MoETokenDispatcher, MoEAlltoAllTokenDispatcher
 from .module import ModuleSpec, build_module
+
+
+logger = get_logger(__name__)
+
+CheckpointContext = Callable[[bool], AbstractContextManager[None]]
 
 
 @dataclass
@@ -26,6 +37,9 @@ class MoESubmodules:
 
     experts: Union[ModuleSpec, type] = None
     shared_experts: Union[ModuleSpec, type] = None
+
+    # Each model preparation gets its own cache. Providers choose compatibility keys.
+    megakernel_cache: dict = field(default_factory=dict, repr=False, compare=False, kw_only=True)
 
 
 @dataclass
@@ -37,6 +51,8 @@ class MoERuntimeInputs:
 
 class BaseMoELayer(torch.nn.Module, ABC):
     """Base class for a mixture of experts layer."""
+
+    expert_checkpoint_context: Callable[[Callable[[], object]], CheckpointContext] | None = None
 
     def __init__(
         self,
@@ -50,6 +66,7 @@ class BaseMoELayer(torch.nn.Module, ABC):
         ep_rank = dist.get_rank(ep_group)
 
         self.config = config
+        self.ep_group = ep_group
         self.expert_parallel_size = ep_size
         assert (
             self.expert_parallel_size > 0
@@ -82,6 +99,34 @@ class BaseMoELayer(torch.nn.Module, ABC):
 
     def set_runtime_inputs(self, inputs: MoERuntimeInputs) -> None:
         self._runtime_inputs = inputs
+
+    def prepare_checkpoint_context(
+        self, block: torch.nn.Module, use_reentrant: bool,
+        parameter_version: Callable[[torch.nn.Module], object],
+    ) -> Callable[[], CheckpointContext]:
+        """Capture this layer's runtime inputs and optional expert replay state."""
+        single_layer = sum(isinstance(child, BaseMoELayer) for child in block.modules()) == 1
+        provider_context = self.expert_checkpoint_context if use_reentrant and single_layer else None
+
+        @contextmanager
+        def context(inputs: MoERuntimeInputs, provider: CheckpointContext | None, replay: bool) -> Iterator[None]:
+            with ExitStack() as stack:
+                if replay:
+                    stack.enter_context(restore_moe_runtime_inputs(((self, inputs),)))
+                if provider is not None:
+                    stack.enter_context(provider(replay))
+                yield
+
+        def capture() -> CheckpointContext:
+            inputs = self._runtime_inputs if use_reentrant else replace(
+                self._runtime_inputs, accumulate_tokens_per_expert=False,
+            )
+            provider = None
+            if provider_context is not None:
+                provider = provider_context(lambda: parameter_version(self.experts))
+            return partial(context, inputs, provider)
+
+        return capture
 
     @abstractmethod
     def forward(
@@ -118,17 +163,11 @@ class MoELayer(BaseMoELayer):
             sp_group=sp_group,
         )
 
-        # Initialize token dispatcher
-        if config.moe_token_dispatcher_type == "alltoall":
+        if not config.mega_moe.enable:
+            if config.moe_token_dispatcher_type != "alltoall":
+                raise ValueError(f"Unsupported token dispatcher type: {config.moe_token_dispatcher_type}")
             self.token_dispatcher = MoEAlltoAllTokenDispatcher(
-                self.num_local_experts,
-                self.local_expert_indices,
-                config=self.config,
-                ep_group=ep_group,
-            )
-        else:
-            raise ValueError(
-                f"Unsupported token dispatcher type: {config.moe_token_dispatcher_type}"
+                self.num_local_experts, self.local_expert_indices, config=config, ep_group=ep_group,
             )
 
         # Initialize experts
@@ -146,16 +185,21 @@ class MoELayer(BaseMoELayer):
                 self.submodules.shared_experts, config=self.config
             )
 
-    def forward(
-        self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Route tokens, compute local experts, and combine their outputs."""
-        probs, routing_map, expert_indices, logits = self.router(
-            hidden_states, input_ids, self._runtime_inputs.padding_mask,
-            self._runtime_inputs.accumulate_tokens_per_expert,
-        )
-        logits = logits.view(-1, logits.shape[-1])
+        self.megakernel = ops.mega_moe(self) if config.mega_moe.enable else None
+        if self.megakernel is not None and config.mega_moe.expert_balance is not None:
+            prepare_balance = getattr(self.megakernel, "prepare_expert_balance", None)
+            if prepare_balance is None:
+                logger.warning_rank0_once(
+                    "%s ignores expert_balance=%s and will use ordinary MegaMoE.",
+                    type(self.megakernel).__name__, config.mega_moe.expert_balance,
+                )
+            else:
+                self.expert_checkpoint_context = prepare_balance()
 
+    def _forward_native_routed(
+        self, hidden_states: torch.Tensor, probs: torch.Tensor,
+        routing_map: torch.Tensor, expert_indices: torch.Tensor | None,
+    ) -> torch.Tensor:
         dispatcher = self.token_dispatcher
         # Reuse stage variables so completed layouts are not kept alive here.
         expert_tokens, expert_probs = dispatcher.dispatch_preprocess(
@@ -170,8 +214,10 @@ class MoELayer(BaseMoELayer):
         expert_tokens = dispatcher.combine_preprocess(expert_tokens)
         expert_tokens = dispatcher.token_combine(expert_tokens)
         expert_tokens = dispatcher.combine_postprocess(expert_tokens)
-        output = expert_tokens.to(hidden_states.dtype)
+        return expert_tokens.to(hidden_states.dtype)
 
+    def add_shared_experts(self, hidden_states: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
+        """Add this layer's shared expert contributions to the routed output."""
         if self.shared_expert is not None:
             shared_expert_output = self.shared_expert(hidden_states)
             shared_expert_output = (
@@ -180,4 +226,33 @@ class MoELayer(BaseMoELayer):
             output = output + shared_expert_output
         if self.shared_experts is not None:
             output = output + self.shared_experts(hidden_states)
-        return output, logits
+        return output
+
+    def forward(
+        self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        runtime = self._runtime_inputs
+        probs, routing_map, expert_indices, logits = self.router(
+            hidden_states, input_ids, runtime.padding_mask, runtime.accumulate_tokens_per_expert,
+        )
+        if self.megakernel is None:
+            output = self._forward_native_routed(hidden_states, probs, routing_map, expert_indices)
+            output = self.add_shared_experts(hidden_states, output)
+        else:
+            output = self.megakernel.forward_experts(
+                hidden_states, probs, routing_map, expert_indices=expert_indices,
+            )
+        return output, logits.view(-1, logits.shape[-1])
+
+
+
+@contextmanager
+def restore_moe_runtime_inputs(
+    snapshot: tuple[tuple[BaseMoELayer, MoERuntimeInputs], ...],
+) -> Iterator[None]:
+    """Use captured routing inputs and restore the caller's inputs on exit."""
+    with ExitStack() as stack:
+        for moe, inputs in snapshot:
+            stack.callback(moe.set_runtime_inputs, moe._runtime_inputs)
+            moe.set_runtime_inputs(inputs)
+        yield

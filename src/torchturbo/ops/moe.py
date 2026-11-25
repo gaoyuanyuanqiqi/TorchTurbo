@@ -1,8 +1,9 @@
-"""Shared tensor contract for MoE permutation and unpermutation operators."""
+"""Shared tensor data and routed expert interface for MoE operators."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Protocol
 
 import torch
 
@@ -64,3 +65,14 @@ def get_expert_indices(routing_map: torch.Tensor) -> torch.Tensor:
             "MoE permutation requires the same top-k count for every token."
         )
     return experts.view(num_tokens, topk)
+
+
+class MoEMegakernel(Protocol):
+    """Execute one layer's routed and shared experts in token order."""
+
+    def forward_experts(
+        self, hidden_states: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor,
+        *, expert_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Optional indices must describe the same final routes as routing_map."""
+        ...

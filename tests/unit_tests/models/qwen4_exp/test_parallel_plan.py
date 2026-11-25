@@ -61,7 +61,7 @@ def test_default_plan_recomputes_only_decoder_blocks(enabled):
     )
     backend.logger = get_logger(__name__)
     backend.prefetch_manager = SimpleNamespace(
-        suspend_expert_forward_prefetch=lambda model: nullcontext()
+        recompute_context=lambda model: nullcontext()
     )
     backend._apply_activation_checkpointing(model, plan)
 

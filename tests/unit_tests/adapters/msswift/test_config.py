@@ -780,3 +780,25 @@ def test_lora_config_dora_rslora_flags():
     )
     assert lora.use_rslora is True
     assert lora.use_dora is True
+
+
+@pytest.mark.parametrize("tuner", ["full", "lora"])
+def test_swift_passes_mega_moe_config_to_backend(tmp_path, tuner):
+    path = tmp_path / "mega.yaml"
+    path.write_text("engine_config:\n  moe:\n    mega_moe: {enable: true, expert_balance: hot_replica}\n")
+    _set_tt(config_path=str(path))
+    config = build_config_from_swift_args(_base_args(tuner_type=tuner))
+    assert config.moe.mega_moe.enable
+    assert config.moe.mega_moe.expert_balance == "hot_replica"
+    assert config.moe.mega_moe._source_token_bound is None
+
+
+@pytest.mark.parametrize("packing,expected", [(True, 17), (False, 33)])
+def test_hot_replica_infers_source_bound(tmp_path, packing, expected):
+    path = tmp_path / "mega.yaml"
+    path.write_text("engine_config:\n  parallel_plan: {sp_size: 4}\n"
+                    "  moe: {mega_moe: {enable: true, expert_balance: hot_replica}}\n")
+    _set_tt(config_path=str(path))
+    args = _base_args(packing=packing, packing_length=33, max_length=65, per_device_train_batch_size=2)
+    config = build_config_from_swift_args(args)
+    assert config.moe.mega_moe._source_token_bound == expected

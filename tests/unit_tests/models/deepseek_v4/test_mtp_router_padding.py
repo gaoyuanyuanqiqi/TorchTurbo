@@ -86,7 +86,7 @@ def test_checkpoint_preserves_mtp_padding_for_each_forward(
         config=EngineConfig.from_dict({
             "activation_checkpointing": {"enabled": True, "use_reentrant": use_reentrant},
         }),
-        prefetch_manager=SimpleNamespace(suspend_expert_forward_prefetch=lambda model: nullcontext()),
+        prefetch_manager=SimpleNamespace(recompute_context=lambda model: nullcontext()),
     )
     FSDP2Backend._apply_activation_checkpointing(
         backend, candidate.mtp,

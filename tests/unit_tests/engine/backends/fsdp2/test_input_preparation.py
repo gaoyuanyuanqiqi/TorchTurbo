@@ -171,7 +171,7 @@ def test_backend_installs_slicing_with_checkpoint_recomputation(
     )
     backend.prefetch_manager = SimpleNamespace(
         setup=lambda model: None,
-        suspend_expert_forward_prefetch=nullcontext,
+        recompute_context=nullcontext,
     )
     backend.get_ep_info = lambda: {"ep_size": 1}
     backend._init_mesh = lambda plan: None

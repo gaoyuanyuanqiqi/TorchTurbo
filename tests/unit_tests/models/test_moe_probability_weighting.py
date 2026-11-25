@@ -3,7 +3,7 @@
 import copy
 import importlib
 import weakref
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -38,9 +38,9 @@ def cpu_dispatch(monkeypatch):
     get_or_create_ops(device_runtime=runtime, default_policy=OpPolicy.NATIVE)
 
 
-def _layer(*, on_input, use_lora=False, dtype=torch.float32):
+def _layer(*, on_input, use_lora=False, dtype=torch.float32, num_experts=2):
     config = MoEConfig(
-        hidden_size=4, moe_ffn_hidden_size=3, num_moe_experts=2,
+        hidden_size=4, moe_ffn_hidden_size=3, num_moe_experts=num_experts,
         gated_linear_unit=True, activation_func=F.silu,
         moe_router_topk=1 if on_input else 2,
         moe_router_score_function="sigmoid", moe_router_dtype="fp32",
@@ -226,7 +226,7 @@ def test_checkpoint_keeps_each_runtime_mask_with_frozen_inputs(use_reentrant):
         config=EngineConfig.from_dict({
             "activation_checkpointing": {"enabled": True, "use_reentrant": use_reentrant},
         }),
-        prefetch_manager=SimpleNamespace(suspend_expert_forward_prefetch=lambda model: nullcontext()),
+        prefetch_manager=SimpleNamespace(recompute_context=lambda model: nullcontext()),
     )
     FSDP2Backend._apply_activation_checkpointing(
         backend, candidate, SimpleNamespace(modules={"": FSDPPlanSpec(activation_checkpoint=True)}),
@@ -249,7 +249,7 @@ def test_checkpoint_keeps_each_runtime_mask_with_frozen_inputs(use_reentrant):
 
 @pytest.mark.parametrize("fail_exit", [False, True])
 def test_runtime_input_context_restores_each_nested_callers_inputs(fail_exit):
-    from torchturbo.engine.backends.fsdp2.activation_checkpointing import restore_moe_runtime_inputs
+    from torchturbo.models.modules.moe.moe_layer import restore_moe_runtime_inputs
 
     layers = (_layer(on_input=False), _layer(on_input=True))
     original_inputs = tuple(layer._runtime_inputs for layer in layers)
@@ -300,7 +300,7 @@ def test_expert_checkpoint_with_frozen_inputs_preserves_parameter_gradients(
         config=EngineConfig.from_dict({
             "activation_checkpointing": {"enabled": True, "use_reentrant": use_reentrant},
         }),
-        prefetch_manager=SimpleNamespace(suspend_expert_forward_prefetch=lambda model: nullcontext()),
+        prefetch_manager=SimpleNamespace(recompute_context=lambda model: nullcontext()),
     )
     plan = SimpleNamespace(modules={"experts": FSDPPlanSpec(activation_checkpoint=True)})
     FSDP2Backend._apply_activation_checkpointing(backend, layer, plan)
@@ -336,7 +336,7 @@ def test_expert_checkpoint_with_disabled_adapters_preserves_router_gradients(use
         config=EngineConfig.from_dict({
             "activation_checkpointing": {"enabled": True, "use_reentrant": use_reentrant},
         }),
-        prefetch_manager=SimpleNamespace(suspend_expert_forward_prefetch=lambda model: nullcontext()),
+        prefetch_manager=SimpleNamespace(recompute_context=lambda model: nullcontext()),
     )
     plan = SimpleNamespace(modules={"experts": FSDPPlanSpec(activation_checkpoint=True)})
     FSDP2Backend._apply_activation_checkpointing(backend, layer, plan)
@@ -375,3 +375,75 @@ def test_frozen_experts_preserve_the_router_gradient_graph(freeze_router):
         actual.sum().backward()
         expected.sum().backward()
         torch.testing.assert_close(layer.router.weight.grad, reference.router.weight.grad)
+
+
+def test_mega_moe_reads_fp32_master_weights_inside_expert_hooks(monkeypatch):
+    from torchturbo.ops.providers.npu.mega_moe import HmcRoutedExperts, _HmcExpertCall
+
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+    layer = _layer(on_input=False, dtype=torch.float32, num_experts=4)
+    order = []
+    layer.experts.register_forward_pre_hook(lambda module, args: order.append("unshard"))
+
+    class Executor(torch.nn.Module):
+        def forward(self, inputs, ids, probs, *, expert_weights):
+            assert order == ["unshard"]
+            assert ids.dtype == torch.int32 and probs.dtype == torch.float32
+            assert ids.shape == probs.shape == (6, 2)
+            w1, w2 = expert_weights
+            assert w1.shape == (2, 4, 6) and w2.shape == (2, 3, 4)
+            assert w1.dtype == w2.dtype == inputs.dtype == torch.bfloat16
+            coeff = probs[:, 0].reshape(3, 2, 1).to(inputs.dtype)
+            return inputs * coeff * (w1.mean() + w2.mean())
+
+    monkeypatch.setattr(_HmcExpertCall, "_create_executor", lambda *args: Executor())
+    layer.megakernel = HmcRoutedExperts(layer, variants={})
+    x = torch.randn(3, 2, 4, dtype=torch.bfloat16, requires_grad=True)
+    output, _ = layer(x)
+    output.float().sum().backward()
+    for p in (layer.experts.weight1, layer.experts.weight2, layer.router.weight):
+        assert p.grad is not None and p.grad.dtype == torch.float32
+    assert x.grad is not None
+
+@pytest.mark.parametrize("use_reentrant", [False, True])
+@pytest.mark.parametrize("layer_count", [1, 2])
+def test_module_checkpoint_captures_invocations_without_global_registration(use_reentrant, layer_count):
+    layers = [_layer(on_input=False) for _ in range(layer_count)]
+    block = torch.nn.ModuleList(layers)
+    entered = []
+
+    def provider(version):
+        saved_version = version()
+
+        @contextmanager
+        def scope(replay):
+            assert version() == saved_version
+            entered.append(replay)
+            yield
+
+        return scope
+
+    for layer in layers:
+        layer.expert_checkpoint_context = provider
+    captures = [
+        layer.prepare_checkpoint_context(block, use_reentrant, lambda module: id(module))
+        for layer in layers
+    ]
+    first = [MoERuntimeInputs(padding_mask=torch.tensor([[True, False]])) for _ in layers]
+    second = [MoERuntimeInputs(padding_mask=torch.tensor([[False, True]])) for _ in layers]
+    for layer, inputs in zip(layers, first, strict=True):
+        layer.set_runtime_inputs(inputs)
+    first_contexts = [capture() for capture in captures]
+    for layer, inputs in zip(layers, second, strict=True):
+        layer.set_runtime_inputs(inputs)
+    second_contexts = [capture() for capture in captures]
+    for expected, contexts in ((second, second_contexts), (first, first_contexts)):
+        for layer, inputs, context in zip(layers, expected, contexts, strict=True):
+            with pytest.raises(RuntimeError, match="replay exit"):
+                with context(True):
+                    assert layer._runtime_inputs.padding_mask is inputs.padding_mask
+                    assert layer._runtime_inputs.accumulate_tokens_per_expert is use_reentrant
+                    raise RuntimeError("replay exit")
+    for layer, inputs in zip(layers, second, strict=True):
+        assert layer._runtime_inputs is inputs
+    assert entered == ([True, True] if use_reentrant and layer_count == 1 else [])

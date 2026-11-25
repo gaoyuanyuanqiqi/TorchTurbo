@@ -468,6 +468,19 @@ class LossChunkConfig:
 
 
 @dataclass
+class MegaMoEConfig:
+    enable: bool = False
+    expert_balance: Literal["hot_replica"] | None = None
+
+    def __post_init__(self) -> None:
+        self._source_token_bound: int | None = None
+        if not isinstance(self.enable, bool):
+            raise ValueError("moe.mega_moe.enable must be a boolean.")
+        if self.expert_balance not in (None, "hot_replica"):
+            raise ValueError("moe.mega_moe.expert_balance must be null or 'hot_replica'.")
+
+
+@dataclass
 class MoEConfig:
     """MoE training configuration."""
 
@@ -476,7 +489,13 @@ class MoEConfig:
     token_dispatcher: str = "alltoall"
     """Expert token dispatcher type."""
 
+    mega_moe: MegaMoEConfig = field(default_factory=MegaMoEConfig)
+
     def __post_init__(self) -> None:
+        if isinstance(self.mega_moe, Mapping):
+            self.mega_moe = MegaMoEConfig(**self.mega_moe)
+        elif not isinstance(self.mega_moe, MegaMoEConfig):
+            raise ValueError("moe.mega_moe must be a mapping.")
         if self.token_dispatcher != "alltoall":
             raise ValueError("moe.token_dispatcher must be 'alltoall'.")
 
@@ -1196,6 +1215,7 @@ def _validate_config_file(data: Mapping[str, Any], parents: tuple[str, ...] = ()
             "freeze_policy.patterns",
         }
     )
+    allowed.update(_dataclass_config_paths(MegaMoEConfig, ("moe", "mega_moe")))
     allowed.update(_dataclass_config_paths(OptimizerConfig, ("optimizer",)))
 
     for key, value in data.items():
@@ -1313,6 +1333,7 @@ def _build_moe_config(fields: Mapping[str, Any]) -> MoEConfig:
     """MoEConfig from the merged config dict."""
     moe_d = fields.get("moe") or {}
     return MoEConfig(
+        mega_moe=moe_d.get("mega_moe", {}),
         aux_loss_coeff=float(moe_d.get("aux_loss_coeff", 0.0)),
         z_loss_coeff=float(moe_d.get("z_loss_coeff", 0.0)),
         token_dispatcher=moe_d.get("token_dispatcher", "alltoall"),

@@ -399,7 +399,7 @@ def test_flush_forward_dedup():
     assert [m.tag for m in l0.forward_prefetch_arg] == ["L1", "L1E"]
 
 
-def test_suspend_expert_forward_prefetch_only_clears_expert_sources():
+def test_recompute_context_only_clears_expert_sources():
     chain = _chain([False, True, True, True])
     manager = pf.FSDPPrefetchManager(
         config=FSDPConfig(prefetch_strategy=FSDPPrefetchStrategy.EXPERT_LOOKAHEAD)
@@ -419,7 +419,7 @@ def test_suspend_expert_forward_prefetch_only_clears_expert_sources():
     assert [m.tag for m in l1e.forward_prefetch_arg] == ["L2E"]
     assert [m.tag for m in l2e.forward_prefetch_arg] == ["L3E"]
 
-    with manager.suspend_expert_forward_prefetch():
+    with manager.recompute_context():
         assert [m.tag for m in l0.forward_prefetch_arg] == ["L1", "L1E"]
         assert [m.tag for m in l1.forward_prefetch_arg] == ["L2"]
         assert l1e.forward_prefetch_arg == []
@@ -494,7 +494,7 @@ def test_manager_cleanup_clears_targets():
     manager.cleanup()
     assert model.layers[0].forward_prefetch_arg == []
     assert model.layers[2].backward_prefetch_arg == []
-    with manager.suspend_expert_forward_prefetch():
+    with manager.recompute_context():
         pass
     assert model.layers[1].experts_ref.forward_prefetch_arg == []
 
@@ -529,7 +529,7 @@ def test_manager_setup_keeps_other_model_targets():
     assert len(manager.chains) == 2
 
 
-def test_suspend_expert_forward_prefetch_can_target_one_model():
+def test_recompute_context_can_target_one_model():
     policy = make_model([False, True, True])
     reference = make_model([False, True, True])
     manager = pf.FSDPPrefetchManager(
@@ -543,7 +543,7 @@ def test_suspend_expert_forward_prefetch_can_target_one_model():
     policy_experts = policy.layers[1].experts_ref
     reference_experts = reference.layers[1].experts_ref
 
-    with manager.suspend_expert_forward_prefetch(policy):
+    with manager.recompute_context(policy):
         assert policy_experts.forward_prefetch_arg == []
         assert reference_experts.forward_prefetch_arg == [
             reference.layers[2].experts_ref
@@ -553,7 +553,7 @@ def test_suspend_expert_forward_prefetch_can_target_one_model():
         policy.layers[2].experts_ref
     ]
 
-    with manager.suspend_expert_forward_prefetch():
+    with manager.recompute_context():
         assert policy_experts.forward_prefetch_arg == []
         assert reference_experts.forward_prefetch_arg == []
 
@@ -565,7 +565,7 @@ def test_suspend_expert_forward_prefetch_can_target_one_model():
     ]
 
 
-def test_suspend_expert_forward_prefetch_supports_same_model_nesting():
+def test_recompute_context_supports_same_model_nesting():
     model = make_model([False, True, True])
     manager = pf.FSDPPrefetchManager(
         config=FSDPConfig(
@@ -576,17 +576,17 @@ def test_suspend_expert_forward_prefetch_supports_same_model_nesting():
     experts = model.layers[1].experts_ref
     targets = [model.layers[2].experts_ref]
 
-    with manager.suspend_expert_forward_prefetch(model):
+    with manager.recompute_context(model):
         assert experts.forward_prefetch_arg == []
-        with manager.suspend_expert_forward_prefetch(model):
+        with manager.recompute_context(model):
             assert experts.forward_prefetch_arg == []
         assert experts.forward_prefetch_arg == []
 
     assert experts.forward_prefetch_arg == targets
 
     with pytest.raises(RuntimeError, match="recompute failed"):
-        with manager.suspend_expert_forward_prefetch(model):
-            with manager.suspend_expert_forward_prefetch(model):
+        with manager.recompute_context(model):
+            with manager.recompute_context(model):
                 raise RuntimeError("recompute failed")
 
     assert experts.forward_prefetch_arg == targets
@@ -608,8 +608,8 @@ def test_global_and_targeted_prefetch_suspensions_can_overlap():
     reference_experts = reference.layers[1].experts_ref
     reference_targets = [reference.layers[2].experts_ref]
 
-    with manager.suspend_expert_forward_prefetch(policy):
-        with manager.suspend_expert_forward_prefetch():
+    with manager.recompute_context(policy):
+        with manager.recompute_context():
             assert policy_experts.forward_prefetch_arg == []
             assert reference_experts.forward_prefetch_arg == []
         assert policy_experts.forward_prefetch_arg == []
@@ -618,8 +618,8 @@ def test_global_and_targeted_prefetch_suspensions_can_overlap():
     assert policy_experts.forward_prefetch_arg == policy_targets
     assert reference_experts.forward_prefetch_arg == reference_targets
 
-    with manager.suspend_expert_forward_prefetch():
-        with manager.suspend_expert_forward_prefetch(policy):
+    with manager.recompute_context():
+        with manager.recompute_context(policy):
             assert policy_experts.forward_prefetch_arg == []
             assert reference_experts.forward_prefetch_arg == []
         assert policy_experts.forward_prefetch_arg == []

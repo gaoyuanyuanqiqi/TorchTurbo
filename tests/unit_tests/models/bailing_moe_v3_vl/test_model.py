@@ -255,7 +255,7 @@ def test_vision_balance_registration_preserves_forward_and_backward(
             )
         )
         backend.prefetch_manager = SimpleNamespace(
-            suspend_expert_forward_prefetch=lambda model: nullcontext()
+            recompute_context=lambda model: nullcontext()
         )
         plan = FSDPParallelPlan(
             plan={"blocks.*": FSDPPlanSpec(activation_checkpoint=True)}

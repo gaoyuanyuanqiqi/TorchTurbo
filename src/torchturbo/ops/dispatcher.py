@@ -4,7 +4,7 @@ import importlib
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import ModuleType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -12,10 +12,13 @@ from torchturbo.logging import get_logger
 from torchturbo.runtime import DeviceRuntime, TurboDevice
 
 from .base import OpImpl, OpImplKind, OpPolicy, OpSpec
-from .moe import MoEPermutation, get_expert_indices
+from .moe import MoEMegakernel, MoEPermutation, get_expert_indices
 from .packed_params import get_packed_params
 from .providers import iter_provider_modules
 from .registry import OpRegistry
+
+if TYPE_CHECKING:
+    from torchturbo.models.modules.moe.moe_layer import MoELayer
 
 logger = get_logger(__name__)
 
@@ -526,6 +529,10 @@ class OpDispatcher:
         return self._dispatch(
             "lightning_indexer_metadata", *args, impl=impl, **kwargs
         )
+
+    def mega_moe(self, layer: MoELayer, *, impl: str | None = None) -> MoEMegakernel:
+        """Build the selected expert backend for one MoE layer."""
+        return self._dispatch("mega_moe", layer, impl=impl)
 
     def moe_permutation(
         self,

@@ -1,17 +1,14 @@
-"""Runtime input restoration and FSDP hooks for activation recomputation."""
+"""FSDP shard versions and lifecycle hooks for activation recomputation."""
 
 from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from torch import nn
 
 from torchturbo.utils.torch_utils import torch_version
-
-if TYPE_CHECKING:
-    from torchturbo.models.modules.moe.moe_layer import BaseMoELayer, MoERuntimeInputs
 
 if torch_version() >= (2, 6, 0):
     from torch.distributed.fsdp._fully_shard import FSDPModule
@@ -19,18 +16,6 @@ if torch_version() >= (2, 6, 0):
 else:  # pragma: no cover - torch<2.6 compatibility
     from torch.distributed._composable.fsdp._fsdp_common import TrainingState
     from torch.distributed._composable.fsdp.fully_shard import FSDPModule
-
-
-@contextmanager
-def restore_moe_runtime_inputs(
-    snapshot: tuple[tuple[BaseMoELayer, MoERuntimeInputs], ...],
-) -> Iterator[None]:
-    """Use each graph's captured inputs and restore the caller's inputs on exit."""
-    with ExitStack() as stack:
-        for moe, inputs in snapshot:
-            stack.callback(moe.set_runtime_inputs, moe._runtime_inputs)
-            moe.set_runtime_inputs(inputs)
-        yield
 
 
 def _unshard_before_forward(submodule: FSDPModule, _args: tuple[Any, ...]) -> None:
@@ -67,3 +52,13 @@ def fsdp_recompute_context(module: nn.Module, use_reentrant: bool) -> Iterator[N
                 handle = child.register_forward_pre_hook(hook, prepend=use_reentrant)
                 stack.callback(handle.remove)
         yield
+
+
+def parameter_version(module: nn.Module) -> tuple[tuple[int, int], ...]:
+    """Track the persistent FSDP shards across temporary full-weight restoration."""
+    if isinstance(module, FSDPModule):
+        group = module._get_fsdp_state()._fsdp_param_group
+        parameters = tuple(parameter.sharded_param for parameter in group.fsdp_params)
+    else:
+        parameters = tuple(module.parameters(recurse=False))
+    return tuple((id(parameter), parameter._version) for parameter in parameters)

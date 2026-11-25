@@ -287,3 +287,69 @@ def test_recompute_context_limits_non_reentrant_hooks_to_older_torch(
     with activation_checkpointing.fsdp_recompute_context(fsdp_parent, use_reentrant):
         assert len(child._forward_pre_hooks) == len(original_hooks) + extra_hooks
     assert child._forward_pre_hooks == original_hooks
+
+
+@pytest.mark.parametrize("use_reentrant", [False, True])
+@pytest.mark.parametrize("fail_recompute", [False, True])
+def test_module_checkpoint_context_preserves_per_invocation_state(use_reentrant, fail_recompute, monkeypatch):
+    from contextlib import contextmanager
+
+    class StatefulLayer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.tensor(1.0))
+            self.scale = 1.0
+
+        def forward(self, x):
+            return x * self.weight * self.scale
+
+    calls = []
+
+    def build(layer, block, reentrant, parameter_version):
+        assert reentrant == use_reentrant
+        assert block is layer
+
+        def capture():
+            saved_scale = layer.scale
+            version = parameter_version(layer)
+
+            @contextmanager
+            def scope(replay):
+                previous = layer.scale
+                try:
+                    calls.append((saved_scale, replay, version))
+                    if replay:
+                        layer.scale = saved_scale
+                        if fail_recompute:
+                            raise RuntimeError("recompute failed")
+                    yield
+                finally:
+                    layer.scale = previous
+
+            return scope
+        return capture
+
+    monkeypatch.setattr(StatefulLayer, "prepare_checkpoint_context", build, raising=False)
+    layer = StatefulLayer()
+    backend = mixed_precision_backend(use_reentrant)
+    FSDP2Backend._apply_activation_checkpointing(
+        backend, layer, SimpleNamespace(modules={"": FSDPPlanSpec(activation_checkpoint=True)}),
+    )
+    first = torch.tensor(1.0, requires_grad=True)
+    second = torch.tensor(1.0, requires_grad=True)
+    layer.scale = 2.0
+    a = layer(first)
+    layer.scale = 3.0
+    b = layer(second)
+    layer.scale = 9.0
+    if fail_recompute:
+        with pytest.raises(RuntimeError, match="recompute failed"):
+            (a + b).backward()
+    else:
+        (a + b).backward()
+        torch.testing.assert_close(first.grad, torch.tensor(2.0))
+        torch.testing.assert_close(second.grad, torch.tensor(3.0))
+        assert sorted((scale, replay) for scale, replay, _ in calls) == [
+            (2.0, False), (2.0, True), (3.0, False), (3.0, True),
+        ]
+    assert layer.scale == 9.0

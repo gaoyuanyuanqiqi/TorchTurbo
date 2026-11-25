@@ -471,10 +471,10 @@ class FSDPPrefetchManager:
         return expert_forward_targets
 
     @contextmanager
-    def suspend_expert_forward_prefetch(
+    def recompute_context(
         self, model: Optional[nn.Module] = None
     ) -> Iterator[None]:
-        """Temporarily disable expert-source forward prefetch.
+        """Apply this manager's prefetch policy during recomputation.
 
         Used by activation-checkpoint recompute only. Normal forward still keeps
         expert lookahead; during backward recompute, nested expert FSDP units can
