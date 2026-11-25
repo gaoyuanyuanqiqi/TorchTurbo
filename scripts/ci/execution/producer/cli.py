@@ -127,7 +127,7 @@ def _plan(args: argparse.Namespace, source: GitSource) -> int:
                     message=str(exc),
                 )]) from exc
     config = bind_image_refs(config, image_refs)
-    facts = load_facts(root, config)
+    facts = load_facts(root)
     output = planner_output_for(
         config,
         facts,

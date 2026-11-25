@@ -607,6 +607,38 @@ def test_tampered_integration_spec_is_rejected(
     ).to_dict()
 
 
+def test_integration_case_requires_framework_venv(
+    config: CiConfig, facts: TestFacts, source
+) -> None:
+    broken = replace(
+        facts,
+        integration=tuple(
+            replace(case, framework="missing")
+            if case.case_id == "qwen3_5_moe/sft_2cpu" else case
+            for case in facts.integration
+        ),
+    )
+
+    with pytest.raises(PlanError, match="has no venv mapping"):
+        build_plan(config, broken, "pull_request", source)
+
+
+def test_integration_case_requires_known_target(
+    config: CiConfig, facts: TestFacts, source
+) -> None:
+    broken = replace(
+        facts,
+        integration=tuple(
+            replace(case, targets=("missing",))
+            if case.case_id == "qwen3_5_moe/sft_2cpu" else case
+            for case in facts.integration
+        ),
+    )
+
+    with pytest.raises(PlanError, match="unknown target 'missing'"):
+        build_plan(config, broken, "pull_request", source)
+
+
 def test_tampered_change_mode_is_rejected(
     config: CiConfig, facts: TestFacts, pr_plan: ExecutionPlan
 ) -> None:

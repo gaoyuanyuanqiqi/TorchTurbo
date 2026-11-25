@@ -435,8 +435,8 @@ def check_config() -> list[Problem]:
     from ..execution.producer.facts import FactsError, load_facts
 
     try:
-        config = load_config(ROOT)
-        load_facts(ROOT, config)
+        load_config(ROOT)
+        load_facts(ROOT)
     except (CiConfigError, FactsError) as exc:
         return [Problem(issue.location, issue.message) for issue in exc.issues]
     return []

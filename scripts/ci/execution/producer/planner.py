@@ -34,10 +34,17 @@ from .config import (
     CiConfigError,
     CiRunner,
     CiTarget,
+    IntegrationSuite,
     Scope,
     area_selected,
 )
-from .facts import IntegrationFact, PytestFact, TestFacts, test_parts
+from .facts import (
+    INTEGRATION_RUNNER_SCRIPT,
+    IntegrationFact,
+    PytestFact,
+    TestFacts,
+    test_parts,
+)
 
 
 class PlanError(DiagnosticError):
@@ -311,6 +318,7 @@ def _integration_jobs(
     used_selections: set[int],
 ) -> list[Job]:
     cases = {(case.suite, case.case_id): case for case in facts.integration}
+    resources: dict[tuple[str, str], IntegrationSuite | None] = {}
     selected: list[tuple[ImageSelection, IntegrationFact]] = []
     for selection in selections:
         if selection.test_areas is None:
@@ -344,6 +352,12 @@ def _integration_jobs(
     job_ids: set[str] = set()
     seen: set[tuple[str, str, str, str]] = set()
     for selection, case in selected:
+        case_key = (case.suite, case.case_id)
+        if case_key not in resources:
+            resources[case_key] = _integration_resources(config, case, issues)
+        suite = resources[case_key]
+        if suite is None:
+            continue
         target = config.target_for(selection.image.target)
         if case.platform != target.device:
             continue
@@ -358,7 +372,6 @@ def _integration_jobs(
         if key in seen:
             continue
         seen.add(key)
-        suite = config.integration_suite(case.suite)
         try:
             job_timeout = suite.job_timeout_minutes_for(case.platform, case.case_id)
             step_timeout = suite.step_timeout_minutes_for(case.platform, case.case_id)
@@ -397,11 +410,53 @@ def _integration_jobs(
                     suite=case.suite,
                     case_id=case.case_id,
                     framework=case.framework,
-                    runner_script=suite.runner,
+                    runner_script=INTEGRATION_RUNNER_SCRIPT,
                 ),
             ),),
         ))
     return jobs
+
+
+def _integration_resources(
+    config: CiConfig, case: IntegrationFact, issues: list[Diagnostic]
+) -> IntegrationSuite | None:
+    """Validate the suite and CI resources a selected case resolves to."""
+    where = f"integration/{case.suite}/{case.case_id}"
+    valid = True
+    if not config.device_is_configured(case.platform):
+        issues.append(_issue(
+            f"{where}.platform",
+            f"no CI target for platform {case.platform!r}",
+            "missing-integration-target",
+        ))
+        valid = False
+    for name in case.targets:
+        target = config.targets.get(name)
+        if target is None:
+            issues.append(_issue(
+                f"{where}.targets", f"unknown target {name!r}", "unknown-case-target"
+            ))
+            valid = False
+        elif target.device != case.platform:
+            issues.append(_issue(
+                f"{where}.targets",
+                f"target {name!r} is for {target.device}, not {case.platform}",
+                "case-target-device",
+            ))
+            valid = False
+    try:
+        suite = config.integration_suite(case.suite)
+    except CiConfigError as exc:
+        issues.extend(exc.issues)
+        return None
+    if case.framework not in suite.framework_venvs:
+        issues.append(_issue(
+            f"test_areas.integration.suites.{case.suite}.framework_venvs.{case.framework}",
+            f"framework {case.framework!r} has no venv mapping",
+            "missing-framework-venv",
+        ))
+        valid = False
+    return suite if valid else None
 
 
 def build_plan(

@@ -41,8 +41,8 @@ def config() -> CiConfig:
 
 
 @pytest.fixture(scope="session")
-def facts(config: CiConfig) -> TestFacts:
-    return load_facts(ROOT, config)
+def facts() -> TestFacts:
+    return load_facts(ROOT)
 
 
 @pytest.fixture(scope="session")

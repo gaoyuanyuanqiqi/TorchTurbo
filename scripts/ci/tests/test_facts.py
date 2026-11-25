@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import json
-from dataclasses import replace
 from pathlib import Path
 
-from scripts.ci.execution.producer.config import CiConfig, IntegrationSuite
 from scripts.ci.execution.producer.facts import (
+    INTEGRATION_RUNNER_SCRIPT,
+    INTEGRATION_SUITE_DIRECTORY,
     _integration_facts,
     _pytest_facts,
-    _targets,
 )
 
 
@@ -165,40 +164,32 @@ def test_model_import_does_not_set_framework(tmp_path: Path) -> None:
     assert fact.frameworks == ()
 
 
-def test_integration_target_must_be_non_empty_string(config: CiConfig) -> None:
-    issues = []
-    assert _targets({"target": 123}, "npu", config, "case.targets", issues) == ()
-    assert [issue.message for issue in issues] == ["target must be a non-empty string"]
-
-    issues = []
-    assert _targets({"targets": []}, "npu", config, "case.targets", issues) == ()
-    assert [issue.message for issue in issues] == ["targets must be non-empty strings"]
-
-
-def _write_manifest_runner(root: Path, payload: dict) -> None:
-    runner = root / "runner.py"
+def _write_integration_fixture(root: Path, manifest: dict) -> None:
+    suite = root / INTEGRATION_SUITE_DIRECTORY / "base_suite.py"
+    suite.parent.mkdir(parents=True)
+    suite.write_text("TEST_CASES = []\n", encoding="utf-8")
+    runner = root / INTEGRATION_RUNNER_SCRIPT
+    runner.parent.mkdir(parents=True)
     runner.write_text(
-        f"print({json.dumps(payload)!r})\n",
+        f"print({json.dumps(manifest)!r})\n",
         encoding="utf-8",
     )
 
 
-def _manifest_config(config: CiConfig) -> CiConfig:
-    suite = IntegrationSuite(
-        name="base_suite",
-        runner="runner.py",
-        job_timeout_minutes={"cpu": 1, "npu": 1, "gpu": 1},
-        step_timeout_minutes={"cpu": 1, "npu": 1, "gpu": 1},
-        framework_venvs={"swift": "swift"},
-        overrides={},
-    )
-    return replace(config, integration_suites={"base_suite": suite})
+def test_missing_integration_runner_is_diagnostic(tmp_path: Path) -> None:
+    suite = tmp_path / INTEGRATION_SUITE_DIRECTORY / "base_suite.py"
+    suite.parent.mkdir(parents=True)
+    suite.write_text("TEST_CASES = []\n", encoding="utf-8")
+
+    facts, issues = _integration_facts(tmp_path)
+
+    assert facts == []
+    assert len(issues) == 1
+    assert "manifest failed" in issues[0].message
 
 
-def test_compare_false_does_not_require_golden(
-    tmp_path: Path, config: CiConfig
-) -> None:
-    _write_manifest_runner(tmp_path, {
+def test_compare_false_does_not_require_golden(tmp_path: Path) -> None:
+    _write_integration_fixture(tmp_path, {
         "schema_version": 1,
         "suite": "base_suite",
         "cases": [{
@@ -213,7 +204,7 @@ def test_compare_false_does_not_require_golden(
     })
     (tmp_path / "config.yaml").write_text("value: 1\n", encoding="utf-8")
 
-    facts, issues = _integration_facts(tmp_path, _manifest_config(config))
+    facts, issues = _integration_facts(tmp_path)
 
     assert [issue.message for issue in issues] == [
         "CI integration cases must compare"
@@ -221,16 +212,14 @@ def test_compare_false_does_not_require_golden(
     assert [fact.case_id for fact in facts] == ["case"]
 
 
-def test_manifest_type_errors_are_diagnostics(
-    tmp_path: Path, config: CiConfig
-) -> None:
-    _write_manifest_runner(tmp_path, {
+def test_compare_requires_existing_golden(tmp_path: Path) -> None:
+    _write_integration_fixture(tmp_path, {
         "schema_version": 1,
         "suite": "base_suite",
         "cases": [{
             "case_id": "case",
-            "framework": [],
-            "platform": [],
+            "framework": "swift",
+            "platform": "cpu",
             "ranks": 1,
             "compare": True,
             "update_golden": False,
@@ -238,11 +227,7 @@ def test_manifest_type_errors_are_diagnostics(
             "golden": "golden.yaml",
         }],
     })
-    for name in ("config.yaml", "golden.yaml"):
-        (tmp_path / name).write_text("value: 1\n", encoding="utf-8")
 
-    _, issues = _integration_facts(tmp_path, _manifest_config(config))
+    _, issues = _integration_facts(tmp_path)
 
-    messages = [issue.message for issue in issues]
-    assert any("has no venv mapping" in message for message in messages)
-    assert "unknown platform" in messages
+    assert [issue.message for issue in issues] == ["golden file is missing"]

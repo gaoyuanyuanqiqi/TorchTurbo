@@ -11,11 +11,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-from .config import CiConfig
-from ...contracts.base import DEVICES, Diagnostic, DiagnosticError
+from ...contracts.base import Diagnostic, DiagnosticError
 
 PYTEST_ROOT = Path("tests/unit_tests")
-MANIFEST_SCHEMA_VERSION = 1
+INTEGRATION_ROOT = Path("tests/integration_tests")
+INTEGRATION_RUNNER_SCRIPT = (INTEGRATION_ROOT / "scripts/run_tests.py").as_posix()
+INTEGRATION_SUITE_DIRECTORY = INTEGRATION_ROOT / "test_suite"
 DEVICE_MARKERS = frozenset({"cpu", "npu", "gpu"})
 MULTI_MARKERS = {"multi_npu": "npu", "multi_gpu": "gpu"}
 REQUIRED_MARKERS = ("cpu", "npu", "multi_npu", "gpu", "multi_gpu", "integration")
@@ -248,179 +249,149 @@ def _pytest_facts(root: Path) -> tuple[list[PytestFact], list[Diagnostic]]:
     return facts, issues
 
 
-def _manifest(
-    root: Path, suite_name: str, runner: str
-) -> tuple[dict[str, Any] | None, Diagnostic | None]:
-    result = subprocess.run(
-        [sys.executable, str(root / runner), "--suite", suite_name, "--list-cases", "--json"],
-        cwd=root,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode:
-        detail = (result.stderr or result.stdout).strip()
-        message = f"manifest failed with rc={result.returncode}: {detail}"
-    else:
-        try:
-            payload = json.loads(result.stdout)
-        except ValueError as exc:
-            message = f"manifest is not JSON: {exc}"
-        else:
-            if isinstance(payload, dict):
-                return payload, None
-            message = "manifest must be a mapping"
-    return None, _issue(
-        runner, f"integration suite {suite_name!r} {message}", "integration-manifest"
-    )
-
-
-def _check_repo_file(
-    root: Path, value: str, where: str, issues: list[Diagnostic]
-) -> None:
-    if not value:
-        issues.append(_issue(where, "path is required"))
-        return
-    path = Path(value)
-    if path.is_absolute():
-        issues.append(_issue(where, "path must be repository-relative"))
-        return
-    absolute = (root / path).resolve()
+def _load_suite_cases(
+    root: Path, suite_name: str
+) -> tuple[list[Any] | None, Diagnostic | None]:
+    """Execute the integration runner and return one suite's manifest cases."""
+    runner_path = INTEGRATION_RUNNER_SCRIPT
     try:
-        absolute.relative_to(root.resolve())
-    except ValueError:
-        issues.append(_issue(where, "path escapes the repository"))
-        return
-    if not absolute.is_file():
-        issues.append(_issue(where, f"file is missing: {value}"))
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(root / runner_path),
+                "--suite", suite_name,
+                "--list-cases",
+                "--json",
+            ],
+            cwd=root,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        return None, _issue(
+            runner_path,
+            f"integration suite {suite_name!r} manifest cannot start: {exc}",
+            "integration-manifest",
+        )
+    if completed.returncode:
+        detail = (completed.stderr or completed.stdout).strip()
+        return None, _issue(
+            runner_path,
+            f"integration suite {suite_name!r} manifest failed "
+            f"with rc={completed.returncode}: {detail}",
+            "integration-manifest",
+        )
+    try:
+        manifest = json.loads(completed.stdout)
+    except ValueError as exc:
+        return None, _issue(
+            runner_path,
+            f"integration suite {suite_name!r} manifest is not JSON: {exc}",
+            "integration-manifest",
+        )
+    if not isinstance(manifest, dict):
+        return None, _issue(
+            runner_path,
+            f"integration suite {suite_name!r} manifest must be a mapping",
+            "integration-manifest",
+        )
+    cases = manifest.get("cases")
+    if not isinstance(cases, list):
+        return None, _issue(
+            runner_path,
+            f"integration suite {suite_name!r} manifest cases must be a list",
+            "integration-manifest",
+        )
+    return cases, None
 
 
-def _targets(
-    item: dict[str, Any],
-    platform: str,
-    config: CiConfig,
-    where: str,
-    issues: list[Diagnostic],
-) -> tuple[str, ...]:
-    single = item.get("target")
-    multiple = item.get("targets")
-    if single is not None and multiple is not None:
-        issues.append(_issue(where, "declare target or targets, not both"))
-    single_valid = isinstance(single, str) and bool(single)
-    multiple_valid = isinstance(multiple, list) and bool(multiple) and all(
-        isinstance(value, str) and value for value in multiple
-    )
-    if single is not None and not single_valid:
-        issues.append(_issue(where, "target must be a non-empty string"))
-    if multiple is not None and not multiple_valid:
-        issues.append(_issue(where, "targets must be non-empty strings"))
-    values = (single,) if single_valid else tuple(multiple) if multiple_valid else ()
-    for name in values:
-        target = config.targets.get(name)
-        if target is None:
-            issues.append(_issue(where, f"unknown target {name!r}"))
-        elif target.device != platform:
-            issues.append(_issue(where, f"target {name!r} is for {target.device}, not {platform}"))
-    return values
+def _integration_case_fact(
+    root: Path,
+    suite_name: str,
+    case_payload: Any,
+    case_index: int,
+) -> tuple[IntegrationFact | None, list[Diagnostic]]:
+    """Validate one manifest case and convert it into an IntegrationFact."""
+    case_location = f"integration/{suite_name}/cases[{case_index}]"
+    if not isinstance(case_payload, dict):
+        return None, [_issue(case_location, "case must be a mapping")]
+
+    case_id = case_payload.get("case_id")
+    if not isinstance(case_id, str) or not case_id:
+        return None, [_issue(
+            f"{case_location}.case_id", "case_id is required"
+        )]
+
+    issues: list[Diagnostic] = []
+    ranks = case_payload.get("ranks")
+    if not isinstance(ranks, int) or isinstance(ranks, bool) or ranks < 1:
+        issues.append(_issue(
+            f"{case_location}.ranks", "ranks must be an integer >= 1"
+        ))
+        ranks = 1
+
+    compares_results = case_payload.get("compare") is True
+    if not compares_results:
+        issues.append(_issue(
+            f"{case_location}.compare", "CI integration cases must compare"
+        ))
+    if case_payload.get("update_golden") is not False:
+        issues.append(_issue(
+            f"{case_location}.update_golden",
+            "CI must not update golden values",
+        ))
+
+    if compares_results:
+        golden_path = case_payload.get("golden")
+        if not isinstance(golden_path, str) or not (root / golden_path).is_file():
+            issues.append(_issue(
+                f"{case_location}.golden", "golden file is missing"
+            ))
+
+    return IntegrationFact(
+        suite=suite_name,
+        case_id=case_id,
+        framework=str(case_payload.get("framework") or ""),
+        platform=str(case_payload.get("platform") or ""),
+        targets=tuple(case_payload.get("targets") or ()),
+        ranks=ranks,
+    ), issues
 
 
 def _integration_facts(
-    root: Path, config: CiConfig
+    root: Path,
 ) -> tuple[list[IntegrationFact], list[Diagnostic]]:
-    issues: list[Diagnostic] = []
+    """Discover integration suites from test_suite and load their manifests."""
+    suite_files = sorted(
+        (root / INTEGRATION_SUITE_DIRECTORY).glob("*_suite.py")
+    )
     facts: list[IntegrationFact] = []
-    seen: set[tuple[str, str]] = set()
-    for suite_name, suite in sorted(config.integration_suites.items()):
-        payload, error = _manifest(root, suite_name, suite.runner)
-        if error is not None:
-            issues.append(error)
+    issues: list[Diagnostic] = []
+    for suite_file in suite_files:
+        suite_name = suite_file.stem
+        case_payloads, manifest_issue = _load_suite_cases(root, suite_name)
+        if manifest_issue is not None:
+            issues.append(manifest_issue)
             continue
-        assert payload is not None
-        expected = {
-            "schema_version": MANIFEST_SCHEMA_VERSION,
-            "suite": suite_name,
-        }
-        for key, value in expected.items():
-            actual = payload.get(key)
-            if actual != value:
-                issues.append(_issue(
-                    suite.runner,
-                    f"manifest {key} is {actual!r}, expected {value!r}",
-                    "integration-manifest",
-                ))
-        cases = payload.get("cases")
-        if not isinstance(cases, list):
-            issues.append(_issue(
-                suite.runner,
-                f"suite {suite_name!r} manifest cases must be a list",
-                "integration-manifest",
-            ))
-            continue
-        for index, item in enumerate(cases):
-            where = f"{suite.runner}.cases[{index}]"
-            if not isinstance(item, dict):
-                issues.append(_issue(where, "case must be a mapping"))
-                continue
-            case_id = item.get("case_id")
-            if not isinstance(case_id, str) or not case_id:
-                issues.append(_issue(f"{where}.case_id", "case_id is required"))
-                continue
-            key = (suite_name, case_id)
-            if key in seen:
-                issues.append(_issue(f"{where}.case_id", f"duplicate case {case_id!r}"))
-            seen.add(key)
-            framework = item.get("framework")
-            if not isinstance(framework, str) or framework not in suite.framework_venvs:
-                issues.append(_issue(
-                    f"{where}.framework", f"framework {framework!r} has no venv mapping"
-                ))
-                framework = ""
-            platform = item.get("platform")
-            if not isinstance(platform, str) or platform not in DEVICES:
-                issues.append(_issue(f"{where}.platform", "unknown platform"))
-                platform = ""
-            elif not config.device_is_configured(platform):
-                issues.append(_issue(
-                    f"{where}.platform", f"no CI target for {platform!r}"
-                ))
-            targets = (
-                _targets(item, platform, config, f"{where}.targets", issues)
-                if platform else ()
+        assert case_payloads is not None
+
+        for case_index, case_payload in enumerate(case_payloads):
+            fact, case_issues = _integration_case_fact(
+                root,
+                suite_name,
+                case_payload,
+                case_index,
             )
-            ranks = item.get("ranks")
-            if not isinstance(ranks, int) or isinstance(ranks, bool) or ranks < 1:
-                issues.append(_issue(f"{where}.ranks", "ranks must be an integer >= 1"))
-                ranks = 1
-            compare = item.get("compare")
-            if compare is not True:
-                issues.append(_issue(
-                    f"{where}.compare", "CI integration cases must compare"
-                ))
-            if item.get("update_golden") is not False:
-                issues.append(_issue(
-                    f"{where}.update_golden", "CI must not update golden values"
-                ))
-            _check_repo_file(
-                root, str(item.get("config") or ""), f"{where}.config", issues
-            )
-            if compare is True:
-                _check_repo_file(
-                    root, str(item.get("golden") or ""), f"{where}.golden", issues
-                )
-            facts.append(IntegrationFact(
-                suite=suite_name,
-                case_id=case_id,
-                framework=framework,
-                platform=platform,
-                targets=targets,
-                ranks=ranks,
-            ))
+            issues.extend(case_issues)
+            if fact is not None:
+                facts.append(fact)
     return facts, issues
 
 
-def load_facts(root: Path, config: CiConfig) -> TestFacts:
-    """Load all configured pytest and integration facts."""
+def load_facts(root: Path) -> TestFacts:
+    """Load pytest and integration facts from repository content."""
     pytest, pytest_issues = _pytest_facts(root)
-    integration, integration_issues = _integration_facts(root, config)
+    integration, integration_issues = _integration_facts(root)
     issues = [*pytest_issues, *integration_issues]
     if not pytest:
         issues.append(_issue(PYTEST_ROOT.as_posix(), "no pytest facts found"))

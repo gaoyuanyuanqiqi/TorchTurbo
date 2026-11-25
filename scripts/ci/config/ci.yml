@@ -86,7 +86,6 @@ test_areas:
   integration:
     suites:
       base_suite:
-        runner: tests/integration_tests/scripts/run_tests.py
         defaults:
           job_timeout_minutes: {cpu: 40, npu: 90, gpu: 90}
           step_timeout_minutes: {cpu: 40, npu: 90, gpu: 90}

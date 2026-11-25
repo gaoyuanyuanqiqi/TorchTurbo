@@ -60,7 +60,6 @@ class IntegrationOverride:
 @dataclass(frozen=True)
 class IntegrationSuite:
     name: str
-    runner: str
     job_timeout_minutes: dict[str, int]
     step_timeout_minutes: dict[str, int]
     framework_venvs: dict[str, str]
@@ -440,7 +439,7 @@ def _load_pytest(
 
 
 def _load_integration(
-    raw: Any, venvs: dict[str, VenvSpec], root: Path, issues: list[Diagnostic]
+    raw: Any, venvs: dict[str, VenvSpec], issues: list[Diagnostic]
 ) -> dict[str, IntegrationSuite]:
     row = _row(raw, "test_areas.integration", {"suites"}, issues)
     suites: dict[str, IntegrationSuite] = {}
@@ -449,11 +448,8 @@ def _load_integration(
     ).items():
         path = f"test_areas.integration.suites.{name}"
         suite = _row(
-            value, path, {"runner", "defaults", "framework_venvs", "overrides"}, issues
+            value, path, {"defaults", "framework_venvs", "overrides"}, issues
         )
-        runner = str(suite.get("runner") or "")
-        if not runner or not (root / runner).is_file():
-            issues.append(_issue(f"{path}.runner", "runner script is missing"))
         defaults = _row(
             suite.get("defaults"),
             f"{path}.defaults",
@@ -490,7 +486,6 @@ def _load_integration(
             )
         suites[name] = IntegrationSuite(
             name=name,
-            runner=runner,
             job_timeout_minutes=_timeouts(
                 defaults.get("job_timeout_minutes"), f"{path}.defaults.job_timeout_minutes", issues
             ),
@@ -599,7 +594,7 @@ def load_config(root: Path) -> CiConfig:
     )
     pytest_areas = _load_pytest(test_areas.get("pytest"), venvs, root, issues)
     integration_suites = _load_integration(
-        test_areas.get("integration"), venvs, root, issues
+        test_areas.get("integration"), venvs, issues
     )
     scopes = _load_scopes(
         document.get("scopes"), images, set(integration_suites), issues
