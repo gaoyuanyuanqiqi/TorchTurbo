@@ -190,6 +190,7 @@ docker build \
 --platform linux/arm64 \
 -f Dockerfile_aarch64 \
 -t torchturbo:aarch64 \
+../..
 ```
 
 Platform dependency scripts are available in `scripts/runs/deps/`, while model-specific installers are located under `scripts/runs/<model>/`.
@@ -201,7 +202,7 @@ When training is launched through an entry point provided by TorchTurbo, the tra
 The LlamaFactory entry point, `scripts/runs/run_lf.py`, explicitly activates `llamafactory_v0` and then calls LlamaFactory's `run_exp()`.    
 The ms-swift entry point, `scripts/runs/run_swift.py`, parses TorchTurbo arguments and activates the `msswift` plugin before dispatching the selected stage.
 
-See the [`Qwen3.5 MoE training guide`](docs/runs/qwen3_5_moe/README_NPU.md).
+See the [training guide](docs/runs/README_NPU.md) for common preparation steps and model-specific examples.
 
 ### Configuration
 
@@ -263,8 +264,8 @@ Before running a script, you will typically need to check:
 ### Checkpoints
 
 Training checkpoints let you resume an interrupted run. Model weights are saved
-in DCP format. For inference or sharing, export the model to HF format; LoRA/DoRA
-weights are merged into the model during export.
+in DCP format. For inference or sharing, export the model to HF format; by
+default, LoRA/DoRA weights are merged into the model during export.
 
 ```text
 checkpoint-<step>/
@@ -280,6 +281,11 @@ is `checkpoint.hf_export`:
 
 - `every` (default): export an HF model with every checkpoint.
 - `final`: export an HF model only at the end of training. Intermediate checkpoints still save DCP.
+
+For LoRA runs, `--tt_lora_export_mode` controls the export content. The
+corresponding config field is `checkpoint.lora_export_mode`: `merged` (default)
+writes merged model weights, and `adapter` writes a standalone PEFT adapter
+directory (`adapter_config.json` and `adapter_model.safetensors`).
 
 LlamaFactory saves the final HF model to `<output_dir>/huggingface/`.
 ms-swift saves it inside the last `checkpoint-*/huggingface/`.
@@ -333,6 +339,7 @@ Built-in models are discovered from `src/torchturbo/models/`. Public environment
 docs/runs/
 └── qwen3_5_moe/
 └── bailing_v3/
+└── glm5_3/
 ...
 ```
 

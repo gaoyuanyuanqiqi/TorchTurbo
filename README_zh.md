@@ -163,7 +163,7 @@ docker build \
 `scripts/runs/run_lf.py` 会显式激活 `llamafactory_v0`，再调用 LlamaFactory 的 `run_exp()`；   
 `scripts/runs/run_swift.py` 会解析 TorchTurbo 参数并激活 `msswift` 插件，再分发到所选训练 stage。
 
-使用指导详见：[Qwen3.5 MoE 训练指南](docs/runs/qwen3_5_moe/README_NPU.md)。
+公共准备步骤与各模型的运行示例见[训练指南](docs/runs/README_NPU.md)。
 
 ### 配置说明
 torchturbo 自有配置有三种配置方法，优先级从低到高：
@@ -224,7 +224,8 @@ bash scripts/runs/qwen3_5_moe/lf_text_sft.sh
 ### Checkpoint
 
 训练 checkpoint 用于断点续训，其中的模型权重以 DCP 格式保存。
-如果要用模型做推理或分享给别人，可以导出为 HF 格式。LoRA/DoRA 权重会在导出时合并到模型中。
+如果要用模型做推理或分享给别人，可以导出为 HF 格式。默认情况下，LoRA/DoRA
+权重会在导出时合并到模型中。
 
 ```text
 checkpoint-<step>/
@@ -239,6 +240,11 @@ checkpoint-<step>/
 
 - `every`（默认）：每次保存 checkpoint 时，同时导出 HF 模型。
 - `final`：只在训练结束时导出 HF 模型，中间的 checkpoint 仍保存 DCP。
+
+LoRA 训练可使用 `--tt_lora_export_mode` 控制导出内容，对应配置字段为
+`checkpoint.lora_export_mode`：`merged`（默认）导出合并后的完整模型权重；
+`adapter` 导出独立的 PEFT 适配器目录（`adapter_config.json` 和
+`adapter_model.safetensors`）。
 
 训练结束后，LlamaFactory 将 HF 模型保存到 `<output_dir>/huggingface/`，
 ms-swift 保存到最后一个 `checkpoint-*/huggingface/`。
@@ -283,6 +289,7 @@ torchrun --nproc_per_node=8 scripts/checkpoint/dcp_to_hf.py \
 docs/runs/
 └── qwen3_5_moe/
 └── bailing_v3/
+└── glm5_3/
 ...
 ```
 
