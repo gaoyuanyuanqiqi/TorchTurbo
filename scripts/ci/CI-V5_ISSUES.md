@@ -13,12 +13,12 @@
 | V5-02 | P0 | Gate 只检查 task 级 `tests_total > 0` | 计划文件未执行仍可绿灯 |
 | V5-03 | P0 | suite 分类受 model import 影响 | engine 测试被误分到 model，PR 不执行 |
 | V5-04 | P0 | NPU/GPU/multi marker 没有强制合同 | NPU 测试漏标后可能跑错 lane 或完全漏跑 |
-| V5-05 | P1 | distributed 测试缺少 torchrun/多 rank 执行模式 | 依赖 `WORLD_SIZE` 的测试无法真实执行 |
+| V5-05 | P1（已关闭） | distributed 测试采用 `mp.spawn` 自启动多 rank，不依赖 torchrun | 无；保留 rank 识别约束 |
 | V5-06 | P1 | 测试扫描根和 PR scope 不完整 | `tests/npu`、model 测试等形成覆盖盲区 |
-| V5-07 | P1 | 通用路径直接调用 `torch.npu` / `torch.cuda` | CPU lane 出现设备不存在错误 |
-| V5-08 | P1 | fork image PR 审批标签未绑定 head SHA | 新 commit 可能复用旧审批 |
+| V5-07 | P1（部分修复） | 通用路径直接调用 `torch.npu` / `torch.cuda` | CI 在 CPU lane 正确暴露业务代码设备抽象泄漏 |
+| V5-08 | P1（已澄清） | `ci:image:build` 绑定 PR，不绑定 commit | 后续 commit 继承 PR 级信任，符合当前策略 |
 | V5-09 | P2 | actionlint 运行时下载不是自包含的 | 网络/DNS 抖动导致 lint 假失败 |
-| V5-10 | P2 | replay PR scope 和测试质量缺少自动校验 | 混入无关变更、测试 fixture 错误未被发现 |
+| V5-10 | P2 | 新增/修改测试缺少收集与执行校验 | fixture/import 错误可能被绿灯掩盖 |
 
 ## 2. 详细问题
 
@@ -78,16 +78,22 @@
   - 混合 CPU/NPU 文件按测试函数标记，必要时拆分文件。
 - 验收：新增一个无 marker 的 NPU 测试，lint 或 Plan 必须失败；新增无 marker 的 CPU 测试必须正常执行。
 
-### V5-05 distributed 测试缺少真实多 rank 执行
+### V5-05 distributed 测试使用 `mp.spawn`（已关闭）
 
-- 现象：依赖 `torchrun` / `WORLD_SIZE` 的测试被当作普通 pytest task 执行，或者被直接 deselect。
-- 证据：#45 `tests/unit_tests/models/test_mega_moe_distributed.py` 要求 2/4 NPU rank，当前 Run 没有真实执行。
-- 影响：distributed 测试绿灯没有覆盖 rank 初始化、通信、分片和聚合路径。
-- V5 修复：
-  - `multi_npu` 且 rank > 1 的 task 使用 torchrun 或专用 launcher。
-  - Plan 明确记录 rank 数和执行模式。
-  - 对不能以 torchrun 运行的测试给出显式错误，不静默 deselect。
-- 验收：至少一个 2-rank NPU 测试和一个 16-rank integration case 在 JUnit/日志中能证明实际 rank 数。
+- 结论：不是问题。项目测试不依赖 torchrun；pytest 进程直接运行在目标 runner 上，测试内部通过 `mp.spawn` 启动多 rank worker。
+- 当前实现：
+  - `facts.py` 识别 `mp.spawn(nprocs=N)`、`require_npus(N)` 和 `world_size` 参数，生成 `ranks_by_device`。
+  - `planner.py` 按 `ranks` 选择 `rank_capacity >= N` 的 runner。
+  - `pytest_job.py` 保持普通 `pytest` 启动，多进程由测试自身负责。
+  - integration 用例由 `run_tests.py` 调用 `torch.distributed.run`，不受此问题影响。
+- 保留约束：
+  - `multi_npu` 测试必须使用 `mp.spawn`，且 `nprocs/rank` 能被 Facts 静态识别。
+  - 不要求 Executor 支持 torchrun；torchrun 不作为 unit test 的运行方式。
+- 当前证据：
+  - `tests/unit_tests/engine/test_muon_offload_distributed.py` 使用 `mp.spawn(nprocs=2)`。
+  - `tests/unit_tests/models/qwen4_exp/test_qsa_distributed.py` 使用 `require_npus(2)` + `mp.spawn(nprocs=2)`。
+  - #45 引用的 `test_mega_moe_distributed.py` 当前工作树中不存在，原证据失效。
+- 验收：`multi_npu` 测试实际启动 N 个 worker，Plan 中 `ranks >= N`，日志或 JUnit 能证明多 rank 执行。
 
 ### V5-06 测试扫描根和 PR scope 不完整
 
@@ -101,23 +107,32 @@
 
 ### V5-07 通用路径直接访问特殊设备
 
-- 现象：PR48 在 CPU lane 执行时报 `AttributeError: module 'torch' has no attribute 'npu'`。
-- 证据：`tests/unit_tests/engine/test_core.py::TestEngineSetup::test_forward_backward_batch_runs_forward_and_backward`，调用 `torch.npu.empty_cache()`。
-- 根因：PR48 在 `engine/core.py:1322` 无条件调用 `torch.npu.empty_cache()`，没有走 device/runtime 抽象。
-- V5 修复：
-  - 通用 engine 代码只调用 device runtime 抽象，例如 `empty_cache()`。
-  - NPU/CUDA 专用逻辑放在对应 backend 或 provider 中。
-  - CPU lane 的测试环境不安装 `torch_npu`，用于及时发现未分流调用。
-- 验收：CPU lane 执行通用 engine 测试不再依赖 `torch.npu`；NPU lane 仍有对应的缓存释放测试。
+- 结论：这是 CI 正确发现业务代码问题，不是 CI 误报。CPU lane 不安装 `torch_npu`，正好能暴露通用路径中的设备专用调用。
+- 原问题：PR48 在 CPU lane 执行时报 `AttributeError: module 'torch' has no attribute 'npu'`；业务代码在 `engine/core.py` 中直接调用 `torch.npu.empty_cache()`，没有走 device/runtime 抽象。
+- 测试归属：`tests/unit_tests/engine/test_core.py` 使用 `CpuRuntime` 和 CPU tensor，按实际行为属于 CPU 用例。不能只依赖 `pytest.mark.cpu` 判断，也不能因为这个 marker 曾不准确就否定 CI 发现的问题。
+- 当前状态：
+  - 原始无条件 `torch.npu.empty_cache()` 已移除。
+  - `engine/core.py` 的 `_sync_device()` 仍直接判断 `torch.npu` / `torch.cuda`，但有 `hasattr` 和 `is_available()` 保护，当前不再导致 CPU lane 崩溃。
+  - 这属于残留的设备抽象泄漏，不是 CI 故障；原文档中的测试证据已过时。
+- 修复方向：
+  - 通用 engine 代码统一调用 `device_runtime.empty_cache()` / `device_runtime.synchronize()`。
+  - NPU/CUDA 专用实现只保留在对应 runtime/backend/provider 中。
+  - marker 与测试实际行为不一致时单独校正 marker，不影响本次 CI 判断。
+- 验收：CPU lane 执行通用 engine 测试不出现 `torch.npu` / `torch.cuda` 依赖；NPU lane 仍有对应的同步和缓存释放覆盖。
 
-### V5-08 fork image PR 审批未绑定 head SHA
+### V5-08 fork image PR 标签审批语义（已澄清）
 
-- 现象：`ci:image:build` 标签可以复用于后续 commit。
-- 风险：维护者批准了旧 commit 后，fork PR 再推送新代码，可能继续获得 image build 权限。
-- V5 修复：
-  - 标签绑定审批时的 head SHA。
-  - 新 commit 到达后要求重新审批，或在 workflow 中校验审批 SHA。
-- 验收：push 新 commit 后旧审批失效，Image PR 必须重新获得标签审批。
+- 当前语义：`ci:image:build` 是 **PR 级信任标签**，绑定 PR，不绑定 head SHA。
+- 当前行为：
+  - 维护者给 PR 加标签后，PR 后续的 Dockerfile commit 仍满足审批条件。
+  - 新 commit 不会自动撤销标签，也不会要求维护者重新打标签。
+  - 构建使用 SWR secret；候选镜像只推 content tag，stable alias 仍由独立的 promote workflow 控制。
+- 结论：按“标签代表信任整个 PR/贡献者”的当前策略，这不是实现 bug，也不要求改成 head SHA 绑定。
+- 使用约束：
+  - 只给可信 contributor/PR 添加 `ci:image:build`。
+  - 标签不替代代码 review，维护者仍需 review 后续改动。
+  - 如果未来改为“按 commit 审批”，应使用 PR review approval、environment approval 或 `/image-build <sha>`，不要继续复用持久 label。
+- 验收：文档明确 `ci:image:build` 为 PR 级语义；新 commit 继承标签符合预期，不会误称为 commit 级审批。
 
 ### V5-09 actionlint 获取不是自包含的
 
@@ -129,17 +144,17 @@
   - 对工具获取失败给出明确的 infra-error，而不是普通 lint error。
 - 验收：断网或 DNS 异常时 lint 能明确报告工具不可用；正常缓存命中时不再访问网络。
 
-### V5-10 replay PR 范围和测试质量缺少校验
+### V5-10 新增/修改测试缺少收集与执行校验
 
-- 现象：
-  - #52 diff 为 45 个文件，上游 #85 为 14 个，混入 #82–#84 和 main 漂移内容。
-  - #49 `deepseek_v41/test_runtime_contracts.py` 直接运行时出现 2 个 `unit_kl_scale` fixture 错误。
-- 影响：PR 失败归因困难；未执行测试中的 fixture/import 错误可能长期隐藏。
+- 结论：CI 只处理当前 PR 的 `base..head`。Replay 分支是否与上游 PR 文件一致，属于 replay 构造流程的问题，不是当前 CI 的问题。
+- 现象：#49 `deepseek_v41/test_runtime_contracts.py` 直接运行时出现 2 个 `unit_kl_scale` fixture 错误；如果文件未进入 Plan 或未实际执行，CI 仍可能绿灯。
+- 影响：新增/修改测试的 import、collection、fixture 错误可能长期隐藏；测试文件存在不等于测试被验证。
 - V5 修复：
-  - replay PR 增加“与上游 PR changed files 对比”的范围检查。
-  - 新增/修改的测试文件至少执行一次 collect-only smoke test。
-  - Plan 对新增测试文件默认纳入执行，不依赖作者额外登记。
-- 验收：replay PR 不能静默混入无关文件；新增测试文件出现 fixture/import 错误时 CI 直接失败。
+  - 新增/修改的测试文件默认进入 Plan，不依赖作者额外登记。
+  - 对新增/修改文件执行 collect-only，捕获 import/collection 错误。
+  - 涉及 fixture 的测试必须在实际执行中覆盖；Gate 不把未产生 case 的文件当成已验证。
+  - replay PR 与上游 PR 的 diff 对齐由 replay 构造工具负责，不纳入 CI 验收。
+- 验收：PR 新增/修改的测试文件要么产生 JUnit case，要么 CI 明确报告未执行或收集失败。
 
 ## 3. V4 已解决的问题
 
@@ -157,11 +172,11 @@
 - [ ] 计划中的每个 pytest 文件至少产生一个 JUnit case
 - [ ] `engine/**`、`ops/**` 不再被 model import 误分类
 - [ ] `tests/npu/**` 要么纳入扫描，要么明确禁止
-- [ ] distributed 测试使用真实 torchrun/多 rank 执行
+- [x] distributed 测试使用 `mp.spawn` 自行启动真实多 rank，不要求 torchrun
 - [ ] 通用代码不直接访问 `torch.npu` / `torch.cuda`
-- [ ] fork image PR 审批与 head SHA 绑定
+- [x] fork image PR 标签语义明确为 PR 级信任，不要求绑定 head SHA
 - [ ] actionlint 获取不依赖运行时网络
-- [ ] replay PR 范围与上游 PR 对齐
+- [ ] 新增/修改的测试文件至少被 collect 或实际执行
 
 ## 5. 建议复测用例
 
@@ -174,5 +189,6 @@
 | DP rebalance | 重新跑 #51 | 49 个新用例全部执行 |
 | 插件测试 | 重新跑 #52 | `test_plugins` / `test_plugins_npu` 出现在 JUnit |
 | 通用 device 调用 | 重新跑 #48 | CPU lane 不再访问 `torch.npu` |
-| 分布式测试 | 运行 multi_npu probe | 使用真实多 rank 执行 |
+| 分布式测试 | 运行 multi_npu probe | 测试内部通过 `mp.spawn` 启动 N 个 worker，Plan 中 `ranks >= N` |
+| 新增测试文件 | 新增一个测试文件 | 自动进入 Plan，并完成 collect 或实际执行 |
 

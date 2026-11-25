@@ -527,7 +527,7 @@ def check_device_markers(root: Path = ROOT) -> list[Problem]:
         except SyntaxError:
             continue
         markers = _module_markers(tree)
-        if markers & NPU_MARKERS or "cpu" in markers:
+        if markers & NPU_MARKERS:
             continue
         line = _npu_signal_line(tree)
         if line:
@@ -588,6 +588,20 @@ def check_markers() -> list[Problem]:
                     for name in sorted(configured - set(REQUIRED_MARKERS)))
     return problems
 
+
+def check_test_locations(root: Path = ROOT) -> list[Problem]:
+    """Keep pytest files under tests/unit_tests so Planner can see them."""
+    allowed = root / "tests" / "unit_tests"
+    return [
+        Problem(
+            path.relative_to(root).as_posix(),
+            "pytest test files must live under tests/unit_tests",
+        )
+        for path in sorted((root / "tests").rglob("test_*.py"))
+        if not path.is_relative_to(allowed)
+    ]
+
+
 CHECKS = (
     Check("ruff", "Python syntax and CI-side Ruff rules", check_ruff),
     Check("shellcheck", "shell scripts under scripts/ci", check_shellcheck),
@@ -596,6 +610,7 @@ CHECKS = (
     Check("contract", "planner/lint/lane topology and output contracts", check_contract),
     Check("config", "CI config, pytest facts, and integration manifest contract", check_config),
     Check("markers", "registered pytest marker contract", check_markers),
+    Check("test-locations", "pytest files live under tests/unit_tests", check_test_locations),
     Check("device-markers", "NPU modules declare a device marker", check_device_markers),
 )
 CHECK_BY_NAME = {check.name: check for check in CHECKS}
