@@ -4,7 +4,6 @@ resources:
       device: cpu
     npu-a3:
       device: npu
-      hardware: a3
 
   images:
     cpu-default:
@@ -56,10 +55,11 @@ resources:
     swift:
       python: "3.11"
       requirements: [scripts/ci/config/envs/swift.txt]
-      overrides: [scripts/ci/config/envs/swift_overrides.txt]
+      overrides: ["datasets==5.0.1"]
     qwen4_exp_swift:
       python: "3.11"
-      extends: swift
+      requirements: [scripts/ci/config/envs/swift.txt]
+      overrides: ["datasets==5.0.1"]
 
 test_areas:
   pytest:
@@ -94,7 +94,7 @@ test_areas:
           llamafactory: lf
         overrides:
           bailing_v3/sft_16npu:
-            job_timeout_minutes: 480
+            job_timeout_minutes: 120
 
 scopes:
   pull_request:

@@ -1,2 +1,0 @@
-# Training pins that intentionally override ms-swift metadata.
-datasets==5.0.1

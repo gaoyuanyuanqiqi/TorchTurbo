@@ -17,7 +17,7 @@ from ....contracts.planner_contract import VenvSpec
 
 CPU_TORCH_VERSION = os.environ.get("CI_CPU_TORCH_VERSION", "2.10.0")
 READY_FILE = ".tt-ready.json"
-INSTALL_SCHEMA = "3"
+INSTALL_SCHEMA = "4"
 RUNTIME_DIR = Path("scripts/ci/execution/consumer/runtime")
 
 
@@ -78,11 +78,13 @@ class VenvManager:
             path = self.root / relative
             digest.update(f"file={relative.as_posix()}\n".encode())
             digest.update(path.read_bytes())
-        for requirements in (*spec.requirements, *spec.overrides):
+        for requirements in spec.requirements:
             for path in _requirement_files(self.root / requirements):
                 name = path.relative_to(self.root).as_posix()
                 digest.update(f"file={name}\n".encode())
                 digest.update(path.read_bytes())
+        for package in spec.overrides:
+            digest.update(f"override={package}\n".encode())
         return digest.hexdigest()[:16]
 
     def _is_ready(self, path: Path) -> bool:
@@ -111,11 +113,13 @@ class VenvManager:
 
         constraints = target / "ci-constraints.txt"
         constraints.write_text(self._constraints(venv, environment), encoding="utf-8")
-        for requirements in (*spec.requirements, *spec.overrides):
+        for requirements in spec.requirements:
             self._pip(venv, [
                 "install", "-r", str(self.root / requirements),
                 "-c", str(constraints),
             ])
+        for package in spec.overrides:
+            self._pip(venv, ["install", package, "-c", str(constraints)])
 
         self._pip(venv, ["install", "--no-build-isolation", "--no-deps",
                          "-e", str(self.root)])

@@ -23,7 +23,7 @@ def _config(name: str = "npu-a3-cann90") -> dict:
         "resources": {
             "targets": {
                 "cpu": {"device": "cpu"},
-                "npu-a3": {"device": "npu", "hardware": "a3"},
+                "npu-a3": {"device": "npu"},
             },
             "images": {
                 "cpu-default": {

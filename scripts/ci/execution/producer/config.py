@@ -25,7 +25,6 @@ class CiConfigError(DiagnosticError):
 class CiTarget:
     name: str
     device: str
-    hardware: str
 
 
 @dataclass(frozen=True)
@@ -82,12 +81,6 @@ class IntegrationSuite:
 class ScopeSelection:
     image: str
     test_areas: tuple[str, ...] | None
-
-    def selects_pytest(self, suite: str) -> bool:
-        return area_selected(self.test_areas, f"pytest/{suite}")
-
-    def selects_integration(self, suite: str, case_id: str) -> bool:
-        return area_selected(self.test_areas, f"integration/{suite}/{case_id}")
 
 
 def area_selected(test_areas: tuple[str, ...] | None, area_id: str) -> bool:
@@ -209,15 +202,6 @@ def _map(value: Any, path: str, issues: list[Diagnostic]) -> dict[str, Any]:
     return value
 
 
-def _row(
-    value: Any, path: str, allowed: set[str], issues: list[Diagnostic]
-) -> dict[str, Any]:
-    row = _map(value, path, issues)
-    for key in sorted(set(row) - allowed):
-        issues.append(_issue(f"{path}.{key}", "unknown field"))
-    return row
-
-
 def _strings(value: Any, path: str, issues: list[Diagnostic]) -> tuple[str, ...]:
     if value is None:
         return ()
@@ -246,20 +230,71 @@ def _timeouts(value: Any, path: str, issues: list[Diagnostic]) -> dict[str, int]
     return result
 
 
+def _timeout_defaults(
+    value: Any, path: str, issues: list[Diagnostic]
+) -> tuple[dict[str, int], dict[str, int]]:
+    defaults = _map(value, path, issues)
+    return (
+        _timeouts(
+            defaults.get("job_timeout_minutes"),
+            f"{path}.job_timeout_minutes",
+            issues,
+        ),
+        _timeouts(
+            defaults.get("step_timeout_minutes"),
+            f"{path}.step_timeout_minutes",
+            issues,
+        ),
+    )
+
+
+def _venv_map(
+    value: Any, path: str, venvs: dict[str, VenvSpec], issues: list[Diagnostic]
+) -> dict[str, str]:
+    mapping = _map(value, path, issues)
+    for name, venv in mapping.items():
+        if str(venv) not in venvs:
+            issues.append(_issue(f"{path}.{name}", f"unknown venv {venv!r}"))
+    return {name: str(venv) for name, venv in mapping.items()}
+
+
+def _optional_int(
+    value: Any, path: str, issues: list[Diagnostic]
+) -> int | None:
+    return _int(value, path, issues, 1) if value is not None else None
+
+
+def _integration_overrides(
+    value: Any, path: str, issues: list[Diagnostic]
+) -> dict[str, IntegrationOverride]:
+    overrides: dict[str, IntegrationOverride] = {}
+    for case_id, item in _map(value, path, issues).items():
+        where = f"{path}.{case_id}"
+        override = _map(item, where, issues)
+        overrides[case_id] = IntegrationOverride(
+            job_timeout_minutes=_optional_int(
+                override.get("job_timeout_minutes"),
+                f"{where}.job_timeout_minutes",
+                issues,
+            ),
+            step_timeout_minutes=_optional_int(
+                override.get("step_timeout_minutes"),
+                f"{where}.step_timeout_minutes",
+                issues,
+            ),
+        )
+    return overrides
+
+
 def _load_targets(raw: Any, issues: list[Diagnostic]) -> dict[str, CiTarget]:
     targets: dict[str, CiTarget] = {}
     for name, value in _map(raw, "resources.targets", issues).items():
         path = f"resources.targets.{name}"
-        row = _row(value, path, {"device", "hardware"}, issues)
+        row = _map(value, path, issues)
         device = str(row.get("device") or "")
-        hardware = str(row.get("hardware") or "")
         if device not in DEVICES:
             issues.append(_issue(f"{path}.device", "unknown device"))
-        if device != "cpu" and not hardware:
-            issues.append(_issue(f"{path}.hardware", "required for accelerator targets"))
-        targets[name] = CiTarget(name, device, hardware)
-    if not targets:
-        issues.append(_issue("resources.targets", "at least one target is required"))
+        targets[name] = CiTarget(name, device)
     return targets
 
 
@@ -288,59 +323,28 @@ def bind_image_refs(config: CiConfig, refs: dict[str, str]) -> CiConfig:
 def _load_venvs(
     raw: Any, root: Path, issues: list[Diagnostic]
 ) -> dict[str, VenvSpec]:
-    local: dict[str, VenvSpec] = {}
+    venvs: dict[str, VenvSpec] = {}
     for name, value in _map(raw, "resources.venvs", issues).items():
         path = f"resources.venvs.{name}"
-        row = _row(
-            value,
-            path,
-            {"python", "requirements", "overrides", "extends"},
-            issues,
-        )
+        row = _map(value, path, issues)
         requirements = _strings(row.get("requirements"), f"{path}.requirements", issues)
         overrides = _strings(row.get("overrides"), f"{path}.overrides", issues)
-        for relative in (*requirements, *overrides):
+        for relative in requirements:
             if not (root / relative).is_file():
                 issues.append(_issue(path, f"missing file {relative!r}"))
-        local[name] = VenvSpec(
+        python = str(row.get("python") or "")
+        if not python:
+            issues.append(_issue(f"{path}.python", "python version is required"))
+        venvs[name] = VenvSpec(
             name=name,
-            python=str(row.get("python") or ""),
+            python=python,
             requirements=requirements,
             overrides=overrides,
-            extends=str(row.get("extends") or "") or None,
+            extends=None,
         )
-        if not local[name].python:
-            issues.append(_issue(f"{path}.python", "python version is required"))
-    if "default" not in local:
+    if "default" not in venvs:
         issues.append(_issue("resources.venvs", "default venv is required"))
-    for venv in local.values():
-        if venv.extends and venv.extends not in local:
-            issues.append(_issue(f"resources.venvs.{venv.name}.extends", "unknown venv"))
-
-    resolved: dict[str, VenvSpec] = {}
-    resolving: set[str] = set()
-
-    def resolve(name: str) -> VenvSpec:
-        if name in resolved:
-            return resolved[name]
-        if name in resolving:
-            issues.append(_issue(f"resources.venvs.{name}.extends", "environment cycle"))
-            return local[name]
-        resolving.add(name)
-        spec = local[name]
-        base = resolve(spec.extends) if spec.extends in local else None
-        result = spec if base is None else replace(
-            spec,
-            requirements=tuple(dict.fromkeys((*base.requirements, *spec.requirements))),
-            overrides=tuple(dict.fromkeys((*base.overrides, *spec.overrides))),
-        )
-        resolving.remove(name)
-        resolved[name] = result
-        return result
-
-    for name in local:
-        resolve(name)
-    return resolved
+    return venvs
 
 
 def _load_runners(
@@ -350,26 +354,18 @@ def _load_runners(
         issues.append(_issue("resources.runners", "must be a list"))
         return ()
     runners: list[CiRunner] = []
-    seen: set[tuple[str, int]] = set()
     for index, value in enumerate(raw):
         path = f"resources.runners[{index}]"
-        row = _row(
-            value, path, {"target", "rank_capacity", "runs_on", "container_options"}, issues
-        )
+        row = _map(value, path, issues)
         target = str(row.get("target") or "")
         capacity = _int(row.get("rank_capacity"), f"{path}.rank_capacity", issues, 1)
-        runs_on = _row(
-            row.get("runs_on"), f"{path}.runs_on", {"variable", "fallback"}, issues
-        )
+        runs_on = _map(row.get("runs_on"), f"{path}.runs_on", issues)
         variable = str(runs_on.get("variable") or "")
         fallback = str(runs_on.get("fallback") or "")
         if target not in targets:
             issues.append(_issue(f"{path}.target", "unknown target"))
         if not variable or not fallback:
             issues.append(_issue(f"{path}.runs_on", "variable and fallback are required"))
-        if (target, capacity) in seen:
-            issues.append(_issue(path, "duplicate target and rank_capacity"))
-        seen.add((target, capacity))
         runners.append(CiRunner(
             target,
             capacity,
@@ -377,43 +373,33 @@ def _load_runners(
             fallback,
             str(row.get("container_options") or "--user root"),
         ))
-    if not runners:
-        issues.append(_issue("resources.runners", "at least one runner is required"))
-    for target in targets:
-        if not any(runner.target == target for runner in runners):
-            issues.append(_issue("resources.runners", f"target {target} has no runner"))
     return tuple(sorted(runners, key=lambda item: (item.target, item.rank_capacity)))
 
 
 def _load_pytest(
     raw: Any, venvs: dict[str, VenvSpec], root: Path, issues: list[Diagnostic]
 ) -> PytestAreas:
-    row = _row(
-        raw,
-        "test_areas.pytest",
-        {"defaults", "model_venvs", "framework_venvs", "combo_venvs", "overrides"},
-        issues,
-    )
-    defaults = _row(
+    row = _map(raw, "test_areas.pytest", issues)
+    job_timeout_minutes, step_timeout_minutes = _timeout_defaults(
         row.get("defaults"),
         "test_areas.pytest.defaults",
-        {"job_timeout_minutes", "step_timeout_minutes"},
         issues,
     )
-    model = _map(row.get("model_venvs"), "test_areas.pytest.model_venvs", issues)
-    framework = _map(
-        row.get("framework_venvs"), "test_areas.pytest.framework_venvs", issues
+    model_venvs = _venv_map(
+        row.get("model_venvs"), "test_areas.pytest.model_venvs", venvs, issues
     )
-    combo = _map(row.get("combo_venvs"), "test_areas.pytest.combo_venvs", issues)
-    for key, value in (*model.items(), *framework.items(), *combo.items()):
-        if str(value) not in venvs:
-            issues.append(_issue(f"test_areas.pytest.{key}", f"unknown venv {value!r}"))
+    framework_venvs = _venv_map(
+        row.get("framework_venvs"), "test_areas.pytest.framework_venvs", venvs, issues
+    )
+    combo_venvs = _venv_map(
+        row.get("combo_venvs"), "test_areas.pytest.combo_venvs", venvs, issues
+    )
     overrides: dict[str, str] = {}
     for path, value in _map(
         row.get("overrides"), "test_areas.pytest.overrides", issues
     ).items():
         where = f"test_areas.pytest.overrides.{path}"
-        override = _row(value, where, {"venv"}, issues)
+        override = _map(value, where, issues)
         venv = str(override.get("venv") or "")
         if venv not in venvs:
             issues.append(_issue(f"{where}.venv", "unknown venv"))
@@ -421,19 +407,11 @@ def _load_pytest(
             issues.append(_issue(where, "test file is missing"))
         overrides[path] = venv
     return PytestAreas(
-        job_timeout_minutes=_timeouts(
-            defaults.get("job_timeout_minutes"),
-            "test_areas.pytest.defaults.job_timeout_minutes",
-            issues,
-        ),
-        step_timeout_minutes=_timeouts(
-            defaults.get("step_timeout_minutes"),
-            "test_areas.pytest.defaults.step_timeout_minutes",
-            issues,
-        ),
-        model_venvs={key: str(value) for key, value in model.items()},
-        framework_venvs={key: str(value) for key, value in framework.items()},
-        combo_venvs={key: str(value) for key, value in combo.items()},
+        job_timeout_minutes=job_timeout_minutes,
+        step_timeout_minutes=step_timeout_minutes,
+        model_venvs=model_venvs,
+        framework_venvs=framework_venvs,
+        combo_venvs=combo_venvs,
         overrides=overrides,
     )
 
@@ -441,58 +419,32 @@ def _load_pytest(
 def _load_integration(
     raw: Any, venvs: dict[str, VenvSpec], issues: list[Diagnostic]
 ) -> dict[str, IntegrationSuite]:
-    row = _row(raw, "test_areas.integration", {"suites"}, issues)
+    row = _map(raw, "test_areas.integration", issues)
     suites: dict[str, IntegrationSuite] = {}
     for name, value in _map(
         row.get("suites"), "test_areas.integration.suites", issues
     ).items():
         path = f"test_areas.integration.suites.{name}"
-        suite = _row(
-            value, path, {"defaults", "framework_venvs", "overrides"}, issues
-        )
-        defaults = _row(
+        suite = _map(value, path, issues)
+        job_timeout_minutes, step_timeout_minutes = _timeout_defaults(
             suite.get("defaults"),
             f"{path}.defaults",
-            {"job_timeout_minutes", "step_timeout_minutes"},
             issues,
         )
-        frameworks = _map(
-            suite.get("framework_venvs"), f"{path}.framework_venvs", issues
+        framework_venvs = _venv_map(
+            suite.get("framework_venvs"),
+            f"{path}.framework_venvs",
+            venvs,
+            issues,
         )
-        for framework, venv in frameworks.items():
-            if str(venv) not in venvs:
-                issues.append(_issue(
-                    f"{path}.framework_venvs.{framework}", f"unknown venv {venv!r}"
-                ))
-        overrides: dict[str, IntegrationOverride] = {}
-        for case_id, item in _map(
+        overrides = _integration_overrides(
             suite.get("overrides"), f"{path}.overrides", issues
-        ).items():
-            where = f"{path}.overrides.{case_id}"
-            override = _row(
-                item, where, {"job_timeout_minutes", "step_timeout_minutes"}, issues
-            )
-            job = override.get("job_timeout_minutes")
-            step = override.get("step_timeout_minutes")
-            overrides[case_id] = IntegrationOverride(
-                job_timeout_minutes=(
-                    _int(job, f"{where}.job_timeout_minutes", issues, 1)
-                    if job is not None else None
-                ),
-                step_timeout_minutes=(
-                    _int(step, f"{where}.step_timeout_minutes", issues, 1)
-                    if step is not None else None
-                ),
-            )
+        )
         suites[name] = IntegrationSuite(
             name=name,
-            job_timeout_minutes=_timeouts(
-                defaults.get("job_timeout_minutes"), f"{path}.defaults.job_timeout_minutes", issues
-            ),
-            step_timeout_minutes=_timeouts(
-                defaults.get("step_timeout_minutes"), f"{path}.defaults.step_timeout_minutes", issues
-            ),
-            framework_venvs={key: str(venv) for key, venv in frameworks.items()},
+            job_timeout_minutes=job_timeout_minutes,
+            step_timeout_minutes=step_timeout_minutes,
+            framework_venvs=framework_venvs,
             overrides=overrides,
         )
     return suites
@@ -510,8 +462,6 @@ def _test_areas(
     if not values:
         issues.append(_issue(path, "must not be empty"))
         return ()
-    if len(set(values)) != len(values):
-        issues.append(_issue(path, "contains duplicate TestAreas"))
     for value in values:
         if value.startswith("pytest/"):
             if value.removeprefix("pytest/") not in SUITES:
@@ -543,9 +493,9 @@ def _load_scopes(
         seen: set[str] = set()
         for index, item in enumerate(value):
             where = f"{path}[{index}]"
-            selection = _row(item, where, {"environment", "test_areas"}, issues)
-            environment = _row(
-                selection.get("environment"), f"{where}.environment", {"image"}, issues
+            selection = _map(item, where, issues)
+            environment = _map(
+                selection.get("environment"), f"{where}.environment", issues
             )
             image = str(environment.get("image") or "")
             if image not in images:
@@ -572,15 +522,8 @@ def load_config(root: Path) -> CiConfig:
         document = yaml.safe_load(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise CiConfigError([_issue(CONFIG_PATH.as_posix(), str(exc))]) from exc
-    document = _row(
-        document, "ci", {"resources", "test_areas", "scopes"}, issues
-    )
-    resources = _row(
-        document.get("resources"),
-        "resources",
-        {"targets", "images", "runners", "venvs"},
-        issues,
-    )
+    document = _map(document, "ci", issues)
+    resources = _map(document.get("resources"), "resources", issues)
     targets = _load_targets(resources.get("targets"), issues)
     try:
         images = load_runtime_images(root)
@@ -589,9 +532,7 @@ def load_config(root: Path) -> CiConfig:
         images = {}
     venvs = _load_venvs(resources.get("venvs"), root, issues)
     runners = _load_runners(resources.get("runners"), targets, issues)
-    test_areas = _row(
-        document.get("test_areas"), "test_areas", {"pytest", "integration"}, issues
-    )
+    test_areas = _map(document.get("test_areas"), "test_areas", issues)
     pytest_areas = _load_pytest(test_areas.get("pytest"), venvs, root, issues)
     integration_suites = _load_integration(
         test_areas.get("integration"), venvs, issues

@@ -14,8 +14,8 @@ def _write_two_image_repo(root: Path) -> Path:
     document = {
         "resources": {
             "targets": {
-                "npu-a3": {"device": "npu", "hardware": "a3"},
-                "npu-a5": {"device": "npu", "hardware": "a5"},
+                "npu-a3": {"device": "npu"},
+                "npu-a5": {"device": "npu"},
             },
             "images": {
                 "npu-a3-cann90": {

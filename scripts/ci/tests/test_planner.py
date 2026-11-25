@@ -321,7 +321,7 @@ def _add_target(
 def test_a5_extends_target_image_runner_and_scope(
     config: CiConfig, facts: TestFacts, source
 ) -> None:
-    target = CiTarget(name="npu-a5", device="npu", hardware="a5")
+    target = CiTarget(name="npu-a5", device="npu")
     image = RuntimeImage(
         image_id="npu-a5-cann90",
         target=target.name,
@@ -382,7 +382,7 @@ def test_a5_extends_target_image_runner_and_scope(
 def test_gpu_target_routes_to_the_container_matrix(
     config: CiConfig, facts: TestFacts, source
 ) -> None:
-    target = CiTarget(name="gpu-h100", device="gpu", hardware="h100")
+    target = CiTarget(name="gpu-h100", device="gpu")
     image = RuntimeImage(
         image_id="gpu-h100-default",
         target=target.name,

@@ -1,8 +1,8 @@
 -r common.txt
 # Keep training dependency pins aligned with scripts/runs/deps/swift_deps.sh.
 # ms-swift 4.4.2 metadata excludes datasets 5.x; the training script installs
-# ms-swift first and datasets==5.0.1 afterwards. The override file preserves
-# that order instead of asking pip to resolve both pins in one transaction.
+# ms-swift first and datasets==5.0.1 afterwards. ci.yml preserves that order
+# through a post-install override instead of resolving both pins together.
 transformers==5.9.0
 safetensors==0.7.0
 deepspeed==0.16.0
