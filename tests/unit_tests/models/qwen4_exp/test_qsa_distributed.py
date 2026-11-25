@@ -272,10 +272,10 @@ def _check_native_qsa_varlen(
     reason="opt-in native NPU varlen attention with HCCL sequence parallelism",
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_native_varlen_ratio12_packed_sp2(tmp_path, dtype) -> None:
+def test_native_varlen_ratio12_packed_sp2(tmp_path, dtype, request) -> None:
     from tests.support.npu import require_npus
 
-    require_npus(2)
+    require_npus(2, request)
     mp.spawn(
         _run_native_qsa_varlen,
         args=(str(tmp_path / "qsa-native-sp"), dtype),

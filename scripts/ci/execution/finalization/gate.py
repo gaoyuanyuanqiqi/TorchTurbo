@@ -123,6 +123,11 @@ def _passed_failures(
                 continue
             if evidence.tests_total == 0:
                 add("pytest-no-tests", "pytest collected no tests", task.id)
+            if (
+                evidence.tests_total > 0
+                and evidence.tests_skipped == evidence.tests_total
+            ):
+                add("pytest-all-skipped", "pytest skipped all collected tests", task.id)
             if evidence.tests_failed or evidence.tests_errors:
                 add("pytest-failures", "pytest evidence contains failures or errors", task.id)
     elif job.kind == "integration" and not result.artifact_paths.get("integration"):

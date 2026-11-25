@@ -76,6 +76,12 @@ test_areas:
     overrides:
       tests/unit_tests/models/bailing_moe_v3_vl/test_lf_image_parity.py:
         venv: lf
+      tests/unit_tests/models/bailing_moe_v3_vl/test_lf_integration.py:
+        venv: lf
+      tests/unit_tests/models/bailing_moe_v3_vl/test_lf_text_parity.py:
+        venv: lf
+      tests/unit_tests/models/bailing_moe_v3_vl/test_swift_integration.py:
+        venv: swift
 
   integration:
     suites:

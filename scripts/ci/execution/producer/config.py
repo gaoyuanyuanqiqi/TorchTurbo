@@ -9,8 +9,8 @@ from typing import Any, Iterable
 
 import yaml
 
-from ...contracts.base import Diagnostic, DiagnosticError
-from ...contracts.planner_contract import DEVICES, SUITES, VenvSpec
+from ...contracts.base import DEVICES, SUITES, Diagnostic, DiagnosticError
+from ...contracts.planner_contract import VenvSpec
 from ...image.image_config import ImageError, RuntimeImage, load_runtime_images
 
 CONFIG_PATH = Path("scripts/ci/config/ci.yml")

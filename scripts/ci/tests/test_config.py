@@ -238,9 +238,9 @@ def test_facts_snapshot(facts: TestFacts) -> None:
     assert Counter(fact.suite for fact in facts.pytest) | Counter(
         {"total": len(facts.pytest), "integration": len(facts.integration)}
     ) == {
-        "core": 86,
-        "model": 60,
-        "adapter": 16,
+        "core": 94,
+        "model": 56,
+        "adapter": 12,
         "total": 162,
         "integration": 3,
     }
@@ -261,4 +261,9 @@ def test_model_venv_distribution(config: CiConfig, facts: TestFacts) -> None:
         )
         assert not issues
         distribution[venv] += 1
-    assert distribution == {"default": 42, "qwen4_exp": 18}
+    assert distribution == {
+        "default": 36,
+        "qwen4_exp": 16,
+        "lf": 3,
+        "swift": 1,
+    }

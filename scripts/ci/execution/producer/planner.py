@@ -9,11 +9,16 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Iterable
 
-from ...contracts.base import Diagnostic, DiagnosticError, GitSource, SCHEMA_VERSION
+from ...contracts.base import (
+    SUITES,
+    Diagnostic,
+    DiagnosticError,
+    GitSource,
+    SCHEMA_VERSION,
+)
 from ...contracts.image_contract import ResolvedImage
 from ...contracts.planner_contract import (
     CHANGE_MODES,
-    SUITES,
     ExecutionPlan,
     IntegrationSpec,
     Job,
@@ -32,7 +37,7 @@ from .config import (
     Scope,
     area_selected,
 )
-from .facts import IntegrationFact, PytestFact, TestFacts
+from .facts import IntegrationFact, PytestFact, TestFacts, test_parts
 
 
 class PlanError(DiagnosticError):
@@ -68,7 +73,23 @@ def slugify(value: str) -> str:
 
 
 def _marker(device: str) -> str:
-    return "cpu" if device == "cpu" else f"{device} or multi_{device}"
+    if device == "cpu":
+        return "cpu or (not npu and not multi_npu and not gpu and not multi_gpu)"
+    return f"{device} or multi_{device}"
+
+
+def _marker_label(device: str) -> str:
+    return "cpu" if device == "cpu" else f"{device}-or-multi-{device}"
+
+
+def _task_group(fact: PytestFact) -> str:
+    if fact.model_families:
+        return f"family:{fact.model_families[0]}"
+
+    parts = test_parts(fact.path)
+    if parts[:1] == ("models",) and len(parts) == 2:
+        return "layer:tests/models"
+    return f"layer:{'/'.join(Path(fact.path).parts[:-1])}"
 
 
 def _claim_job_id(base: str, seen: set[str], suffix: str) -> str:
@@ -237,10 +258,15 @@ def _pytest_jobs(
         )
         tasks_by_key: dict[tuple[str, str], list[PytestFact]] = {}
         for entry in group.entries:
-            tasks_by_key.setdefault((entry.process_group, _marker(group.device)), []).append(entry)
+            tasks_by_key.setdefault(
+                (_task_group(entry), _marker(group.device)), []
+            ).append(entry)
         tasks = [
             TestTask(
-                id=f"{job_id}/{slugify(process_group)}-{slugify(marker)}",
+                id=(
+                    f"{job_id}/{slugify(task_group)}-"
+                    f"{slugify(_marker_label(group.device))}"
+                ),
                 timeout_minutes=step_timeout,
                 spec=PytestSpec(
                     suite=group.suite,
@@ -248,7 +274,7 @@ def _pytest_jobs(
                     device_marker=marker,
                 ),
             )
-            for (process_group, marker), entries in sorted(tasks_by_key.items())
+            for (task_group, marker), entries in sorted(tasks_by_key.items())
         ]
         jobs.append(Job(
             id=job_id,

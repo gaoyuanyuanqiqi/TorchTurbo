@@ -442,6 +442,103 @@ def check_config() -> list[Problem]:
     return []
 
 
+NPU_MARKERS = frozenset({"npu", "multi_npu"})
+
+
+def _marker_names(node: ast.AST) -> set[str]:
+    values = node.elts if isinstance(node, (ast.List, ast.Tuple, ast.Set)) else [node]
+    names: set[str] = set()
+    for value in values:
+        if isinstance(value, ast.Call):
+            value = value.func
+        if isinstance(value, ast.Attribute):
+            names.add(value.attr)
+    return names
+
+
+def _module_markers(tree: ast.Module) -> set[str]:
+    names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets, value = [node.target], node.value
+        else:
+            continue
+        if value is not None and any(
+            isinstance(target, ast.Name) and target.id == "pytestmark"
+            for target in targets
+        ):
+            names |= _marker_names(value)
+    return names
+
+
+def _module_scope_nodes(node: ast.AST) -> Iterable[ast.AST]:
+    yield node
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return
+    for child in ast.iter_child_nodes(node):
+        yield from _module_scope_nodes(child)
+
+
+def _npu_signal_line(tree: ast.Module) -> int:
+    for top in tree.body:
+        for node in _module_scope_nodes(top):
+            if isinstance(node, ast.Import) and any(
+                alias.name == "torch_npu" for alias in node.names
+            ):
+                return node.lineno
+            if (
+                isinstance(node, ast.ImportFrom)
+                and node.module
+                and node.module.startswith("torch_npu")
+            ):
+                return node.lineno
+            if isinstance(node, ast.Call):
+                func = node.func
+                name = func.attr if isinstance(func, ast.Attribute) else (
+                    func.id if isinstance(func, ast.Name) else ""
+                )
+                if name in {"require_npu", "require_npus"}:
+                    return node.lineno
+                if (
+                    name == "importorskip"
+                    and node.args
+                    and isinstance(node.args[0], ast.Constant)
+                    and node.args[0].value == "torch_npu"
+                ):
+                    return node.lineno
+            if (
+                isinstance(node, ast.Attribute)
+                and node.attr == "npu"
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "torch"
+            ):
+                return node.lineno
+    return 0
+
+
+def check_device_markers(root: Path = ROOT) -> list[Problem]:
+    """Require NPU modules with module-level signals to declare a device marker."""
+    problems: list[Problem] = []
+    for path in sorted((root / "tests" / "unit_tests").rglob("test_*.py")):
+        try:
+            tree = ast.parse(text(path))
+        except SyntaxError:
+            continue
+        markers = _module_markers(tree)
+        if markers & NPU_MARKERS or "cpu" in markers:
+            continue
+        line = _npu_signal_line(tree)
+        if line:
+            problems.append(Problem(
+                path.relative_to(root).as_posix(),
+                "NPU-specific module requires pytestmark = pytest.mark.npu",
+                line,
+            ))
+    return problems
+
+
 def _test_marker_names() -> set[str]:
     """Collect custom pytest markers used under tests/."""
     names: set[str] = set()
@@ -499,6 +596,7 @@ CHECKS = (
     Check("contract", "planner/lint/lane topology and output contracts", check_contract),
     Check("config", "CI config, pytest facts, and integration manifest contract", check_config),
     Check("markers", "registered pytest marker contract", check_markers),
+    Check("device-markers", "NPU modules declare a device marker", check_device_markers),
 )
 CHECK_BY_NAME = {check.name: check for check in CHECKS}
 

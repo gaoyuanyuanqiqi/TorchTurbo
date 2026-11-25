@@ -6,12 +6,17 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..tools.json_io import JsonDecodeError, content_digest, decode, read_json
-from .base import Contract, ContractError, Diagnostic, GitSource, SCHEMA_VERSION
+from .base import (
+    DEVICES,
+    Contract,
+    ContractError,
+    Diagnostic,
+    GitSource,
+    SCHEMA_VERSION,
+)
 from .image_contract import ResolvedImage
 
-SUITES = ("core", "model", "adapter")
 JOB_KINDS = ("pytest", "integration")
-DEVICES = ("cpu", "npu", "gpu")
 PLANNER_OUTPUT_STATUSES = ("ready", "failed")
 CHANGE_MODES = ("code", "docs_only", "image_only", "mixed")
 

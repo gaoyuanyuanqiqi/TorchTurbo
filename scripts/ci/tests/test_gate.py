@@ -80,8 +80,8 @@ def _plan_with_allowed_skip(plan, job_id: str, reason: str):
 def test_all_jobs_pass(pr_plan) -> None:
     decision = decide_plan(pr_plan, _results(pr_plan))
     assert decision.status == "passed"
-    assert decision.summary["expected_jobs"] == 7
-    assert decision.summary["passed"] == 7
+    assert decision.summary["expected_jobs"] == 6
+    assert decision.summary["passed"] == 6
     assert decision.failures == ()
 
 
@@ -207,6 +207,28 @@ def test_pytest_without_tests_fails(pr_plan) -> None:
     )
     decision = decide_plan(pr_plan, results)
     assert "pytest-no-tests" in {failure["code"] for failure in decision.failures}
+
+
+def test_pytest_all_skipped_fails(pr_plan) -> None:
+    results = _results(pr_plan)
+    index = next(i for i, result in enumerate(results) if result.kind == "pytest")
+    tasks = tuple(
+        replace(
+            task,
+            evidence=replace(
+                task.evidence,
+                tests_total=2,
+                tests_skipped=2,
+            )
+            if task.evidence is not None else None,
+        )
+        for task in results[index].tasks
+    )
+    results[index] = replace(results[index], tasks=tasks)
+
+    decision = decide_plan(pr_plan, results)
+
+    assert "pytest-all-skipped" in {failure["code"] for failure in decision.failures}
 
 
 def test_pytest_failures_fail(pr_plan) -> None:

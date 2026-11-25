@@ -13,7 +13,15 @@ from scripts.ci.execution.producer.facts import (
 
 
 def _scan(tmp_path: Path, source: str):
-    path = tmp_path / "tests" / "unit_tests" / "ops" / "test_example.py"
+    return _scan_path(
+        tmp_path,
+        "tests/unit_tests/ops/test_example.py",
+        source,
+    )
+
+
+def _scan_path(tmp_path: Path, relative: str, source: str):
+    path = tmp_path / relative
     path.parent.mkdir(parents=True)
     path.write_text(source, encoding="utf-8")
     facts, errors = _pytest_facts(tmp_path)
@@ -78,6 +86,83 @@ def test_parametrized_world_size_sets_rank(tmp_path: Path) -> None:
     assert errors == []
     assert fact.devices == ("cpu",)
     assert fact.ranks_by_device == {"cpu": 4}
+
+
+def test_mixed_marked_and_unmarked_tests(tmp_path: Path) -> None:
+    fact, errors = _scan(
+        tmp_path,
+        "import pytest\n\n"
+        "def test_cpu():\n    pass\n\n"
+        "@pytest.mark.multi_npu\n"
+        "def test_npu():\n    pass\n",
+    )
+
+    assert errors == []
+    assert fact.devices == ("cpu", "npu")
+    assert fact.ranks_by_device == {"cpu": 1, "npu": 2}
+
+
+def test_model_path_sets_suite_and_family_without_import(tmp_path: Path) -> None:
+    fact, errors = _scan_path(
+        tmp_path,
+        "tests/unit_tests/models/qwen3_5/test_example.py",
+        "def test_plain():\n    pass\n",
+    )
+
+    assert errors == []
+    assert fact.suite == "model"
+    assert fact.model_families == ("qwen3_5",)
+
+
+def test_engine_model_import_does_not_set_family(tmp_path: Path) -> None:
+    fact, errors = _scan_path(
+        tmp_path,
+        "tests/unit_tests/engine/test_example.py",
+        "from torchturbo.models.qwen3_5 import model\n\n"
+        "def test_plain():\n    pass\n",
+    )
+
+    assert errors == []
+    assert fact.suite == "core"
+    assert fact.model_families == ()
+
+
+def test_adapter_path_sets_framework_without_import(tmp_path: Path) -> None:
+    swift, errors = _scan_path(
+        tmp_path,
+        "tests/unit_tests/adapters/msswift/test_example.py",
+        "def test_plain():\n    pass\n",
+    )
+
+    assert errors == []
+    assert swift.suite == "adapter"
+    assert swift.frameworks == ("swift",)
+
+
+def test_adapter_path_takes_precedence_over_import(tmp_path: Path) -> None:
+    fact, errors = _scan_path(
+        tmp_path,
+        "tests/unit_tests/adapters/msswift/test_example.py",
+        "import llamafactory\n\n"
+        "def test_plain():\n    pass\n",
+    )
+
+    assert errors == []
+    assert fact.suite == "adapter"
+    assert fact.frameworks == ("swift",)
+
+
+def test_model_import_does_not_set_framework(tmp_path: Path) -> None:
+    fact, errors = _scan_path(
+        tmp_path,
+        "tests/unit_tests/models/qwen3_5/test_example.py",
+        "from llamafactory.data import loader\n\n"
+        "def test_plain():\n    pass\n",
+    )
+
+    assert errors == []
+    assert fact.suite == "model"
+    assert fact.frameworks == ()
 
 
 def test_integration_target_must_be_non_empty_string(config: CiConfig) -> None:

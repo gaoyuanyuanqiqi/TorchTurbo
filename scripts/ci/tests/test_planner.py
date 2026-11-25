@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
@@ -26,6 +28,8 @@ from scripts.ci.execution.producer.config import (
 from scripts.ci.execution.producer.facts import TestFacts
 from scripts.ci.execution.producer.planner import (
     PlanError,
+    _marker,
+    _task_group,
     build_plan,
     planner_output_for,
     requested_images,
@@ -40,6 +44,60 @@ REF = f"registry.example/team/image@{DIGEST}"
 
 def _with_plan_id(plan: ExecutionPlan) -> ExecutionPlan:
     return replace(plan, plan_id=plan_digest(plan))
+
+
+def test_cpu_marker_includes_unmarked_tests() -> None:
+    assert _marker("cpu") == (
+        "cpu or (not npu and not multi_npu and not gpu and not multi_gpu)"
+    )
+    assert _marker("npu") == "npu or multi_npu"
+
+
+def test_cpu_marker_selects_unmarked_tests(tmp_path: Path) -> None:
+    probe = tmp_path / "test_marker_probe.py"
+    probe.write_text(
+        "import pytest\n\n"
+        "def test_unmarked():\n    pass\n\n"
+        "@pytest.mark.cpu\n"
+        "def test_cpu():\n    pass\n\n"
+        "@pytest.mark.npu\n"
+        "def test_npu():\n    pass\n\n"
+        "@pytest.mark.multi_npu\n"
+        "def test_multi_npu():\n    pass\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "-m",
+            _marker("cpu"),
+            str(probe),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "2 passed, 2 deselected" in result.stdout
+
+
+def test_task_group_is_derived_from_fact(facts: TestFacts) -> None:
+    by_path = {fact.path: fact for fact in facts.pytest}
+    assert _task_group(
+        by_path["tests/unit_tests/engine/test_core.py"]
+    ) == "layer:tests/unit_tests/engine"
+    assert _task_group(
+        by_path["tests/unit_tests/engine/test_engine_config_loading.py"]
+    ) == "layer:tests/unit_tests/engine"
+    assert _task_group(
+        by_path["tests/unit_tests/models/qwen3_5/test_mtp.py"]
+    ) == "family:qwen3_5"
 
 
 def _assert_matches(
@@ -62,7 +120,7 @@ def test_pull_request_scope(
     config: CiConfig, facts: TestFacts, pr_plan: ExecutionPlan
 ) -> None:
     assert Counter(job.kind for job in pr_plan.jobs) == {
-        "pytest": 5,
+        "pytest": 4,
         "integration": 2,
     }
     assert pr_plan.ci_type == "pull_request"
@@ -72,7 +130,6 @@ def test_pull_request_scope(
         "integration-base-suite-qwen3-5-moe-sft-2cpu",
         "integration-base-suite-qwen3-5-moe-sft-2npu",
         "pytest-adapter-cpu-cpu-default-lf",
-        "pytest-adapter-cpu-cpu-default-qwen4-exp-swift",
         "pytest-adapter-cpu-cpu-default-swift",
         "pytest-core-cpu-cpu-default-default",
         "pytest-core-npu-npu-a3-cann90-default",
@@ -121,7 +178,7 @@ def test_nightly_scope(
     config: CiConfig, facts: TestFacts, nightly_plan: ExecutionPlan
 ) -> None:
     assert Counter(job.kind for job in nightly_plan.jobs) == {
-        "pytest": 9,
+        "pytest": 10,
         "integration": 3,
     }
     pytest_suites = {
@@ -164,14 +221,12 @@ def test_cpu_target_slice_runs_pr_cpu_jobs(
     assert [job.id for job in plan.jobs] == [
         "integration-base-suite-qwen3-5-moe-sft-2cpu",
         "pytest-adapter-cpu-cpu-default-lf",
-        "pytest-adapter-cpu-cpu-default-qwen4-exp-swift",
         "pytest-adapter-cpu-cpu-default-swift",
         "pytest-core-cpu-cpu-default-default",
     ]
     assert [item["display_name"] for item in matrix_outputs(plan, config)["cpu_jobs"]] == [
         "integration-base-suite-qwen3-5-moe-sft-2cpu",
         "pytest-adapter-cpu-lf",
-        "pytest-adapter-cpu-qwen4-exp-swift",
         "pytest-adapter-cpu-swift",
         "pytest-core-cpu-default",
     ]

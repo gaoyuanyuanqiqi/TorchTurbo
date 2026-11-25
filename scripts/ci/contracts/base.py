@@ -6,6 +6,8 @@ from dataclasses import asdict, dataclass
 from typing import Any, Iterable
 
 SCHEMA_VERSION = 21
+DEVICES = ("cpu", "npu", "gpu")
+SUITES = ("core", "model", "adapter")
 
 
 class ContractError(ValueError):
