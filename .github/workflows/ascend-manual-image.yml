@@ -1,0 +1,64 @@
+name: Ascend-Manual-Image
+run-name: Ascend-Manual-Image ${{ inputs.image_id }} ${{ github.ref_name }}
+
+# Manual image build/reuse entry. Candidate testing is optional; alias
+# promotion remains a separate trusted workflow in ascend-image-promote.yml.
+on:
+  workflow_dispatch:
+    inputs:
+      image_id:
+        description: 'Logical image ID'
+        required: true
+        default: 'npu-a3-cann90'
+        type: string
+      target:
+        description: 'Target slice used by tests; required when run_tests is true'
+        required: false
+        default: ''
+        type: string
+      checkout_ref:
+        description: 'Git ref to build; empty uses the dispatched SHA'
+        required: false
+        default: ''
+        type: string
+      max_jobs:
+        description: 'MAX_JOBS passed to the image builder'
+        required: false
+        default: 'auto'
+        type: string
+      use_cache:
+        description: 'Use the GitHub Actions build cache'
+        required: false
+        default: true
+        type: boolean
+      runner:
+        description: 'Optional build runner label; empty uses CI_IMAGE_RUNNER'
+        required: false
+        default: ''
+        type: string
+      run_tests:
+        description: 'Run candidate tests after building or reusing the image'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: read
+
+jobs:
+  image:
+    name: Manual image (${{ inputs.image_id }})
+    uses: ./.github/workflows/ascend-image-pipeline.yml
+    with:
+      image_id: ${{ inputs.image_id }}
+      target: ${{ inputs.target }}
+      checkout_ref: ${{ inputs.checkout_ref }}
+      max_jobs: ${{ inputs.max_jobs }}
+      use_cache: ${{ inputs.use_cache }}
+      runner: ${{ inputs.runner }}
+      run_tests: ${{ inputs.run_tests }}
+    secrets:
+      SWR_USERNAME: ${{ secrets.SWR_USERNAME }}
+      SWR_PASSWORD: ${{ secrets.SWR_PASSWORD }}

@@ -1,0 +1,333 @@
+name: Ascend-PR-CI
+run-name: Ascend-PR-CI ${{ github.event.pull_request.number && format('#{0}', github.event.pull_request.number) || github.ref_name }}
+
+# One entry point for PR, nightly and manual CI type selection.
+#
+#   lint -> Planner -> PlannerOutput -> Executor -> Gate
+#
+# The Plan carries an immutable digest image reference. Image builds and
+# alias promotion are a separate release pipeline; they are not a job in this
+# graph and cannot change the test topology.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths-ignore:
+      - 'docker/**/Dockerfile*'
+  workflow_call:
+    inputs:
+      mode:
+        required: false
+        default: 'pr'
+        type: string
+      job_filter:
+        required: false
+        default: ''
+        type: string
+      ci_type:
+        description: 'Optional CI type override: pull_request or nightly'
+        required: false
+        default: ''
+        type: string
+      target_filter:
+        description: 'Optional target filter, for example cpu or npu-a3'
+        required: false
+        default: ''
+        type: string
+      checkout_ref:
+        description: 'Optional Git ref under test; empty uses the event checkout'
+        required: false
+        default: ''
+        type: string
+      image_ref:
+        description: 'Optional immutable image ref; empty derives content refs'
+        required: false
+        default: ''
+        type: string
+      image_id:
+        description: 'Logical image ID paired with image_ref'
+        required: false
+        default: ''
+        type: string
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+  pull-requests: read
+  actions: read
+
+env:
+  # run_tests.sh treats MODE as cpu/npu, so keep this variable name distinct.
+  CI_MODE: ${{ github.event_name == 'pull_request' && 'pr' || inputs.mode }}
+  CI_JOB_FILTER: ${{ inputs.job_filter || '' }}
+  CI_TARGET_FILTER: ${{ inputs.target_filter || '' }}
+  CI_TYPE: ${{ inputs.ci_type || '' }}
+  CI_IMAGE_REF: ${{ inputs.image_ref || '' }}
+  CI_IMAGE_ID: ${{ inputs.image_id || '' }}
+
+jobs:
+  plan:
+    name: Lint-Plan
+    runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
+    timeout-minutes: 20
+    outputs:
+      cpu_jobs: ${{ steps.plan.outputs.cpu_jobs || '[]' }}
+      cpu_job_count: ${{ steps.plan.outputs.cpu_job_count || '0' }}
+      container_jobs: ${{ steps.plan.outputs.container_jobs || '[]' }}
+      container_job_count: ${{ steps.plan.outputs.container_job_count || '0' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.checkout_ref || github.sha }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: classify changes
+        id: changes
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+        run: |
+          set -euo pipefail
+          kind=code
+          if [ "$EVENT_NAME" = pull_request ] && [ -n "$BASE_SHA" ]; then
+            kind=$(git diff --name-only --diff-filter=AM --no-renames \
+              "$BASE_SHA...HEAD" | \
+              python3 -m scripts.ci.tools.changed_files)
+          fi
+
+          ci_type=$CI_TYPE
+          if [ -z "$ci_type" ]; then
+            [ "$CI_MODE" = full ] && ci_type=nightly || ci_type=pull_request
+          fi
+
+          printf 'change_mode=%s\nci_type=%s\n' "$kind" "$ci_type" >> "$GITHUB_OUTPUT"
+          printf 'kind=%s; ci_type=%s\n' "$kind" "$ci_type" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: install CI dependencies
+        run: |
+          python3 -m pip install --quiet --disable-pip-version-check \
+            -r scripts/ci/config/requirements-lint.txt
+
+      - name: lint
+        id: lint
+        if: steps.changes.outputs.change_mode == 'code'
+        env:
+          PYTHONUNBUFFERED: '1'
+        run: |
+          set -uo pipefail
+          python3 -m scripts.ci.tools.lint
+
+      - name: generate test plan
+        id: plan
+        if: always()
+        env:
+          LINT_OUTCOME: ${{ steps.lint.outcome }}
+          CHANGE_MODE: ${{ steps.changes.outputs.change_mode || 'code' }}
+          CI_TYPE: ${{ steps.changes.outputs.ci_type || 'pull_request' }}
+          CI_SOURCE_REF: ${{ inputs.checkout_ref || github.ref }}
+        run: |
+          set -euo pipefail
+          ARGS=(
+            --ci-type "$CI_TYPE"
+            --output "$RUNNER_TEMP/ci-plan/plan.json"
+            --change-mode "$CHANGE_MODE"
+            --job-filter "$CI_JOB_FILTER"
+            --target-filter "$CI_TARGET_FILTER"
+          )
+
+          if [ "$CHANGE_MODE" = code ] && [ -n "$CI_IMAGE_ID" ]; then
+            ARGS+=(--image-filter "$CI_IMAGE_ID")
+            [ -z "$CI_IMAGE_REF" ] || \
+              ARGS+=(--image-ref "$CI_IMAGE_ID=$CI_IMAGE_REF")
+          fi
+
+          case "$CHANGE_MODE" in
+            image_only|mixed) echo "Dockerfile PR is handled by Ascend-Image-PR" >> "$GITHUB_STEP_SUMMARY" ;;
+          esac
+
+          if [ "$CHANGE_MODE" = code ] && [ "$LINT_OUTCOME" != success ]; then
+            echo "::error::lint failed"
+            python3 -m scripts.ci.execution.producer.cli failed-output \
+              --output "$RUNNER_TEMP/ci-plan/plan.json" \
+              --code lint-failed \
+              --location scripts/ci \
+              --message "lint failed; see Lint-Plan job"
+            exit 1
+          fi
+
+          python3 -m scripts.ci.execution.producer.cli plan \
+            "${ARGS[@]}" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: upload plan
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-plan
+          path: ${{ runner.temp }}/ci-plan
+          if-no-files-found: warn
+          retention-days: 7
+
+  cpu:
+    name: CPU (${{ matrix.display_name }})
+    needs: plan
+    if: |
+      always() && needs.plan.result == 'success' &&
+      needs.plan.outputs.cpu_job_count != '0'
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.cpu_jobs) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.timeout_minutes }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            scripts/ci/config/ci.yml
+            scripts/ci/config/envs/*.txt
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ci-plan
+          path: ${{ runner.temp }}/ci-plan
+
+      - name: execute
+        env:
+          RUNNER_LABEL: ${{ matrix.runner }}
+          CI_VENV_ROOT: ${{ runner.temp }}/turbo-ci-venv
+        run: |
+          set -euo pipefail
+          result_root="$RUNNER_TEMP/ci-result"
+          mkdir -p "$result_root"
+          python3 -m scripts.ci.execution.consumer.executor \
+            --plan "$RUNNER_TEMP/ci-plan/plan.json" \
+            --job-id "${{ matrix.job_id }}" \
+            --output "$result_root/job-result.json" \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-result-${{ matrix.job_id }}
+          path: ${{ runner.temp }}/ci-result
+          if-no-files-found: error
+          retention-days: 7
+
+  accelerator:
+    name: Accelerator (${{ matrix.display_name }})
+    needs: plan
+    if: |
+      always() && needs.plan.result == 'success' &&
+      needs.plan.outputs.container_job_count != '0'
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(vars.CI_CONTAINER_MAX_PARALLEL || '2') }}
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.container_jobs) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.timeout_minutes }}
+    container:
+      image: ${{ matrix.image_ref }}
+      options: ${{ matrix.container_options }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ci-plan
+          path: ${{ runner.temp }}/ci-plan
+
+      - name: execute
+        env:
+          RUNNER_LABEL: ${{ matrix.runner }}
+          CI_VENV_ROOT: /tmp/turbo-ci-venv
+        run: |
+          set -euo pipefail
+          result_root="$RUNNER_TEMP/ci-result"
+          mkdir -p "$result_root"
+          python3 -m scripts.ci.execution.consumer.executor \
+            --plan "$RUNNER_TEMP/ci-plan/plan.json" \
+            --job-id "${{ matrix.job_id }}" \
+            --output "$result_root/job-result.json" \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-result-${{ matrix.job_id }}
+          path: ${{ runner.temp }}/ci-result
+          if-no-files-found: error
+          retention-days: 7
+
+  gate:
+    name: Gate
+    needs: [plan, cpu, accelerator]
+    if: always()
+    runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: download artifacts
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ci-*
+          path: ${{ runner.temp }}/ci-artifacts
+
+      - name: timing
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 -m scripts.ci.execution.finalization.timing
+
+      - name: judge
+        env:
+          PLAN: ${{ runner.temp }}/ci-artifacts/ci-plan/plan.json
+          RESULTS: ${{ runner.temp }}/ci-artifacts
+          DECISION: ${{ runner.temp }}/ci-decision/decision.json
+        run: |
+          set -euo pipefail
+          mkdir -p "$RESULTS"
+          if [ ! -f "$PLAN" ]; then
+            echo "::error::missing ci-plan artifact"
+            printf '## CI Gate: failed\n\n- missing-plan: ci-plan artifact is missing\n' \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 2
+          fi
+          python3 -m scripts.ci.execution.finalization.gate \
+            --plan "$PLAN" \
+            --results "$RESULTS" \
+            --output "$DECISION" \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: upload decision
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-decision
+          path: ${{ runner.temp }}/ci-decision
+          if-no-files-found: ignore
+          retention-days: 7

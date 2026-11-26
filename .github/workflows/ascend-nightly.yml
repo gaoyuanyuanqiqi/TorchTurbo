@@ -1,0 +1,69 @@
+name: Ascend-Nightly-CI
+run-name: Ascend-Nightly-CI ${{ github.ref_name }}
+
+# Full pytest + integration run on the current content-tag image. The first
+# job syncs stale publish aliases best-effort; tests always run afterwards.
+# Automatic scheduling is intentionally disabled for now.
+on:
+  # schedule:
+  #   - cron: '0 19 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+  actions: read
+
+jobs:
+  sync-aliases:
+    name: Sync image aliases
+    if: github.ref == 'refs/heads/main'
+    runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
+    timeout-minutes: 15
+    continue-on-error: true
+    concurrency:
+      group: image-promote
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: install CI dependencies
+        run: |
+          python3 -m pip install --quiet --disable-pip-version-check \
+            -r scripts/ci/config/requirements-lint.txt
+
+      - name: log in to SWR
+        env:
+          SWR_USER: ${{ secrets.SWR_USERNAME }}
+          SWR_PASS: ${{ secrets.SWR_PASSWORD }}
+          REGISTRY: ${{ vars.SWR_REGISTRY || 'swr.cn-north-12.myhuaweicloud.com' }}
+        run: |
+          set -euo pipefail
+          if [ -z "$SWR_USER" ] || [ -z "$SWR_PASS" ]; then
+            echo "::warning::SWR credentials are unavailable; alias repair may fail"
+            exit 0
+          fi
+          if ! printf '%s' "$SWR_PASS" | \
+            docker login "$REGISTRY" -u "$SWR_USER" --password-stdin; then
+            echo "::warning::SWR login failed; alias repair may fail"
+          fi
+
+      - name: sync stable aliases
+        run: |
+          python3 -m scripts.ci.image.cli sync-aliases \
+            --images all \
+            --best-effort
+
+  full-tests:
+    name: Nightly full tests
+    needs: sync-aliases
+    if: always()
+    uses: ./.github/workflows/ascend-pr.yml
+    with:
+      mode: full

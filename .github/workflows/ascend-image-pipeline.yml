@@ -1,0 +1,253 @@
+name: Ascend-Image-Pipeline
+run-name: Image pipeline ${{ inputs.image_id }}
+
+# One logical image's candidate pipeline. The parent workflow expands this as a
+# matrix so different images run independently without global barriers.
+# Candidate tests consume the immutable image digest and intentionally do not
+# reuse the complete PR workflow: the image path already ran lint and owns only
+# the build -> test-plan -> NPU -> gate lifecycle. Manual entry lives in
+# ascend-manual-image.yml.
+
+on:
+  workflow_call:
+    inputs:
+      image_id:
+        description: 'Logical image ID from resources.images'
+        required: true
+        type: string
+      target:
+        description: 'Target slice used by candidate tests; required when run_tests is true'
+        required: false
+        default: ''
+        type: string
+      checkout_ref:
+        description: 'Git ref under test; empty uses the calling workflow SHA'
+        required: false
+        default: ''
+        type: string
+      max_jobs:
+        description: 'MAX_JOBS passed to the image builder'
+        required: false
+        default: 'auto'
+        type: string
+      use_cache:
+        description: 'Use the GitHub Actions build cache'
+        required: false
+        default: true
+        type: boolean
+      runner:
+        description: 'Optional build runner label; empty uses CI_IMAGE_RUNNER'
+        required: false
+        default: ''
+        type: string
+      run_tests:
+        description: 'Run candidate tests after building or reusing the image'
+        required: false
+        default: true
+        type: boolean
+    secrets:
+      SWR_USERNAME:
+        required: false
+      SWR_PASSWORD:
+        required: false
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: read
+
+jobs:
+  build:
+    name: Build
+    runs-on: ${{ inputs.runner || vars.CI_IMAGE_RUNNER || vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
+    timeout-minutes: 350
+    concurrency:
+      group: image-${{ inputs.image_id }}-${{ inputs.checkout_ref || github.sha }}
+      cancel-in-progress: false
+    outputs:
+      ref: ${{ steps.result.outputs.ref }}
+      container_jobs: ${{ steps.plan.outputs.container_jobs || '[]' }}
+      container_job_count: ${{ steps.plan.outputs.container_job_count || '0' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.checkout_ref || github.sha }}
+          allow-unsafe-pr-checkout: ${{ startsWith(inputs.checkout_ref, 'refs/pull/') }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: install CI dependencies
+        run: python3 -m pip install --quiet --disable-pip-version-check -r scripts/ci/config/requirements-lint.txt
+
+      - name: log in to SWR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ vars.SWR_REGISTRY || 'swr.cn-north-12.myhuaweicloud.com' }}
+          username: ${{ secrets.SWR_USERNAME }}
+          password: ${{ secrets.SWR_PASSWORD }}
+
+      - uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker-container
+
+      - name: build image
+        id: result
+        env:
+          IMAGE_ID: ${{ inputs.image_id }}
+          MAX_JOBS: ${{ inputs.max_jobs }}
+          USE_CACHE: ${{ inputs.use_cache }}
+        run: |
+          set -euo pipefail
+          result="$RUNNER_TEMP/image-result.json"
+          build=(python3 -m scripts.ci.image.cli build --image "$IMAGE_ID" --output "$result")
+          if [ -n "${MAX_JOBS:-}" ]; then build+=(--max-jobs "$MAX_JOBS"); fi
+          if [ "${USE_CACHE:-true}" != true ]; then build+=(--no-cache); fi
+          "${build[@]}"
+
+      - name: plan candidate tests
+        id: plan
+        if: inputs.run_tests
+        env:
+          TARGETS: ${{ inputs.target }}
+          IMAGE_ID: ${{ inputs.image_id }}
+          IMAGE_REF: ${{ steps.result.outputs.ref }}
+          CI_SOURCE_REF: ${{ inputs.checkout_ref || github.ref }}
+        run: |
+          set -euo pipefail
+          : "${TARGETS:?target is required when run_tests is true}"
+          : "${IMAGE_REF:?build did not publish an image ref}"
+
+          python3 -m scripts.ci.execution.producer.cli plan \
+            --root "$GITHUB_WORKSPACE" \
+            --ci-type pull_request \
+            --change-mode code \
+            --target-filter "$TARGETS" \
+            --image-filter "$IMAGE_ID" \
+            --image-ref "$IMAGE_ID=$IMAGE_REF" \
+            --output "$RUNNER_TEMP/ci-plan/plan.json" \
+            --github-output "$GITHUB_OUTPUT"
+
+          count=$(sed -n 's/^container_job_count=//p' "$GITHUB_OUTPUT" | tail -n 1)
+          if [ "${count:-0}" -lt 1 ]; then
+            echo "::error::candidate tests produced no container jobs"
+            exit 1
+          fi
+
+      - name: upload test plan
+        if: always() && inputs.run_tests
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-plan-${{ inputs.image_id }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ci-plan
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: upload build log
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-build-log-${{ inputs.image_id }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /tmp/build.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: summary
+        if: always()
+        env:
+          DIGEST: ${{ steps.result.outputs.digest }}
+          BUILT: ${{ steps.result.outputs.built }}
+        run: |
+          printf "## Image CI\n\n| field | value |\n|---|---|\n| digest | \`%s\` |\n| built | \`%s\` |\n" \
+            "${DIGEST:-missing}" "${BUILT:-unknown}" >> "$GITHUB_STEP_SUMMARY"
+
+  container-tests:
+    name: Container (${{ matrix.display_name }})
+    needs: build
+    if: |
+      always() && needs.build.result == 'success' &&
+      needs.build.outputs.container_job_count != '0'
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(vars.CI_CONTAINER_MAX_PARALLEL || '2') }}
+      matrix:
+        include: ${{ fromJSON(needs.build.outputs.container_jobs) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.timeout_minutes }}
+    container:
+      image: ${{ needs.build.outputs.ref }}
+      options: ${{ matrix.container_options }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
+          allow-unsafe-pr-checkout: ${{ startsWith(inputs.checkout_ref, 'refs/pull/') }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ci-plan-${{ inputs.image_id }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ci-plan
+
+      - name: execute
+        env:
+          RUNNER_LABEL: ${{ matrix.runner }}
+          CI_VENV_ROOT: /tmp/turbo-ci-venv
+        run: |
+          result_root="$RUNNER_TEMP/ci-result"
+          mkdir -p "$result_root"
+          python3 -m scripts.ci.execution.consumer.executor \
+            --plan "$RUNNER_TEMP/ci-plan/plan.json" \
+            --job-id "${{ matrix.job_id }}" \
+            --output "$result_root/job-result.json" \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-result-${{ inputs.image_id }}-${{ matrix.job_id }}
+          path: ${{ runner.temp }}/ci-result
+          if-no-files-found: error
+          retention-days: 7
+
+  gate:
+    name: Candidate gate
+    needs: container-tests
+    if: always() && inputs.run_tests
+    runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: download plan
+        if: always()
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-plan-${{ inputs.image_id }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ci-plan
+
+      - name: download results
+        if: always()
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ci-result-${{ inputs.image_id }}-*
+          path: ${{ runner.temp }}/ci-results
+
+      - name: judge
+        env:
+          PLAN: ${{ runner.temp }}/ci-plan/plan.json
+          RESULTS: ${{ runner.temp }}/ci-results
+        run: |
+          python3 -m scripts.ci.execution.finalization.gate \
+            --plan "$PLAN" \
+            --results "$RESULTS" \
+            --summary "$GITHUB_STEP_SUMMARY"

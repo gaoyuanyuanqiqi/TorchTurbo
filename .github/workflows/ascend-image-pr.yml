@@ -1,0 +1,265 @@
+name: Ascend Image PR
+run-name: Image PR ${{ format('#{0}', github.event.pull_request.number) }}
+
+# Dockerfile PR validation. One Plan job does lint, change classification, image
+# identity planning and CPU test planning:
+#   Plan -> CPU matrix -> per-image build -> container tests -> Gate
+#
+# A mixed Dockerfile + code PR runs the CPU matrix before any build. Different
+# images remain independent reusable pipelines.
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
+    branches: [main, ci/pr-replay-baseline]
+    paths:
+      - 'docker/**/Dockerfile*'
+
+permissions:
+  contents: read
+  pull-requests: read
+  actions: read
+
+concurrency:
+  group: image-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  plan:
+    name: Image plan
+    runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
+    timeout-minutes: 20
+    outputs:
+      change_kind: ${{ steps.images.outputs.change_kind }}
+      cpu_jobs: ${{ steps.cpu.outputs.cpu_jobs || '[]' }}
+      cpu_job_count: ${{ steps.cpu.outputs.cpu_job_count || '0' }}
+      image_jobs: ${{ steps.images.outputs.image_jobs }}
+      image_count: ${{ steps.images.outputs.image_count }}
+      images: ${{ steps.images.outputs.images }}
+    steps:
+      - name: Check fork image PR approval
+        if: |
+          github.event.pull_request.head.repo.full_name != github.repository &&
+          !contains(github.event.pull_request.labels.*.name, 'ci:image:build')
+        run: |
+          echo "::error::fork image PR requires maintainer approval via the 'ci:image:build' label"
+          exit 1
+
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/head
+          fetch-depth: 0
+          allow-unsafe-pr-checkout: true
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: install CI dependencies
+        run: python3 -m pip install --quiet --disable-pip-version-check -r scripts/ci/config/requirements-lint.txt
+
+      - name: lint
+        run: python3 -m scripts.ci.tools.lint
+
+      - name: select changed images
+        id: images
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          changed="$RUNNER_TEMP/ci-changed-files.txt"
+          git diff --name-only --diff-filter=AM --no-renames \
+            "$BASE_SHA...HEAD" > "$changed"
+          kind=$(python3 -m scripts.ci.tools.changed_files --changed-files "$changed")
+
+          python3 -m scripts.ci.image.cli plan \
+            --root "$GITHUB_WORKSPACE" --changed-files "$changed" \
+            --output "$RUNNER_TEMP/image-matrix.json" \
+            --github-output "$GITHUB_OUTPUT"
+
+          image_count=$(sed -n 's/^image_count=//p' "$GITHUB_OUTPUT" | tail -n 1)
+          case "${image_count:-0}:$kind" in
+            0:*) effective_kind=no_image ;;
+            *:image_only|*:mixed) effective_kind=$kind ;;
+            *) echo "::error::image changes require image_only or mixed; got $kind"; exit 1 ;;
+          esac
+
+          printf 'change_kind=%s\n' "$effective_kind" >> "$GITHUB_OUTPUT"
+          images=$(sed -n 's/^images=//p' "$GITHUB_OUTPUT" | tail -n 1)
+          printf '## Image PR change kind\n\n| kind | images |\n|---|---|\n| %s | %s |\n' \
+            "$effective_kind" "$images" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: plan CPU preflight
+        id: cpu
+        if: steps.images.outputs.change_kind == 'mixed'
+        run: |
+          set -euo pipefail
+          python3 -m scripts.ci.execution.producer.cli plan \
+            --ci-type pull_request --change-mode code --target-filter cpu \
+            --output "$RUNNER_TEMP/ci-plan/plan.json"
+
+      - name: Upload plan
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-plan
+          path: ${{ runner.temp }}/ci-plan
+          if-no-files-found: warn
+          retention-days: 7
+
+  cpu-tests:
+    name: ${{ matrix.display_name }}
+    needs: plan
+    if: needs.plan.outputs.change_kind == 'mixed' && needs.plan.outputs.cpu_job_count != '0'
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.cpu_jobs) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.timeout_minutes }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/head
+          allow-unsafe-pr-checkout: true
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            scripts/ci/config/ci.yml
+            scripts/ci/config/envs/*.txt
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ci-plan
+          path: ${{ runner.temp }}/ci-plan
+
+      - name: execute
+        env:
+          RUNNER_LABEL: ${{ matrix.runner }}
+          CI_VENV_ROOT: ${{ runner.temp }}/turbo-ci-venv
+        run: |
+          set -euo pipefail
+          output="$RUNNER_TEMP/ci-results/${{ matrix.job_id }}"
+          mkdir -p "$output"
+          python3 -m scripts.ci.execution.consumer.executor \
+            --plan "$RUNNER_TEMP/ci-plan/plan.json" \
+            --job-id "${{ matrix.job_id }}" \
+            --output "$output/job-result.json" \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: upload CPU results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-results-${{ matrix.job_id }}
+          path: ${{ runner.temp }}/ci-results
+          if-no-files-found: warn
+          retention-days: 7
+
+  build_and_test_images:
+    name: Build and test image (${{ matrix.image_id }})
+    needs: [plan, cpu-tests]
+    if: |
+      !cancelled() &&
+      needs.plan.result == 'success' &&
+      needs.plan.outputs.image_count != '0' &&
+      (needs.cpu-tests.result == 'success' || needs.cpu-tests.result == 'skipped')
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(vars.CI_IMAGE_MAX_PARALLEL || '3') }}
+      matrix: ${{ fromJSON(needs.plan.outputs.image_jobs) }}
+    uses: ./.github/workflows/ascend-image-pipeline.yml
+    with:
+      image_id: ${{ matrix.image_id }}
+      target: ${{ matrix.target }}
+      checkout_ref: refs/pull/${{ github.event.pull_request.number }}/head
+    secrets:
+      SWR_USERNAME: ${{ secrets.SWR_USERNAME }}
+      SWR_PASSWORD: ${{ secrets.SWR_PASSWORD }}
+
+  gate:
+    name: Image gate
+    needs: [plan, cpu-tests, build_and_test_images]
+    if: always()
+    runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: evaluate image PR pipeline
+        env:
+          PLAN_RESULT: ${{ needs.plan.result }}
+          CHANGE_KIND: ${{ needs.plan.outputs.change_kind }}
+          CPU_JOB_COUNT: ${{ needs.plan.outputs.cpu_job_count }}
+          CPU_RESULT: ${{ needs.cpu-tests.result }}
+          BUILD_RESULT: ${{ needs.build_and_test_images.result }}
+          IMAGE_COUNT: ${{ needs.plan.outputs.image_count }}
+          IMAGES: ${{ needs.plan.outputs.images }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+
+          [ "$PLAN_RESULT" = success ] || \
+            fail "plan result is $PLAN_RESULT"
+
+          case "$CHANGE_KIND" in
+            no_image) [ "${IMAGE_COUNT:-0}" -eq 0 ] || fail "no-image PR reported images" ;;
+            image_only|mixed) [ "${IMAGE_COUNT:-0}" -ge 1 ] || fail "no affected image" ;;
+            *) fail "unexpected change kind: $CHANGE_KIND" ;;
+          esac
+
+          if [ "${IMAGE_COUNT:-0}" -gt 0 ] && [ "$BUILD_RESULT" != success ]; then
+            fail "image build/test result is $BUILD_RESULT"
+          fi
+
+          if [ "$CHANGE_KIND" = mixed ]; then
+            [ "${CPU_JOB_COUNT:-0}" -ge 1 ] || fail "mixed PR has no CPU Plan jobs"
+            [ "$CPU_RESULT" = success ] || fail "CPU tests result is $CPU_RESULT"
+          fi
+
+          echo "image PR pipeline passed for $CHANGE_KIND: $IMAGES" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: download CPU Plan
+        if: always() && needs.plan.outputs.change_kind == 'mixed'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-plan
+          path: ${{ runner.temp }}/ci-plan
+
+      - name: download CPU results
+        if: always() && needs.plan.outputs.change_kind == 'mixed'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ci-results-*
+          path: ${{ runner.temp }}/ci-results
+
+      - name: judge CPU Plan results
+        if: always() && needs.plan.outputs.change_kind == 'mixed'
+        env:
+          PLAN: ${{ runner.temp }}/ci-plan/plan.json
+          RESULTS: ${{ runner.temp }}/ci-results
+          DECISION: ${{ runner.temp }}/ci-decision/decision.json
+        run: |
+          set -euo pipefail
+          mkdir -p "$RESULTS" "$(dirname "$DECISION")"
+          python3 -m scripts.ci.execution.finalization.gate \
+            --plan "$PLAN" \
+            --results "$RESULTS" \
+            --output "$DECISION" \
+            --summary "$GITHUB_STEP_SUMMARY"

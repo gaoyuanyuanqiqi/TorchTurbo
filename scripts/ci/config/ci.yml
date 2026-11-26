@@ -1,0 +1,108 @@
+resources:
+  devices:
+    cpu: [cpu]
+    npu: [npu-a3]
+
+  images:
+    cpu:
+      default:
+        kind: host
+        ref: python:3.11
+
+    npu-a3:
+      cann90:
+        kind: container
+        build:
+          dockerfile: docker/npu/Dockerfile_aarch64
+          platform: linux/arm64
+          revision: 1
+          ci_build_args:
+            GIT_HTTP_USER_AGENT: git/2.56.1
+        publish:
+          ref: swr.cn-north-12.myhuaweicloud.com/ascend/torchturbo_npu:cann9.0.0-a3-base
+
+  runners:
+    cpu:
+      capacities: [8]
+      label: ubuntu-22.04-arm
+    npu-a3:
+      capacities: [2, 4, 6, 8, 16]
+      label_prefix: linux-aarch64-a3-800i
+
+  venvs:
+    default:
+      python: "3.11"
+      requirements: [scripts/ci/config/envs/default.txt]
+    qwen4_exp:
+      python: "3.11"
+      requirements: [scripts/ci/config/envs/qwen4_exp.txt]
+    lf:
+      python: "3.11"
+      requirements: [scripts/ci/config/envs/lf.txt]
+    swift:
+      python: "3.11"
+      requirements: [scripts/ci/config/envs/swift.txt]
+      overrides: ["datasets==5.0.1"]
+    qwen4_exp_swift:
+      python: "3.11"
+      requirements: [scripts/ci/config/envs/swift.txt]
+      overrides: ["datasets==5.0.1"]
+
+test_areas:
+  unit_tests:
+    defaults:
+      job_timeout_minutes: {cpu: 40, npu: 90, gpu: 90}
+      step_timeout_minutes: {cpu: 40, npu: 90, gpu: 90}
+    model_venvs:
+      qwen4_exp: qwen4_exp
+    framework_venvs:
+      lf: lf
+      swift: swift
+    combo_venvs:
+      qwen4_exp+swift: qwen4_exp_swift
+    overrides:
+      tests/unit_tests/models/bailing_moe_v3_vl/test_lf_image_parity.py:
+        venv: lf
+      tests/unit_tests/models/bailing_moe_v3_vl/test_lf_integration.py:
+        venv: lf
+      tests/unit_tests/models/bailing_moe_v3_vl/test_lf_text_parity.py:
+        venv: lf
+      tests/unit_tests/models/bailing_moe_v3_vl/test_swift_integration.py:
+        venv: swift
+
+  integration_tests:
+    suites:
+      base_suite:
+        defaults:
+          job_timeout_minutes: {cpu: 40, npu: 60, gpu: 60}
+          step_timeout_minutes: {cpu: 40, npu: 60, gpu: 60}
+        framework_venvs:
+          swift: swift
+          llamafactory: lf
+        overrides:
+          bailing_v3/sft_16npu:
+            job_timeout_minutes: 90
+
+test_profiles:
+  pull_request:
+    - image: cpu-default
+      test_areas:
+        unit_tests: [core, adapter]
+        integration_tests: [base_suite/qwen3_5_moe/sft_2cpu]
+    - image: npu-a3-cann90
+      test_areas:
+        unit_tests: [core]
+        integration_tests: [base_suite/qwen3_5_moe/sft_2npu]
+
+  nightly:
+    - image: cpu-default
+      test_areas:
+        unit_tests: [all]
+        integration_tests: [all]
+    - image: npu-a3-cann90
+      test_areas:
+        unit_tests: [core, model]
+        integration_tests: [
+          base_suite/qwen3_5_moe/sft_2npu,
+          base_suite/bailing_v3/sft_16npu,
+        ]

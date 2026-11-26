@@ -1,0 +1,176 @@
+name: Ascend-Image-Promote
+run-name: Ascend-Image-Promote ${{ inputs.images || github.sha }}
+
+# Trusted post-merge image pipeline. Every affected logical image runs one
+# complete unit independently:
+#   promote (resolve candidate + move alias)
+#
+# Image input changes select images automatically. Manual dispatch can target
+# all images or a comma-separated list. A failure in one image does not cancel
+# other images; the final gate fails if any selected image fails.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docker/**/Dockerfile*'
+  workflow_dispatch:
+    inputs:
+      images:
+        description: "'all' or a comma-separated list of logical image names"
+        required: true
+        default: 'all'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: image-promote
+  cancel-in-progress: false
+
+jobs:
+  discover:
+    name: Ascend-Image-Promote-Discover
+    runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
+    timeout-minutes: 10
+    outputs:
+      image_jobs: ${{ steps.select.outputs.image_jobs }}
+      image_count: ${{ steps.select.outputs.image_count }}
+      images: ${{ steps.select.outputs.images }}
+    steps:
+      - name: require main branch
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [ "$REF" != refs/heads/main ]; then
+            echo "::error::image promotion is restricted to refs/heads/main"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: install CI dependencies
+        run: python3 -m pip install --quiet --disable-pip-version-check -r scripts/ci/config/requirements-lint.txt
+
+      - name: select affected images
+        id: select
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          IMAGES: ${{ inputs.images || 'all' }}
+        run: |
+          set -euo pipefail
+          common=(--root "$GITHUB_WORKSPACE" --github-output "$GITHUB_OUTPUT")
+          if [ "$EVENT_NAME" = workflow_dispatch ]; then
+            python3 -m scripts.ci.image.cli plan --images "$IMAGES" "${common[@]}"
+          else
+            changed="$RUNNER_TEMP/ci-changed-files.txt"
+            git diff --name-only --diff-filter=AM --no-renames \
+              "$BEFORE_SHA...HEAD" > "$changed"
+            python3 -m scripts.ci.image.cli plan \
+              --changed-files "$changed" "${common[@]}"
+          fi
+
+  promotions:
+    name: Ascend-Image-Promote (${{ matrix.image_id }})
+    needs: discover
+    if: |
+      needs.discover.result == 'success' &&
+      needs.discover.outputs.image_count != '0'
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(vars.CI_IMAGE_MAX_PARALLEL || '2') }}
+      matrix: ${{ fromJSON(needs.discover.outputs.image_jobs) }}
+    runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: install CI dependencies
+        run: python3 -m pip install --quiet --disable-pip-version-check -r scripts/ci/config/requirements-lint.txt
+
+      - name: log in to SWR
+        env:
+          SWR_USER: ${{ secrets.SWR_USERNAME }}
+          SWR_PASS: ${{ secrets.SWR_PASSWORD }}
+          REGISTRY: ${{ vars.SWR_REGISTRY || 'swr.cn-north-12.myhuaweicloud.com' }}
+        run: |
+          set -euo pipefail
+          : "${SWR_USER:?SWR_USERNAME is required for image promotion}"
+          : "${SWR_PASS:?SWR_PASSWORD is required for image promotion}"
+          printf '%s' "$SWR_PASS" | docker login "$REGISTRY" -u "$SWR_USER" --password-stdin
+
+      - name: promote validated candidate
+        id: promote
+        env:
+          IMAGE_ID: ${{ matrix.image_id }}
+        run: |
+          python3 -m scripts.ci.image.cli promote \
+            --image "$IMAGE_ID" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: summary
+        if: always()
+        env:
+          IMAGE_ID: ${{ matrix.image_id }}
+          ALIAS: ${{ steps.promote.outputs.alias }}
+          DIGEST: ${{ steps.promote.outputs.digest }}
+        run: |
+          {
+            echo '## Image promotion'
+            echo ''
+            echo '| field | value |'
+            echo '|---|---|'
+            echo "| image | \`${IMAGE_ID}\` |"
+            echo "| alias | \`${ALIAS:-missing}\` |"
+            echo "| digest | \`${DIGEST:-missing}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  gate:
+    name: Ascend-Image-Promote-Gate
+    needs: [discover, promotions]
+    if: always()
+    runs-on: ${{ vars.CI_CPU_RUNNER || 'ubuntu-22.04-arm' }}
+    timeout-minutes: 5
+    steps:
+      - name: evaluate image promotion pipeline
+        env:
+          DISCOVER_RESULT: ${{ needs.discover.result }}
+          PROMOTION_RESULT: ${{ needs.promotions.result }}
+          IMAGE_COUNT: ${{ needs.discover.outputs.image_count }}
+          IMAGES: ${{ needs.discover.outputs.images }}
+        run: |
+          set -euo pipefail
+          failed=0
+          if [ "$DISCOVER_RESULT" != success ]; then
+            echo "::error::discover result is ${DISCOVER_RESULT}"
+            failed=1
+          fi
+          if [ "$failed" -ne 0 ]; then
+            exit 1
+          fi
+          if [ "${IMAGE_COUNT:-0}" -lt 1 ]; then
+            echo "no Dockerfile changed; promotion is a no-op" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "$PROMOTION_RESULT" != success ]; then
+            echo "::error::image promotion result is ${PROMOTION_RESULT}"
+            exit 1
+          fi
+          echo "image promotion passed for: $IMAGES" >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,62 @@
+name: Ascend-Manual-Test
+run-name: Ascend-Manual-Test ${{ inputs.mode }} ${{ inputs.job_filter }} ${{ github.ref_name }}
+
+# Debug one exact job through the normal CI graph. Manual runs use the same
+# CiConfig/TestFacts -> Plan -> Executor -> Gate pipeline as PR and nightly, but
+# reduce the Plan to one target job. No second planner or executor path.
+#
+# job_filter is the Plan job id. Common values:
+#   pytest-core-cpu-cpu-default-default
+#   pytest-core-npu-npu-a3-cann90-default
+#   integration-base-suite-qwen3-5-moe-sft-2cpu
+#   integration-base-suite-qwen3-5-moe-sft-2npu
+#
+# Use mode=pr for the PR profile, or mode=full to target a job that only nightly
+# selects (for example the 16-NPU integration case). An unknown target fails
+# in Planner before any runner starts.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'pr = PR profile; full = nightly profile'
+        required: true
+        default: 'pr'
+        type: choice
+        options:
+          - pr
+          - full
+      job_filter:
+        description: 'exact Plan job id to execute'
+        required: true
+        default: 'pytest-core-cpu-cpu-default-default'
+        type: string
+      image_ref:
+        description: 'optional explicit image ref; empty derives the SHA content ref'
+        required: false
+        default: ''
+        type: string
+      image_id:
+        description: 'logical image ID paired with image_ref'
+        required: false
+        default: ''
+        type: string
+
+concurrency:
+  group: ci-manual-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+  actions: read
+
+jobs:
+  manual:
+    name: Manual test (${{ inputs.job_filter }})
+    uses: ./.github/workflows/ascend-pr.yml
+    with:
+      mode: ${{ inputs.mode == 'full' && 'full' || 'pr' }}
+      job_filter: ${{ inputs.job_filter }}
+      image_ref: ${{ inputs.image_ref }}
+      image_id: ${{ inputs.image_id }}
